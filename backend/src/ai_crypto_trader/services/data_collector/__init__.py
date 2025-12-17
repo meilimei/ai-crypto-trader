@@ -1,0 +1,3 @@
+"""
+Data collector service stubs.
+"""

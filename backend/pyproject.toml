@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "ai-crypto-trader-backend"
+version = "0.1.0"
+description = "Backend services for the AI Crypto Trader platform"
+authors = ["AI Crypto Trader Team <dev@ai-crypto-trader.local>"]
+readme = "README.md"
+packages = [{ include = "ai_crypto_trader", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.110.0"
+uvicorn = { extras = ["standard"], version = "^0.29.0" }
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.1.1"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,3 @@
+"""
+Trading engine service stubs.
+"""

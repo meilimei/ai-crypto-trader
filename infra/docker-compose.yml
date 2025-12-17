@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: ai-crypto-trader-postgres
+    environment:
+      POSTGRES_DB: ai_crypto_trader
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d ai_crypto_trader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: ai-crypto-trader-backend
+    environment:
+      DATABASE_URL: postgresql://trader:trader@postgres:5432/ai_crypto_trader
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
