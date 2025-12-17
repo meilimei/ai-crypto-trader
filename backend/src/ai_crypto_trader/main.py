@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 
+# Import database layer to ensure models are registered and engine is created.
+from ai_crypto_trader.common import database  # noqa: F401
 from ai_crypto_trader.api.routes import router as api_router
 
 
