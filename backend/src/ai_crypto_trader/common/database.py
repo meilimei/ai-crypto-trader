@@ -1,11 +1,20 @@
+import logging
 import os
 from typing import AsyncGenerator, Dict
 
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ai_crypto_trader.common.models import Base
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./dev.db")
+logger = logging.getLogger(__name__)
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Please set DATABASE_URL in backend/.env")
+
+rendered_url = make_url(DATABASE_URL).render_as_string(hide_password=True)
+logger.info("Initializing database engine", extra={"database_url": rendered_url})
 
 
 def _get_connect_args(url: str) -> Dict[str, object]:

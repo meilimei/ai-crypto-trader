@@ -10,8 +10,13 @@ For production, prefer Alembic migrations to manage schema changes.
 
 import asyncio
 
+from pathlib import Path
+from dotenv import load_dotenv
+
 from ai_crypto_trader.common.database import engine
 from ai_crypto_trader.common.models import Base
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
 async def init_db() -> None:

@@ -1,7 +1,7 @@
 import asyncio
 import os
 from logging.config import fileConfig
-
+from dotenv import load_dotenv
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -18,6 +18,7 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Prefer env var DATABASE_URL over alembic.ini setting.
+load_dotenv()
 database_url = os.getenv("DATABASE_URL")
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)

@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import Uuid
@@ -281,3 +282,190 @@ class RiskEvent(Base):
 
     user: Mapped["User"] = relationship(back_populates="risk_events")
     strategy: Mapped[Optional["Strategy"]] = relationship()
+
+
+# Paper trading models
+class PaperAccount(Base):
+    __tablename__ = "paper_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    base_ccy: Mapped[str] = mapped_column(String(10))
+    initial_cash_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), default=Decimal("10000"))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
+
+    balances: Mapped[List["PaperBalance"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+    positions: Mapped[List["PaperPosition"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+    orders: Mapped[List["PaperOrder"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+    trades: Mapped[List["PaperTrade"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+    snapshots: Mapped[List["EquitySnapshot"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
+
+
+class PaperBalance(Base):
+    __tablename__ = "paper_balances"
+    __table_args__ = (
+        UniqueConstraint("account_id", "ccy", name="uq_paper_balances_account_ccy"),
+        Index("ix_paper_balances_account_id", "account_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"))
+    ccy: Mapped[str] = mapped_column(String(10))
+    available: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=Decimal("0"))
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
+
+    account: Mapped["PaperAccount"] = relationship(back_populates="balances")
+
+
+class PaperPosition(Base):
+    __tablename__ = "paper_positions"
+    __table_args__ = (
+        UniqueConstraint("account_id", "symbol", name="uq_paper_positions_account_symbol"),
+        Index("ix_paper_positions_account_id", "account_id"),
+        Index("ix_paper_positions_symbol", "symbol"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"))
+    symbol: Mapped[str] = mapped_column(String(50))
+    side: Mapped[str] = mapped_column(String(5))  # long/short
+    qty: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=Decimal("0"))
+    avg_entry_price: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=Decimal("0"))
+    unrealized_pnl: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=Decimal("0"))
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
+
+    account: Mapped["PaperAccount"] = relationship(back_populates="positions")
+
+
+class PaperOrder(Base):
+    __tablename__ = "paper_orders"
+    __table_args__ = (
+        Index("ix_paper_orders_account_id", "account_id"),
+        Index("ix_paper_orders_symbol_created_at", "symbol", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"))
+    symbol: Mapped[str] = mapped_column(String(50))
+    side: Mapped[str] = mapped_column(String(5))  # buy/sell
+    type: Mapped[str] = mapped_column(String(20))  # market
+    status: Mapped[str] = mapped_column(String(20))  # new/filled/canceled/rejected
+    requested_qty: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    filled_qty: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=Decimal("0"))
+    avg_fill_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10))
+    fee_paid: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
+
+    account: Mapped["PaperAccount"] = relationship(back_populates="orders")
+
+
+class PaperTrade(Base):
+    __tablename__ = "paper_trades"
+    __table_args__ = (
+        Index("ix_paper_trades_account_id", "account_id"),
+        Index("ix_paper_trades_symbol_created_at", "symbol", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"))
+    symbol: Mapped[str] = mapped_column(String(50))
+    side: Mapped[str] = mapped_column(String(5))
+    qty: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    price: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    fee: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10))
+    realized_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
+
+    account: Mapped["PaperAccount"] = relationship(back_populates="trades")
+
+
+class EquitySnapshot(Base):
+    __tablename__ = "equity_snapshots"
+    __table_args__ = (
+        Index("ix_equity_snapshots_account_id_created_at", "account_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"))
+    equity: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    balance: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    unrealized_pnl: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
+
+    account: Mapped["PaperAccount"] = relationship(back_populates="snapshots")
+
+
+class RiskPolicy(Base):
+    __tablename__ = "risk_policies"
+    __table_args__ = (Index("ix_risk_policies_is_active", "is_active"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    max_loss_per_trade_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    max_loss_per_day_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    max_position_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    max_open_positions: Mapped[int] = mapped_column(Integer)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    fee_bps: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("0"))
+    slippage_bps: Mapped[Decimal] = mapped_column(Numeric(10, 4), default=Decimal("0"))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, onupdate=utc_now
+    )
+
+    strategies: Mapped[List["StrategyConfig"]] = relationship(
+        back_populates="risk_policy", cascade="all, delete-orphan"
+    )
+
+
+class StrategyConfig(Base):
+    __tablename__ = "strategy_configs"
+    __table_args__ = (
+        Index("ix_strategy_configs_is_active", "is_active"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbols: Mapped[List[str]] = mapped_column(JSON, default=list)
+    timeframe: Mapped[str] = mapped_column(String(50))
+    thresholds: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    order_type: Mapped[str] = mapped_column(String(20), default="market")
+    allow_short: Mapped[bool] = mapped_column(Boolean, default=False)
+    min_notional_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6), default=Decimal("0"))
+    risk_policy_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("risk_policies.id", ondelete="SET NULL"), nullable=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, onupdate=utc_now
+    )
+
+    risk_policy: Mapped[Optional["RiskPolicy"]] = relationship(back_populates="strategies")
+
+
+class AdminAction(Base):
+    __tablename__ = "admin_actions"
+    __table_args__ = (Index("ix_admin_actions_created_at", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    action: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32))
+    message: Mapped[Optional[str]] = mapped_column(Text)
+    meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
