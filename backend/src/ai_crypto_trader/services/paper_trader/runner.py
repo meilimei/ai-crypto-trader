@@ -158,7 +158,6 @@ class PaperTraderRunner:
     async def _reconcile_loop(self, auto_apply: bool) -> None:
         config = PaperTraderConfig.from_env()
         account_name = f"paper-{config.exchange_name}"
-        emit_ok = os.getenv("PAPER_TRADER_RECONCILE_EMIT_OK", "true").lower() in {"1", "true", "yes", "on"}
         while self.is_running and self.reconcile_interval_seconds > 0:
             try:
                 async with AsyncSessionLocal() as session:
@@ -175,42 +174,45 @@ class PaperTraderRunner:
                     warn = None
                     if summary.get("has_negative_balance") or summary.get("has_equity_mismatch"):
                         warn = "unsafe_to_autofix"
-                    emit = False
-                    now_mono = asyncio.get_running_loop().time()
-                    if self._last_reconcile_action_at is None:
-                        emit = True
+                    if diff_count == 0 and status == "ok":
+                        logger.debug(
+                            "reconcile ok",
+                            extra={"account_id": account.id, "tick_count": self.reconcile_tick_count},
+                        )
                     else:
-                        last_summary = self._last_reconcile_summary or {}
-                        if (
-                            last_summary.get("diff_count") != summary.get("diff_count")
-                            or last_summary.get("has_negative_balance") != summary.get("has_negative_balance")
-                            or last_summary.get("has_equity_mismatch") != summary.get("has_equity_mismatch")
-                        ):
+                        emit = False
+                        now_mono = asyncio.get_running_loop().time()
+                        if self._last_reconcile_action_at is None:
                             emit = True
                         else:
-                            if diff_count > 0 and now_mono - self._last_reconcile_action_at >= 60:
+                            last_summary = self._last_reconcile_summary or {}
+                            if (
+                                last_summary.get("diff_count") != summary.get("diff_count")
+                                or last_summary.get("has_negative_balance") != summary.get("has_negative_balance")
+                                or last_summary.get("has_equity_mismatch") != summary.get("has_equity_mismatch")
+                            ):
                                 emit = True
-                            if diff_count == 0 and now_mono - self._last_reconcile_action_at >= 300:
+                            elif diff_count > 0 and now_mono - self._last_reconcile_action_at >= 60:
                                 emit = True
-                    if emit and (emit_ok or diff_count > 0):
-                        session.add(
-                            AdminAction(
-                                action="RECONCILE_REPORT",
-                                status=status,
-                                message="Auto reconcile report",
-                                meta=json_safe({
-                                    "account_id": account.id,
-                                    "summary": summary,
-                                    "diff_count": diff_count,
-                                    "diffs_sample": diffs_sample,
-                                    "warning": warn,
-                                }),
+                        if emit:
+                            session.add(
+                                AdminAction(
+                                    action="RECONCILE_REPORT",
+                                    status=status,
+                                    message="Auto reconcile report",
+                                    meta=json_safe({
+                                        "account_id": account.id,
+                                        "summary": summary,
+                                        "diff_count": diff_count,
+                                        "diffs_sample": diffs_sample,
+                                        "warning": warn,
+                                    }),
+                                )
                             )
-                        )
-                        await session.commit()
-                        self._last_reconcile_summary = summary
-                        self._last_reconcile_action_at = now_mono
-                        self._last_reconcile_action_status = status
+                            await session.commit()
+                            self._last_reconcile_summary = summary
+                            self._last_reconcile_action_at = now_mono
+                            self._last_reconcile_action_status = status
 
                     if diff_count > 0 and auto_apply:
                         if summary.get("has_negative_balance") or summary.get("has_equity_mismatch"):

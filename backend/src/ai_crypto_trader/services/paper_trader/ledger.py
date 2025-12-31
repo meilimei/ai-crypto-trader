@@ -4,9 +4,8 @@ from typing import Any, Dict, Iterable, Tuple
 from ai_crypto_trader.common.models import PaperAccount
 from ai_crypto_trader.services.paper_trader.accounting import (
     normalize_symbol,
-    QTY_EXP,
-    PRICE_EXP,
     MONEY_EXP,
+    update_position_from_trade,
 )
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 
@@ -41,6 +40,7 @@ def simulate_positions_and_cash(
     stats = {
         "realized_pnl_usd": Decimal("0"),
         "fees_usd": Decimal("0"),
+        "slippage_usd": Decimal("0"),
         "sum_buy_notional": Decimal("0"),
         "sum_sell_notional": Decimal("0"),
         "trade_count": 0,
@@ -84,44 +84,19 @@ def simulate_positions_and_cash(
         pos = positions.get(symbol, {"qty": Decimal("0"), "avg_entry": Decimal("0")})
         pos_qty = Decimal(str(pos["qty"]))
         pos_avg = Decimal(str(pos["avg_entry"]))
-        new_qty = pos_qty + qty_signed
-
-        if pos_qty == 0:
-            if new_qty == 0:
-                pos_qty = Decimal("0")
-                pos_avg = Decimal("0")
+        if pos_qty != 0 and qty_signed != 0 and pos_qty * qty_signed < 0:
+            closed_qty = min(abs(pos_qty), qty_abs)
+            if realized_override is not None:
+                stats["realized_pnl_usd"] += realized_override
             else:
-                pos_qty = _q(new_qty, QTY_EXP)
-                pos_avg = _q(price, PRICE_EXP)
-        else:
-            if (pos_qty > 0 and qty_signed > 0) or (pos_qty < 0 and qty_signed < 0):
-                if new_qty == 0:
-                    pos_qty = Decimal("0")
-                    pos_avg = Decimal("0")
-                else:
-                    weighted = (abs(pos_qty) * pos_avg + qty_abs * price) / abs(new_qty)
-                    pos_qty = _q(new_qty, QTY_EXP)
-                    pos_avg = _q(weighted, PRICE_EXP)
-            else:
-                closed_qty = min(abs(pos_qty), qty_abs)
-                if realized_override is not None:
-                    stats["realized_pnl_usd"] += realized_override
-                else:
-                    sign = Decimal("1") if pos_qty > 0 else Decimal("-1")
-                    stats["realized_pnl_usd"] += (price - pos_avg) * closed_qty * sign
+                sign = Decimal("1") if pos_qty > 0 else Decimal("-1")
+                stats["realized_pnl_usd"] += (price - pos_avg) * closed_qty * sign
 
-                if new_qty == 0:
-                    pos_qty = Decimal("0")
-                    pos_avg = Decimal("0")
-                else:
-                    if (pos_qty > 0 and new_qty < 0) or (pos_qty < 0 and new_qty > 0):
-                        pos_qty = _q(new_qty, QTY_EXP)
-                        pos_avg = _q(price, PRICE_EXP)
-                    else:
-                        pos_qty = _q(new_qty, QTY_EXP)
-                        pos_avg = _q(pos_avg, PRICE_EXP)
+        slippage = Decimal(str(getattr(trade, "slippage_usd", 0) or 0))
+        stats["slippage_usd"] += slippage
 
-        positions[symbol] = {"qty": pos_qty, "avg_entry": pos_avg}
+        updated = update_position_from_trade(pos_qty, pos_avg, price, qty_signed)
+        positions[symbol] = {"qty": updated["qty"], "avg_entry": updated["avg"]}
 
     return {"positions": positions, "cash": cash, "stats": stats}
 

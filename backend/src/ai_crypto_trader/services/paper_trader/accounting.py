@@ -41,7 +41,7 @@ def apply_fill_to_state(
     fees_usd: Decimal = state.get("fees_usd", Decimal("0"))
 
     pos = positions.get(symbol, {"qty": Decimal("0"), "avg": Decimal("0")})
-    updated = _update_position_from_trade(pos["qty"], pos["avg"], price, delta_qty)
+    updated = update_position_from_trade(pos["qty"], pos["avg"], price, delta_qty)
     positions[symbol] = updated
 
     # Cash
@@ -56,7 +56,7 @@ def apply_fill_to_state(
     return state
 
 
-def _update_position_from_trade(
+def update_position_from_trade(
     pos_qty: Decimal,
     pos_avg: Decimal,
     price: Decimal,
@@ -70,7 +70,7 @@ def _update_position_from_trade(
         return {"qty": _q(new_qty, QTY_EXP), "avg": _q(price, PRICE_EXP)}
 
     # Same direction
-    if (pos_qty > 0 and delta_qty > 0) or (pos_qty < 0 and delta_qty < 0):
+    if (pos_qty > 0 and new_qty > 0) or (pos_qty < 0 and new_qty < 0):
         if abs(new_qty) > abs(pos_qty):
             weighted = (abs(pos_qty) * pos_avg + abs(delta_qty) * price) / abs(new_qty)
             return {"qty": _q(new_qty, QTY_EXP), "avg": _q(weighted, PRICE_EXP)}

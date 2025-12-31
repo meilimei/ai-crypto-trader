@@ -19,7 +19,7 @@ from ai_crypto_trader.common.models import (
     utc_now,
 )
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
-from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol, MONEY_EXP
+from ai_crypto_trader.services.paper_trader.accounting import apply_fill_to_state, normalize_symbol, MONEY_EXP
 from ai_crypto_trader.services.paper_trader.ledger import get_initial_usdt, simulate_positions_and_cash
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,19 @@ async def flatten_positions(session: AsyncSession) -> Dict[str, object]:
         logger.info("Flatten requested but paper account missing", extra={"account": account_name})
         return {"ok": True, "account_name": account_name, "flattened": 0, "symbols": []}
 
+    balance = await session.scalar(
+        select(PaperBalance).where(PaperBalance.account_id == account.id, PaperBalance.ccy == account.base_ccy)
+    )
+    if balance is None:
+        balance = PaperBalance(account_id=account.id, ccy=account.base_ccy, available=Decimal("0"))
+        session.add(balance)
+        await session.flush()
+    state = {
+        "positions_by_symbol": {},
+        "balances_by_asset": {"USDT": Decimal(str(balance.available))},
+        "fees_usd": Decimal("0"),
+    }
+
     positions: List[PaperPosition] = (
         await session.scalars(
             select(PaperPosition).where(PaperPosition.account_id == account.id, PaperPosition.qty != Decimal("0"))
@@ -63,6 +76,9 @@ async def flatten_positions(session: AsyncSession) -> Dict[str, object]:
     for pos in positions:
         qty_abs = pos.qty.copy_abs()
         side = "sell" if pos.qty > 0 else "buy"
+        symbol_norm = normalize_symbol(pos.symbol)
+        if symbol_norm and symbol_norm != pos.symbol:
+            pos.symbol = symbol_norm
         symbols.append(pos.symbol)
 
         price = await _latest_price(session, pos.symbol)
@@ -94,10 +110,13 @@ async def flatten_positions(session: AsyncSession) -> Dict[str, object]:
         )
         session.add(trade)
 
-        pos.qty = Decimal("0")
-        pos.avg_entry_price = Decimal("0")
+        apply_fill_to_state(state, pos.symbol, side, qty_abs, fill_price, Decimal("0"))
+        updated = state.get("positions_by_symbol", {}).get(pos.symbol, {"qty": Decimal("0"), "avg": Decimal("0")})
+        pos.qty = updated["qty"]
+        pos.avg_entry_price = updated["avg"]
         pos.unrealized_pnl = Decimal("0")
         pos.updated_at = now
+        balance.available = state.get("balances_by_asset", {}).get("USDT", balance.available)
         flattened += 1
 
     balances: List[PaperBalance] = (
@@ -626,6 +645,8 @@ async def reconcile_apply(
         "before_keys": before_keys,
         "before_db_counts": before_db_counts,
     }
+    qty_eps = Decimal("0.00000001")
+    price_eps = Decimal("0.00000001")
 
     if diff_before == 0:
         session.add(
@@ -665,15 +686,19 @@ async def reconcile_apply(
                 columns=["account_id", "symbol"],
                 alt_names=["uq_paper_positions_account_symbol"],
             )
-            derived_positions = before.get("derived", {}).get("positions_by_symbol", {})
-            db_positions = before.get("db", {}).get("positions_by_symbol", {})
-            symbols = set(derived_positions.keys()) | set(db_positions.keys())
+            derived_positions = before.get("derived", {}).get("positions_by_symbol", {}) or {}
+            db_positions = before.get("db", {}).get("positions_by_symbol", {}) or {}
+            symbols = set(derived_positions.keys())
             now = utc_now()
             values = []
             for sym in symbols:
                 target = derived_positions.get(sym, {"qty": "0", "avg_entry_price": "0"})
                 qty = Decimal(str(target.get("qty", "0")))
                 avg = Decimal(str(target.get("avg_entry_price", "0")))
+                if qty.copy_abs() < qty_eps:
+                    qty = Decimal("0")
+                if qty == 0 or avg.copy_abs() < price_eps:
+                    avg = Decimal("0")
                 side = "short" if qty < 0 else "long"
                 values.append(
                     {
@@ -699,6 +724,19 @@ async def reconcile_apply(
                 )
                 result = await session.execute(stmt)
                 applied_counts["positions"] = int(result.rowcount or 0)
+            missing_symbols = set(db_positions.keys()) - set(derived_positions.keys())
+            if missing_symbols:
+                missing_rows = await session.scalars(
+                    select(PaperPosition).where(
+                        PaperPosition.account_id == account_id,
+                        PaperPosition.symbol.in_(sorted(missing_symbols)),
+                    )
+                )
+                for row in missing_rows:
+                    row_qty = Decimal(str(row.qty or 0))
+                    row_avg = Decimal(str(row.avg_entry_price or 0))
+                    if row_qty.copy_abs() < qty_eps and row_avg.copy_abs() < price_eps:
+                        await session.delete(row)
             pos_cnt = await session.execute(
                 text("select count(*)::int from paper_positions where account_id=:aid"),
                 {"aid": account_id},
@@ -708,12 +746,9 @@ async def reconcile_apply(
         if apply_balances:
             derived_balances_raw = before.get("derived", {}).get("balances_by_asset", {}) or {}
             derived_balances = {normalize_asset(k): Decimal(str(v)) for k, v in derived_balances_raw.items()}
-            db_balances = {normalize_asset(k): Decimal(str(v)) for k, v in (before.get("db", {}).get("balances_by_asset", {}) or {}).items()}
-            assets = set(derived_balances.keys()) | set(db_balances.keys())
             now = utc_now()
             values = []
-            for asset in assets:
-                amount = Decimal(str(derived_balances.get(asset, "0")))
+            for asset, amount in derived_balances.items():
                 values.append(
                     {
                         "account_id": account_id,
@@ -775,7 +810,10 @@ async def reconcile_apply(
             }),
         )
     )
-    await session.commit()
+    if started_tx:
+        await session.commit()
+    else:
+        await session.flush()
 
     return {
         "mode": "apply",

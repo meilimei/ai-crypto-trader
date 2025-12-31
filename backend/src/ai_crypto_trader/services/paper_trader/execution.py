@@ -24,7 +24,9 @@ def _quantize(val: Decimal, exp: str) -> Decimal:
 
 async def _get_balance(session: AsyncSession, account: PaperAccount) -> PaperBalance:
     balance = await session.scalar(
-        select(PaperBalance).where(PaperBalance.account_id == account.id, PaperBalance.ccy == account.base_ccy)
+        select(PaperBalance)
+        .where(PaperBalance.account_id == account.id, PaperBalance.ccy == account.base_ccy)
+        .with_for_update()
     )
     if balance:
         return balance
@@ -37,11 +39,15 @@ async def _get_balance(session: AsyncSession, account: PaperAccount) -> PaperBal
 async def _get_position(session: AsyncSession, account_id: int, symbol: str) -> PaperPosition:
     symbol_norm = normalize_symbol(symbol)
     position = await session.scalar(
-        select(PaperPosition).where(PaperPosition.account_id == account_id, PaperPosition.symbol == symbol_norm)
+        select(PaperPosition)
+        .where(PaperPosition.account_id == account_id, PaperPosition.symbol == symbol_norm)
+        .with_for_update()
     )
     if not position and symbol_norm != symbol:
         position = await session.scalar(
-            select(PaperPosition).where(PaperPosition.account_id == account_id, PaperPosition.symbol == symbol)
+            select(PaperPosition)
+            .where(PaperPosition.account_id == account_id, PaperPosition.symbol == symbol)
+            .with_for_update()
         )
         if position:
             position.symbol = symbol_norm
