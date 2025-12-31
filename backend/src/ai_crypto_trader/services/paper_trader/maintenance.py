@@ -1,6 +1,6 @@
 import json
 import logging
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Any
 
 from sqlalchemy import select, text
@@ -129,6 +129,28 @@ def normalize_asset(asset: str) -> str:
 
 def _quant(val: Decimal, exp: str = "0.00000001") -> Decimal:
     return Decimal(val).quantize(Decimal(exp))
+
+
+def to_decimal(value: Any) -> Decimal:
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+
+
+def is_effectively_zero(value: Any, eps: Decimal) -> bool:
+    return to_decimal(value).copy_abs() <= to_decimal(eps)
+
+
+def normalize_zero(value: Any, eps: Decimal = Decimal("0")) -> Decimal:
+    dec = to_decimal(value)
+    if is_effectively_zero(dec, eps):
+        return Decimal("0")
+    return dec
 
 
 def normalize_status(status: str) -> str:
@@ -361,6 +383,26 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
 
         derived_state = await compute_derived_state(session, account_id)
         diff_result = diff_states(db_state, derived_state)
+        diffs = diff_result.get("diffs", [])
+        diff_type_counts: Dict[str, int] = {}
+        for diff in diffs:
+            diff_type = str(diff.get("type") or "unknown")
+            diff_type_counts[diff_type] = diff_type_counts.get(diff_type, 0) + 1
+        pos_qty_count = diff_type_counts.get("position_qty", 0)
+        pos_avg_count = diff_type_counts.get("position_avg", 0)
+        balance_count = diff_type_counts.get("balance", 0)
+        equity_count = diff_type_counts.get("equity", 0)
+        debug_counts = {
+            "diff_items_total": len(diffs),
+            "diff_items_positions": pos_qty_count + pos_avg_count,
+            "diff_items_position_qty": pos_qty_count,
+            "diff_items_position_avg": pos_avg_count,
+            "diff_items_balances": balance_count,
+            "diff_items_equity": equity_count,
+            "warnings": len(warnings),
+            "extra_rows": 0,
+            "diff_types": diff_type_counts,
+        }
 
         return {
             "ok": diff_result["summary"]["diff_count"] == 0,
@@ -370,6 +412,7 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
             "diffs": diff_result["diffs"],
             "summary": diff_result["summary"],
             "warnings": warnings,
+            "debug_counts": debug_counts,
         }
     except Exception as exc:
         error_payload = {
