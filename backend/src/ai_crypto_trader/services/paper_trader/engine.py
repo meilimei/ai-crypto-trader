@@ -21,7 +21,8 @@ from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceRes
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
-from ai_crypto_trader.services.paper_trader.maintenance import normalize_status, json_safe
+from ai_crypto_trader.services.paper_trader.maintenance import normalize_status
+from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.market_summary import MarketSummaryBuilder
 from ai_crypto_trader.services.paper_trader.risk import clamp_notional, enforce_confidence
@@ -173,7 +174,7 @@ class PaperTradingEngine:
                         action="ORDER_SKIPPED",
                         status=normalize_status("alert"),
                         message="Skipped order with non-positive qty",
-                        meta=json_safe(
+                        meta=to_jsonable(
                             {"symbol": symbol, "qty": str(delta_qty), "reason": "ZERO_OR_NEGATIVE_QTY"}
                         ),
                     )
@@ -199,7 +200,7 @@ class PaperTradingEngine:
                     action="ORDER_SKIPPED",
                     status=normalize_status("alert"),
                     message="Execution skipped due to ValueError",
-                    meta=json_safe({"symbol": symbol, "error": str(exc)}),
+                    meta=to_jsonable({"symbol": symbol, "error": str(exc)}),
                 )
             )
             await session.commit()

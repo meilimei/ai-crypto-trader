@@ -95,11 +95,12 @@ def simulate_positions_and_cash(
                 pos_avg = _q(price, PRICE_EXP)
         else:
             if (pos_qty > 0 and qty_signed > 0) or (pos_qty < 0 and qty_signed < 0):
-                if new_qty == 0:
+                denom = abs(new_qty)
+                if denom == 0:
                     pos_qty = Decimal("0")
                     pos_avg = Decimal("0")
                 else:
-                    weighted = (abs(pos_qty) * pos_avg + qty_abs * price) / abs(new_qty)
+                    weighted = (abs(pos_qty) * pos_avg + qty_abs * price) / denom
                     pos_qty = _q(new_qty, QTY_EXP)
                     pos_avg = _q(weighted, PRICE_EXP)
             else:

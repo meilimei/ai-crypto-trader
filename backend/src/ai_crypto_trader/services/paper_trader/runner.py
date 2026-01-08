@@ -21,7 +21,8 @@ from ai_crypto_trader.common.models import (
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.engine import PaperTradingEngine
 from ai_crypto_trader.common.maintenance import ensure_and_sync_paper_id_sequences
-from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_apply, normalize_status, json_safe
+from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_apply, normalize_status
+from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.common.database import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -115,26 +116,36 @@ class PaperTraderRunner:
     def status(self) -> Dict[str, object]:
         engine_cycle_at = self._engine.last_cycle_at.isoformat() if self._engine and self._engine.last_cycle_at else None
         engine_error = self._engine.last_error if self._engine else None
+        engine_task_state = "none"
+        engine_task_exc = None
         reconcile_state = "none"
         reconcile_exc = None
         running = False
+        if self._task:
+            if self._task.cancelled():
+                engine_task_state = "cancelled"
+            elif self._task.done():
+                engine_task_state = "done"
+                engine_task_exc = self._task.exception()
+            else:
+                engine_task_state = "pending"
         if self._reconcile_task:
             if self._reconcile_task.cancelled():
                 reconcile_state = "cancelled"
             elif self._reconcile_task.done():
                 reconcile_state = "done"
-                try:
-                    reconcile_exc = self._reconcile_task.exception()
-                except Exception:
-                    reconcile_exc = None
+                reconcile_exc = self._reconcile_task.exception()
             else:
                 reconcile_state = "pending"
                 running = True
+                reconcile_exc = None
         return {
             "running": self.is_running,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "last_cycle_at": engine_cycle_at,
             "last_error": engine_error or self.last_error,
+            "engine_task_state": engine_task_state,
+            "engine_task_exception": str(engine_task_exc) if engine_task_exc else None,
             "reconcile_task_running": running,
             "reconcile_task_state": reconcile_state,
             "reconcile_task_exception": str(reconcile_exc) if reconcile_exc else None,
@@ -198,7 +209,7 @@ class PaperTraderRunner:
                                 action="RECONCILE_REPORT",
                                 status=status,
                                 message="Auto reconcile report",
-                                meta=json_safe({
+                                meta=to_jsonable({
                                     "account_id": account.id,
                                     "summary": summary,
                                     "diff_count": diff_count,
@@ -223,7 +234,7 @@ class PaperTraderRunner:
                                 action="RECONCILE_APPLY",
                                 status=status_apply,
                                 message="Auto reconcile apply",
-                                meta=json_safe({
+                                meta=to_jsonable({
                                     "account_id": account.id,
                                     "summary_before": summary,
                                     "summary_after": after_summary,
@@ -250,7 +261,7 @@ class PaperTraderRunner:
                             action="RECONCILE_REPORT",
                             status=normalize_status("error"),
                             message="Auto reconcile error",
-                            meta=json_safe({"account": account_name, "error": str(exc)}),
+                            meta=to_jsonable({"account": account_name, "error": str(exc)}),
                         )
                     )
                     await session.commit()

@@ -1,4 +1,3 @@
-import json
 import logging
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Any
@@ -18,6 +17,7 @@ from ai_crypto_trader.common.models import (
     AdminAction,
     utc_now,
 )
+from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol, MONEY_EXP
 from ai_crypto_trader.services.paper_trader.ledger import get_initial_usdt, simulate_positions_and_cash
@@ -63,14 +63,15 @@ async def flatten_positions(session: AsyncSession) -> Dict[str, object]:
     for pos in positions:
         qty_abs = pos.qty.copy_abs()
         side = "sell" if pos.qty > 0 else "buy"
-        symbols.append(pos.symbol)
+        symbol_norm = normalize_symbol(pos.symbol)
+        symbols.append(symbol_norm)
 
-        price = await _latest_price(session, pos.symbol)
+        price = await _latest_price(session, symbol_norm)
         fill_price = price if price is not None else Decimal("0")
 
         order = PaperOrder(
             account_id=account.id,
-            symbol=pos.symbol,
+            symbol=symbol_norm,
             side=side,
             type="market",
             status="filled",
@@ -84,7 +85,7 @@ async def flatten_positions(session: AsyncSession) -> Dict[str, object]:
 
         trade = PaperTrade(
             account_id=account.id,
-            symbol=pos.symbol,
+            symbol=symbol_norm,
             side=side,
             qty=qty_abs,
             price=fill_price,
@@ -158,7 +159,7 @@ def normalize_status(status: str) -> str:
 
 
 def json_safe(obj: Any) -> Any:
-    return json.loads(json.dumps(obj, default=str))
+    return to_jsonable(obj)
 
 
 def _safe_order_cols(model) -> List[Any]:
@@ -339,13 +340,14 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
                 entry["avg"] = avg
             else:
                 new_qty = entry["qty"] + qty
-                if new_qty != 0:
-                    weighted = (abs(entry["qty"]) * entry["avg"] + abs(qty) * avg) / abs(new_qty)
-                    entry["qty"] = new_qty
-                    entry["avg"] = weighted
-                else:
+                denom = abs(new_qty)
+                if denom == 0:
                     entry["qty"] = Decimal("0")
                     entry["avg"] = Decimal("0")
+                else:
+                    weighted = (abs(entry["qty"]) * entry["avg"] + abs(qty) * avg) / denom
+                    entry["qty"] = new_qty
+                    entry["avg"] = weighted
         if any(count > 1 for count in symbol_counts.values()) or any(len(raws) > 1 for raws in symbol_raws.values()):
             warnings.append("DUP_SYMBOL_ROWS")
 
@@ -381,7 +383,15 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
             else None,
         }
 
-        derived_state = await compute_derived_state(session, account_id)
+        try:
+            derived_state = await compute_derived_state(session, account_id)
+        except (InvalidOperation, ZeroDivisionError) as exc:
+            warnings.append(f"DERIVED_STATE_ERROR:{exc.__class__.__name__}")
+            derived_state = {
+                "positions_by_symbol": {},
+                "balances_by_asset": {},
+                "baseline_source": "error",
+            }
         diff_result = diff_states(db_state, derived_state)
         diffs = diff_result.get("diffs", [])
         diff_type_counts: Dict[str, int] = {}
@@ -429,7 +439,7 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
                     action="RECONCILE_REPORT",
                     status=normalize_status("error"),
                     message="Reconcile report error",
-                    meta=json_safe(
+                    meta=to_jsonable(
                         {
                             "account_id": account_id,
                             "error_type": exc.__class__.__name__,
@@ -472,7 +482,7 @@ async def reconcile_fix(session: AsyncSession, account_id: int, apply: bool) -> 
                 action="RECONCILE_REPORT",
                 status=status,
                 message="Reconcile report (dry run)",
-                meta=json_safe({
+                meta=to_jsonable({
                     "account_id": account_id,
                     "summary": report_before.get("summary"),
                     "diffs_sample": diffs[:20],
@@ -504,7 +514,7 @@ async def reconcile_fix(session: AsyncSession, account_id: int, apply: bool) -> 
                 action="RECONCILE_APPLY",
                 status=normalize_status("blocked"),
                 message="Reconcile blocked",
-                meta=json_safe(
+                meta=to_jsonable(
                     {"account_id": account_id, "derived_cash": str(derived_cash), "equity_mismatch": equity_mismatch}
                 ),
             )
@@ -577,7 +587,7 @@ async def reconcile_fix(session: AsyncSession, account_id: int, apply: bool) -> 
             action="RECONCILE_APPLY",
             status=status,
             message="Reconcile fix applied",
-            meta=json_safe({
+            meta=to_jsonable({
                 "account_id": account_id,
                 "before_summary": report_before.get("summary"),
                 "after_summary": report_after.get("summary"),
@@ -676,7 +686,7 @@ async def reconcile_apply(
                 action="RECONCILE_APPLY",
                 status=normalize_status("ok"),
                 message="No diffs to apply",
-                meta=json_safe({
+                meta=to_jsonable({
                     "account_id": account_id,
                     "summary_before": before_summary,
                     "warnings": warnings,
@@ -802,7 +812,7 @@ async def reconcile_apply(
             action="RECONCILE_APPLY",
             status=status,
             message="Reconcile apply",
-            meta=json_safe({
+            meta=to_jsonable({
                 "account_id": account_id,
                 "summary_before": before_summary,
                 "summary_after": after_summary,

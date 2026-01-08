@@ -1,12 +1,12 @@
 import os
 import logging
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Body
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, select, desc
+from sqlalchemy import func, select, desc, delete
 from sqlalchemy.exc import ProgrammingError
 try:
     from asyncpg.exceptions import UndefinedTableError as AsyncpgUndefinedTableError
@@ -17,6 +17,7 @@ from ai_crypto_trader.common.database import get_db_session
 from ai_crypto_trader.services.paper_trader.runner import PaperTraderRunner, reset_paper_data
 from ai_crypto_trader.services.paper_trader.maintenance import flatten_positions
 from ai_crypto_trader.common.models import (
+    Candle,
     EquitySnapshot,
     PaperAccount,
     PaperBalance,
@@ -27,10 +28,12 @@ from ai_crypto_trader.common.models import (
 )
 
 from ai_crypto_trader.common.log_buffer import get_log_buffer
-from ai_crypto_trader.services.paper_trader.config import get_active_bundle, ActiveConfigMissingError
+from ai_crypto_trader.services.paper_trader.config import get_active_bundle, ActiveConfigMissingError, PaperTraderConfig
+from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
-from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status, json_safe
+from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
+from ai_crypto_trader.common.jsonable import to_jsonable
 from sqlalchemy import text
 from fastapi.responses import StreamingResponse
 import asyncio
@@ -63,6 +66,19 @@ def _account_name() -> str:
     from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 
     return os.getenv("PAPER_ACCOUNT_NAME") or f"paper-{PaperTraderConfig.from_env().exchange_name}"
+
+
+async def _latest_price(session: AsyncSession, symbol: str) -> Decimal | None:
+    try:
+        result = await session.execute(
+            select(Candle.close)
+            .where(Candle.symbol == symbol)
+            .order_by(Candle.open_time.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+    except Exception:
+        return None
 
 
 @router.post("/start")
@@ -194,6 +210,23 @@ class ReconcileApplyBody(BaseModel):
     apply_positions: bool | None = True
 
 
+class SmokeTradeRequest(BaseModel):
+    account_id: int
+    symbol: str = "ETHUSDT"
+    side: str = "buy"
+    qty: Decimal = Decimal("0.01")
+    price: str | None = None
+
+
+class PaperAccountCreateRequest(BaseModel):
+    initial_cash_usd: Decimal | None = None
+
+
+class PaperAccountResetRequest(BaseModel):
+    account_id: int
+    reset_to_initial_cash: bool | None = True
+
+
 @router.post("/risk-check")
 async def risk_check(payload: RiskCheckRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
     try:
@@ -252,17 +285,34 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
     fee_bps = Decimal(str(bundle["risk_policy"]["fee_bps"]))
     slippage_bps = Decimal(str(bundle["risk_policy"]["slippage_bps"]))
 
-    execution = await execute_market_order_with_costs(
-        session=session,
-        account_id=payload.account_id,
-        symbol=payload.symbol,
-        side=payload.side,
-        qty=qty,
-        mid_price=Decimal(str(payload.price)),
-        fee_bps=fee_bps,
-        slippage_bps=slippage_bps,
-        meta={"origin": "admin_manual"},
-    )
+    try:
+        execution = await execute_market_order_with_costs(
+            session=session,
+            account_id=payload.account_id,
+            symbol=payload.symbol,
+            side=payload.side,
+            qty=qty,
+            mid_price=Decimal(str(payload.price)),
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            meta={"origin": "admin_manual"},
+        )
+    except ValueError as exc:
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "alert",
+            "Order rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol": payload.symbol,
+                "side": payload.side,
+                "qty": str(qty),
+                "price": str(payload.price),
+                "reason": str(exc),
+            },
+        )
+        raise HTTPException(status_code=400, detail=str(exc))
 
     exec_payload = {
         **meta_payload,
@@ -281,6 +331,391 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
             "balance_available": str(execution.balance.available),
             "costs": execution.costs,
         },
+    }
+
+
+@router.post("/smoke-trade")
+async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
+    # Self-test: NEW_ID=3 smoke buy 0.01 + sell 0.005 (with price), then verify positions/balances,
+    # reconcile?account_id=3 diff_count ok, /status has no InvalidStateError, admin_actions meta serializes.
+    symbol_in = (payload.symbol or "ETHUSDT").strip()
+    symbol_norm = normalize_symbol(symbol_in)
+    side = (payload.side or "buy").lower().strip()
+    if side not in {"buy", "sell"}:
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "alert",
+            "Order rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(payload.qty),
+                "reason": "side must be buy or sell",
+            },
+        )
+        raise HTTPException(status_code=400, detail="side must be buy or sell")
+    qty = Decimal(str(payload.qty))
+    if qty <= 0:
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "alert",
+            "Order rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(payload.qty),
+                "reason": "qty must be positive",
+            },
+        )
+        raise HTTPException(status_code=400, detail="qty must be positive")
+    if not symbol_norm:
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "alert",
+            "Order rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(payload.qty),
+                "reason": "symbol must be non-empty",
+            },
+        )
+        raise HTTPException(status_code=400, detail="symbol must be non-empty")
+
+    price = None
+    price_source = None
+    if payload.price is not None:
+        try:
+            price = Decimal(str(payload.price))
+        except (InvalidOperation, TypeError, ValueError):
+            await _record_action(
+                session,
+                "ORDER_REJECTED",
+                "alert",
+                "Order rejected",
+                meta={
+                    "account_id": payload.account_id,
+                    "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
+                    "side": side,
+                    "qty": str(qty),
+                    "price": payload.price,
+                    "reason": "price must be a valid decimal",
+                },
+            )
+            raise HTTPException(status_code=400, detail="price must be a valid decimal")
+        if not price.is_finite() or price <= 0:
+            await _record_action(
+                session,
+                "ORDER_REJECTED",
+                "alert",
+                "Order rejected",
+                meta={
+                    "account_id": payload.account_id,
+                    "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
+                    "side": side,
+                    "qty": str(qty),
+                    "price": str(price),
+                    "reason": "price must be positive",
+                },
+            )
+            raise HTTPException(status_code=400, detail="price must be positive")
+        price_source = "override"
+    else:
+        price = await _latest_price(session, symbol_norm)
+        if price is not None and price.is_finite():
+            price_source = "latest"
+        else:
+            price = None
+            symbol_slash = None
+            if "/" in symbol_in:
+                symbol_slash = symbol_in
+            elif symbol_norm.endswith("USDT") and len(symbol_norm) > 4:
+                symbol_slash = f"{symbol_norm[:-4]}/USDT"
+            symbols = [symbol_norm]
+            if symbol_slash and symbol_slash not in symbols:
+                symbols.append(symbol_slash)
+            last_trade = await session.execute(
+                select(PaperTrade.price)
+                .where(PaperTrade.symbol.in_(symbols))
+                .order_by(desc(PaperTrade.created_at).nullslast(), PaperTrade.id.desc())
+                .limit(1)
+            )
+            row = last_trade.first()
+            if row and row[0] is not None:
+                candidate = Decimal(str(row[0]))
+                if candidate.is_finite() and candidate > 0:
+                    price = candidate
+                    price_source = "paper_trades_last"
+
+    if price is None:
+        await _record_action(
+            session,
+            "SMOKE_TRADE",
+            "error",
+            "Smoke trade price unavailable",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(qty),
+                "price": None,
+                "price_source": price_source,
+                "trade_id": None,
+            },
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"No price data for symbol {symbol_norm}; pass price to override",
+        )
+
+    config = PaperTraderConfig.from_env()
+    try:
+        execution = await execute_market_order_with_costs(
+            session=session,
+            account_id=payload.account_id,
+            symbol=symbol_norm,
+            side=side,
+            qty=qty,
+            mid_price=Decimal(str(price)),
+            fee_bps=config.fee_bps,
+            slippage_bps=config.slippage_bps,
+            meta={"origin": "admin_smoke"},
+        )
+    except ValueError as exc:
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "alert",
+            "Order rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(qty),
+                "price": str(price) if price is not None else None,
+                "price_source": price_source,
+                "reason": str(exc),
+            },
+        )
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        await _record_action(
+            session,
+            "SMOKE_TRADE",
+            "error",
+            "Smoke trade failed",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(qty),
+                "price": str(price) if price is not None else None,
+                "price_source": price_source,
+                "trade_id": None,
+                "error": str(exc),
+            },
+        )
+        raise
+
+    await _record_action(
+        session,
+        "SMOKE_TRADE",
+        "ok",
+        "Smoke trade executed",
+        meta={
+            "account_id": payload.account_id,
+            "symbol_in": symbol_in,
+            "symbol_normalized": symbol_norm,
+            "side": side,
+            "qty": str(qty),
+            "price": str(price) if price is not None else None,
+            "price_source": price_source,
+            "trade_id": execution.trade.id,
+        },
+    )
+
+    positions = (
+        await session.scalars(
+            select(PaperPosition)
+            .where(PaperPosition.account_id == payload.account_id)
+            .order_by(PaperPosition.symbol.asc())
+        )
+    ).all()
+    balance = await session.scalar(
+        select(PaperBalance)
+        .where(PaperBalance.account_id == payload.account_id, PaperBalance.ccy == "USDT")
+    )
+    report = await reconcile_report(session, payload.account_id)
+
+    return {
+        "symbol_in": symbol_in,
+        "symbol_normalized": symbol_norm,
+        "price_source": price_source,
+        "trade": {
+            "id": execution.trade.id,
+            "symbol": execution.trade.symbol,
+            "side": execution.trade.side,
+            "qty": str(execution.trade.qty),
+            "price": str(execution.trade.price),
+            "fee": str(execution.trade.fee),
+            "created_at": execution.trade.created_at.isoformat() if execution.trade.created_at else None,
+        },
+        "positions": [
+            {
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "qty": str(pos.qty),
+                "avg_entry_price": str(pos.avg_entry_price),
+                "updated_at": pos.updated_at.isoformat() if pos.updated_at else None,
+            }
+            for pos in positions
+        ],
+        "balance_usdt": {
+            "ccy": balance.ccy,
+            "available": str(balance.available),
+            "updated_at": balance.updated_at.isoformat() if balance.updated_at else None,
+        }
+        if balance
+        else None,
+        "reconcile": report,
+    }
+
+
+@admin_router.post("/paper-accounts/create")
+async def create_paper_account(
+    payload: PaperAccountCreateRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    config = PaperTraderConfig.from_env()
+    initial_cash = (
+        Decimal(str(payload.initial_cash_usd))
+        if payload.initial_cash_usd is not None
+        else Decimal("10000.00")
+    )
+    if not initial_cash.is_finite() or initial_cash < 0:
+        raise HTTPException(status_code=400, detail="initial_cash_usd must be a valid decimal")
+
+    account_name = f"paper-{config.exchange_name}"
+    base_ccy = config.base_ccy
+
+    async def _create() -> PaperAccount:
+        account = await session.scalar(select(PaperAccount).where(PaperAccount.name == account_name))
+        if account is None:
+            account = PaperAccount(name=account_name, base_ccy=base_ccy, initial_cash_usd=initial_cash)
+            session.add(account)
+            await session.flush()
+        elif payload.initial_cash_usd is not None or account.initial_cash_usd is None:
+            account.initial_cash_usd = initial_cash
+            await session.flush()
+
+        balance = await session.scalar(
+            select(PaperBalance).where(PaperBalance.account_id == account.id, PaperBalance.ccy == "USDT")
+        )
+        if balance is None:
+            balance = PaperBalance(account_id=account.id, ccy="USDT", available=initial_cash)
+            session.add(balance)
+        else:
+            balance.available = initial_cash
+        await session.flush()
+        return account
+
+    if session.in_transaction():
+        account = await _create()
+    else:
+        async with session.begin():
+            account = await _create()
+
+    return {
+        "account_id": account.id,
+        "name": account.name,
+        "initial_cash_usd": str(account.initial_cash_usd),
+    }
+
+
+@admin_router.post("/paper-accounts/reset")
+async def reset_paper_account(
+    payload: PaperAccountResetRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    reset_to_initial_cash = bool(payload.reset_to_initial_cash) if payload.reset_to_initial_cash is not None else True
+    account = await session.get(PaperAccount, payload.account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Paper account not found")
+
+    async def _reset() -> None:
+        initial_cash = account.initial_cash_usd if account.initial_cash_usd is not None else Decimal("10000.00")
+        await session.execute(delete(PaperOrder).where(PaperOrder.account_id == account.id))
+        await session.execute(delete(PaperTrade).where(PaperTrade.account_id == account.id))
+        await session.execute(delete(PaperPosition).where(PaperPosition.account_id == account.id))
+        await session.execute(delete(PaperBalance).where(PaperBalance.account_id == account.id))
+        if reset_to_initial_cash:
+            session.add(PaperBalance(account_id=account.id, ccy="USDT", available=Decimal(str(initial_cash))))
+        session.add(
+            AdminAction(
+                action="ACCOUNT_RESET",
+                status=normalize_status("ok"),
+                message="Paper account reset",
+                meta=to_jsonable(
+                    {
+                        "account_id": account.id,
+                        "reset_to_initial_cash": reset_to_initial_cash,
+                        "initial_cash_usd": str(initial_cash),
+                    }
+                ),
+            )
+        )
+        await session.flush()
+
+    try:
+        if session.in_transaction():
+            await _reset()
+        else:
+            async with session.begin():
+                await _reset()
+    except Exception as exc:
+        try:
+            if session.in_transaction():
+                await session.rollback()
+        except Exception:
+            pass
+        try:
+            session.add(
+                AdminAction(
+                    action="ACCOUNT_RESET",
+                    status=normalize_status("error"),
+                    message="Paper account reset error",
+                    meta=to_jsonable(
+                        {
+                            "account_id": account.id,
+                            "reset_to_initial_cash": reset_to_initial_cash,
+                            "initial_cash_usd": str(account.initial_cash_usd),
+                            "error": str(exc),
+                        }
+                    ),
+                )
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+        raise
+
+    return {
+        "account_id": account.id,
+        "reset_to_initial_cash": reset_to_initial_cash,
     }
 
 
@@ -371,7 +806,7 @@ async def _record_action(session: AsyncSession, action: str, status: str, messag
                 action=action,
                 status=normalize_status(status),
                 message=message,
-                meta=json_safe(meta or {}),
+                meta=to_jsonable(meta or {}),
             )
         )
         await session.commit()
