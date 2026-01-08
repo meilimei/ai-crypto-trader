@@ -21,6 +21,7 @@ from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceRes
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.utils import RiskRejected
 from ai_crypto_trader.services.paper_trader.maintenance import normalize_status
 from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
@@ -172,7 +173,7 @@ class PaperTradingEngine:
                 session.add(
                     AdminAction(
                         action="ORDER_SKIPPED",
-                        status=normalize_status("alert"),
+                        status=normalize_status("warn"),
                         message="Skipped order with non-positive qty",
                         meta=to_jsonable(
                             {"symbol": symbol, "qty": str(delta_qty), "reason": "ZERO_OR_NEGATIVE_QTY"}
@@ -180,12 +181,11 @@ class PaperTradingEngine:
                     )
                 )
                 await session.commit()
-                self.last_error = "ZERO_OR_NEGATIVE_QTY"
                 return
             fill = await execute_market_order_with_costs(
                 session=session,
                 account_id=account_id,
-                symbol=symbol_norm,
+                symbol=symbol,
                 side=side,
                 qty=qty_dec,
                 mid_price=summary.last_close,
@@ -193,14 +193,13 @@ class PaperTradingEngine:
                 slippage_bps=self.config.slippage_bps,
                 meta={"origin": "engine"},
             )
-        except ValueError as exc:
-            self.last_error = str(exc)
+        except (RiskRejected, ValueError) as exc:
             session.add(
                 AdminAction(
                     action="ORDER_SKIPPED",
-                    status=normalize_status("alert"),
+                    status=normalize_status("warn"),
                     message="Execution skipped due to ValueError",
-                    meta=to_jsonable({"symbol": symbol, "error": str(exc)}),
+                    meta=to_jsonable({"symbol": symbol, "side": side, "qty": str(qty_dec), "reason": str(exc)}),
                 )
             )
             await session.commit()

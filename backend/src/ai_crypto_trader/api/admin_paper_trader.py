@@ -32,12 +32,16 @@ from ai_crypto_trader.services.paper_trader.config import get_active_bundle, Act
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
 from ai_crypto_trader.common.jsonable import to_jsonable
+from ai_crypto_trader.utils.json_safe import json_safe
 from sqlalchemy import text
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import asyncio
 import json
+
+logger = logging.getLogger(__name__)
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
@@ -286,22 +290,23 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
     slippage_bps = Decimal(str(bundle["risk_policy"]["slippage_bps"]))
 
     try:
+        prepared = prepare_order_inputs(payload.symbol, qty, payload.price)
         execution = await execute_market_order_with_costs(
             session=session,
             account_id=payload.account_id,
-            symbol=payload.symbol,
+            symbol=prepared.symbol,
             side=payload.side,
-            qty=qty,
-            mid_price=Decimal(str(payload.price)),
+            qty=prepared.qty,
+            mid_price=prepared.price,
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             meta={"origin": "admin_manual"},
         )
-    except ValueError as exc:
+    except (RiskRejected, ValueError) as exc:
         await _record_action(
             session,
             "ORDER_REJECTED",
-            "alert",
+            "warn",
             "Order rejected",
             meta={
                 "account_id": payload.account_id,
@@ -334,62 +339,45 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
     }
 
 
-@router.post("/smoke-trade")
-async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
+async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -> dict:
     # Self-test: NEW_ID=3 smoke buy 0.01 + sell 0.005 (with price), then verify positions/balances,
     # reconcile?account_id=3 diff_count ok, /status has no InvalidStateError, admin_actions meta serializes.
     symbol_in = (payload.symbol or "ETHUSDT").strip()
     symbol_norm = normalize_symbol(symbol_in)
+    qty_raw = payload.qty
     side = (payload.side or "buy").lower().strip()
+    if "/" in symbol_in:
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "warn",
+            "Order rejected",
+            meta=json_safe({
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "side": side,
+                "qty": str(qty_raw),
+                "price": None,
+                "reason": "SYMBOL_CONTAINS_SLASH",
+            }),
+        )
+        raise HTTPException(status_code=400, detail="SYMBOL_CONTAINS_SLASH")
     if side not in {"buy", "sell"}:
         await _record_action(
             session,
             "ORDER_REJECTED",
-            "alert",
+            "warn",
             "Order rejected",
-            meta={
+            meta=json_safe({
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
                 "side": side,
                 "qty": str(payload.qty),
+                "price": None,
                 "reason": "side must be buy or sell",
-            },
+            }),
         )
         raise HTTPException(status_code=400, detail="side must be buy or sell")
-    qty = Decimal(str(payload.qty))
-    if qty <= 0:
-        await _record_action(
-            session,
-            "ORDER_REJECTED",
-            "alert",
-            "Order rejected",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(payload.qty),
-                "reason": "qty must be positive",
-            },
-        )
-        raise HTTPException(status_code=400, detail="qty must be positive")
-    if not symbol_norm:
-        await _record_action(
-            session,
-            "ORDER_REJECTED",
-            "alert",
-            "Order rejected",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(payload.qty),
-                "reason": "symbol must be non-empty",
-            },
-        )
-        raise HTTPException(status_code=400, detail="symbol must be non-empty")
 
     price = None
     price_source = None
@@ -400,34 +388,32 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             await _record_action(
                 session,
                 "ORDER_REJECTED",
-                "alert",
+                "warn",
                 "Order rejected",
-                meta={
+                meta=json_safe({
                     "account_id": payload.account_id,
                     "symbol_in": symbol_in,
-                    "symbol_normalized": symbol_norm,
                     "side": side,
-                    "qty": str(qty),
+                    "qty": str(payload.qty),
                     "price": payload.price,
                     "reason": "price must be a valid decimal",
-                },
+                }),
             )
             raise HTTPException(status_code=400, detail="price must be a valid decimal")
         if not price.is_finite() or price <= 0:
             await _record_action(
                 session,
                 "ORDER_REJECTED",
-                "alert",
+                "warn",
                 "Order rejected",
-                meta={
+                meta=json_safe({
                     "account_id": payload.account_id,
                     "symbol_in": symbol_in,
-                    "symbol_normalized": symbol_norm,
                     "side": side,
-                    "qty": str(qty),
+                    "qty": str(payload.qty),
                     "price": str(price),
                     "reason": "price must be positive",
-                },
+                }),
             )
             raise HTTPException(status_code=400, detail="price must be positive")
         price_source = "override"
@@ -464,21 +450,43 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             "SMOKE_TRADE",
             "error",
             "Smoke trade price unavailable",
-            meta={
+            meta=json_safe({
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
                 "symbol_normalized": symbol_norm,
                 "side": side,
-                "qty": str(qty),
+                "qty": str(qty_raw),
                 "price": None,
                 "price_source": price_source,
                 "trade_id": None,
-            },
+            }),
         )
         raise HTTPException(
             status_code=400,
             detail=f"No price data for symbol {symbol_norm}; pass price to override",
         )
+
+    try:
+        prepared = prepare_order_inputs(symbol_in, qty_raw, price)
+    except ValueError as exc:
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "warn",
+            "Order rejected",
+            meta=json_safe({
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "side": side,
+                "qty": str(qty_raw),
+                "price": str(price) if price is not None else None,
+                "price_source": price_source,
+                "reason": str(exc),
+            }),
+        )
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    symbol_norm = prepared.symbol
 
     config = PaperTraderConfig.from_env()
     try:
@@ -487,28 +495,28 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             account_id=payload.account_id,
             symbol=symbol_norm,
             side=side,
-            qty=qty,
-            mid_price=Decimal(str(price)),
+            qty=prepared.qty,
+            mid_price=prepared.price,
             fee_bps=config.fee_bps,
             slippage_bps=config.slippage_bps,
             meta={"origin": "admin_smoke"},
         )
-    except ValueError as exc:
+    except (RiskRejected, ValueError) as exc:
         await _record_action(
             session,
             "ORDER_REJECTED",
-            "alert",
+            "warn",
             "Order rejected",
-            meta={
+            meta=json_safe({
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
                 "symbol_normalized": symbol_norm,
                 "side": side,
-                "qty": str(qty),
-                "price": str(price) if price is not None else None,
+                "qty": str(prepared.qty),
+                "price": str(prepared.price) if price is not None else None,
                 "price_source": price_source,
                 "reason": str(exc),
-            },
+            }),
         )
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -517,17 +525,17 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             "SMOKE_TRADE",
             "error",
             "Smoke trade failed",
-            meta={
+            meta=json_safe({
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
                 "symbol_normalized": symbol_norm,
                 "side": side,
-                "qty": str(qty),
+                "qty": str(prepared.qty),
                 "price": str(price) if price is not None else None,
                 "price_source": price_source,
                 "trade_id": None,
                 "error": str(exc),
-            },
+            }),
         )
         raise
 
@@ -536,16 +544,16 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
         "SMOKE_TRADE",
         "ok",
         "Smoke trade executed",
-        meta={
+        meta=json_safe({
             "account_id": payload.account_id,
             "symbol_in": symbol_in,
             "symbol_normalized": symbol_norm,
             "side": side,
-            "qty": str(qty),
+            "qty": str(prepared.qty),
             "price": str(price) if price is not None else None,
             "price_source": price_source,
             "trade_id": execution.trade.id,
-        },
+        }),
     )
 
     positions = (
@@ -562,6 +570,8 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
     report = await reconcile_report(session, payload.account_id)
 
     return {
+        "ok": True,
+        "account_id": payload.account_id,
         "symbol_in": symbol_in,
         "symbol_normalized": symbol_norm,
         "price_source": price_source,
@@ -593,6 +603,37 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
         else None,
         "reconcile": report,
     }
+
+
+@router.post("/smoke-trade")
+async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
+    try:
+        return await _smoke_trade_impl(payload, session)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Smoke trade failed")
+        await _record_action(
+            session,
+            "SMOKE_TRADE",
+            "error",
+            "Smoke trade failed",
+            meta=json_safe(
+                {
+                    "account_id": payload.account_id,
+                    "symbol_in": getattr(payload, "symbol", None),
+                    "side": getattr(payload, "side", None),
+                    "qty": str(getattr(payload, "qty", None)),
+                    "price_override": getattr(payload, "price", None),
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                }
+            ),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(exc), "error_type": exc.__class__.__name__},
+        )
 
 
 @admin_router.post("/paper-accounts/create")

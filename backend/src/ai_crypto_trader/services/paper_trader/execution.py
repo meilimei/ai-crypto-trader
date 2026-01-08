@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from ai_crypto_trader.common.models import PaperAccount, PaperBalance, PaperOrder, PaperPosition, PaperTrade, utc_now
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol, QTY_EXP, MONEY_EXP, PRICE_EXP
+from ai_crypto_trader.services.paper_trader.utils import guard_market_risk, prepare_order_inputs
 
 
 @dataclass
@@ -110,10 +111,12 @@ async def apply_trade_to_state(
     fee: Decimal,
     initial_cash_usd: Decimal,
 ) -> tuple[PaperPosition, PaperBalance]:
+    if "/" in str(symbol):
+        raise ValueError("SYMBOL_CONTAINS_SLASH")
     symbol_norm = normalize_symbol(symbol)
     if not symbol_norm or "/" in symbol_norm:
         raise ValueError("Invalid symbol")
-    qty_dec = _quantize(Decimal(str(qty)).copy_abs(), QTY_EXP)
+    qty_dec = _quantize(Decimal(str(qty)), QTY_EXP)
     if qty_dec <= 0:
         raise ValueError("Quantity must be positive")
     if side not in {"buy", "sell"}:
@@ -168,19 +171,14 @@ async def execute_market_order_with_costs(
     slippage_bps: Decimal,
     meta: Optional[Dict[str, str]] = None,
 ) -> ExecutionResult:
-    qty_dec = _quantize(Decimal(str(qty)), QTY_EXP)
-    if qty_dec <= 0:
-        raise ValueError("Quantity must be positive")
+    prepared = prepare_order_inputs(symbol, qty, mid_price)
+    qty_dec = prepared.qty
+    symbol_norm = prepared.symbol
 
     side_norm = side.lower().strip()
     if side_norm not in {"buy", "sell"}:
         raise ValueError("Side must be buy or sell")
-    symbol_norm = normalize_symbol(symbol)
-    if not symbol_norm or "/" in symbol_norm:
-        raise ValueError("Invalid symbol")
-    mid_price_dec = _quantize(Decimal(str(mid_price)), PRICE_EXP)
-    if not mid_price_dec.is_finite() or mid_price_dec <= 0:
-        raise ValueError("Price must be positive")
+    mid_price_dec = prepared.price
     slip_mult = Decimal("1") + (slippage_bps / Decimal("10000"))
     if side_norm == "sell":
         slip_mult = Decimal("1") - (slippage_bps / Decimal("10000"))
@@ -203,6 +201,21 @@ async def execute_market_order_with_costs(
         account = await session.get(PaperAccount, account_id, with_for_update=True)
         if not account:
             raise ValueError("Paper account not found")
+
+        allow_short = False
+        if meta and isinstance(meta, dict):
+            allow_short = bool(meta.get("allow_short", False))
+        await guard_market_risk(
+            session,
+            account_id=account_id,
+            symbol=symbol_norm,
+            side=side_norm,
+            qty=qty_dec,
+            price=mid_price_dec,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            allow_short=allow_short,
+        )
 
         order = PaperOrder(
             account_id=account_id,
