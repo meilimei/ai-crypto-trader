@@ -6,11 +6,11 @@ from typing import Optional
 
 from fastapi import HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import MissingGreenlet
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.database import AsyncSessionLocal
 from ai_crypto_trader.common.models import (
-    AdminAction,
     PaperAccount,
     PaperBalance,
     PaperPosition,
@@ -22,9 +22,8 @@ from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
 from ai_crypto_trader.services.paper_trader.utils import RiskRejected
-from ai_crypto_trader.services.paper_trader.maintenance import normalize_status
-from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
+from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
 from ai_crypto_trader.services.paper_trader.market_summary import MarketSummaryBuilder
 from ai_crypto_trader.services.paper_trader.risk import clamp_notional, enforce_confidence
 from ai_crypto_trader.services.paper_trader.sizing import target_notional_from_advice
@@ -52,6 +51,13 @@ class PaperTradingEngine:
                 await self._cycle()
                 self.last_cycle_at = datetime.now(timezone.utc)
                 self.last_error = None
+            except MissingGreenlet as exc:
+                self.last_error = "MissingGreenlet"
+                logger.exception("Paper engine cycle failed with MissingGreenlet")
+                async with AsyncSessionLocal() as session:
+                    await self._log_engine_error(session, account_id=None, symbol=None, exc=exc)
+                await asyncio.sleep(2)
+                continue
             except Exception as exc:
                 self.last_error = str(exc)
                 logger.exception("Paper engine cycle failed")
@@ -66,18 +72,31 @@ class PaperTradingEngine:
 
     async def _cycle(self) -> None:
         async with AsyncSessionLocal() as session:
-            account = await self._ensure_account(session)
-            balance = await self._ensure_balance(session, account.id)
+            try:
+                account = await self._ensure_account(session)
+                balance = await self._ensure_balance(session, account.id)
+            except MissingGreenlet as exc:
+                await self._log_engine_error(session, account_id=None, symbol=None, exc=exc)
+                return
 
             equity = await self._compute_equity(session, balance, account.id)
             if self.peak_equity is None or equity > self.peak_equity:
                 self.peak_equity = equity
 
             for symbol in self.config.symbols:
-                await self._process_symbol(session, account.id, balance, equity, symbol)
+                try:
+                    await self._process_symbol(session, account.id, balance, equity, symbol)
+                except MissingGreenlet as exc:
+                    await self._log_engine_error(session, account_id=account.id, symbol=symbol, exc=exc)
+                    continue
 
-            await self._snapshot_equity(session, account.id, balance, equity)
-            await session.commit()
+            try:
+                await self._snapshot_equity(session, account.id, balance, equity)
+                await session.commit()
+            except MissingGreenlet as exc:
+                await self._log_engine_error(session, account_id=account.id, symbol=None, exc=exc)
+                await session.rollback()
+                return
 
     async def _ensure_account(self, session: AsyncSession) -> PaperAccount:
         account = await session.scalar(select(PaperAccount).where(PaperAccount.name == self.account_name))
@@ -166,21 +185,23 @@ class PaperTradingEngine:
             return
 
         side = "buy" if delta_qty > 0 else "sell"
+        qty_dec = Decimal("0")
 
         try:
             qty_dec = Decimal(str(delta_qty)).copy_abs()
             if qty_dec <= 0:
-                session.add(
-                    AdminAction(
-                        action="ORDER_SKIPPED",
-                        status=normalize_status("warn"),
-                        message="Skipped order with non-positive qty",
-                        meta=to_jsonable(
-                            {"symbol": symbol, "qty": str(delta_qty), "reason": "ZERO_OR_NEGATIVE_QTY"}
-                        ),
-                    )
+                await add_action_deduped(
+                    session,
+                    action="ORDER_SKIPPED",
+                    status="warn",
+                    message="Execution skipped",
+                    meta={
+                        "account_id": account_id,
+                        "symbol": symbol_norm,
+                        "qty": str(delta_qty),
+                        "reason": "ZERO_OR_NEGATIVE_QTY",
+                    },
                 )
-                await session.commit()
                 return
             fill = await execute_market_order_with_costs(
                 session=session,
@@ -194,15 +215,37 @@ class PaperTradingEngine:
                 meta={"origin": "engine"},
             )
         except (RiskRejected, ValueError) as exc:
-            session.add(
-                AdminAction(
-                    action="ORDER_SKIPPED",
-                    status=normalize_status("warn"),
-                    message="Execution skipped due to ValueError",
-                    meta=to_jsonable({"symbol": symbol, "side": side, "qty": str(qty_dec), "reason": str(exc)}),
-                )
+            await add_action_deduped(
+                session,
+                action="ORDER_SKIPPED",
+                status="warn",
+                message="Execution skipped",
+                meta={
+                    "account_id": account_id,
+                    "symbol": symbol_norm,
+                    "side": side,
+                    "qty": str(qty_dec),
+                    "reason": str(exc),
+                    "error_type": exc.__class__.__name__,
+                },
             )
-            await session.commit()
+            return
+        except Exception as exc:  # safety net to keep engine alive
+            logger.exception("Execution failed; skipping symbol", extra={"symbol": symbol_norm})
+            await add_action_deduped(
+                session,
+                action="ORDER_SKIPPED",
+                status="alert",
+                message="Execution skipped",
+                meta={
+                    "symbol": symbol_norm,
+                    "side": side,
+                    "qty": str(delta_qty),
+                    "error": str(exc),
+                    "error_type": exc.__class__.__name__,
+                    "account_id": account_id,
+                },
+            )
             return
 
         logger.info(
@@ -245,6 +288,27 @@ class PaperTradingEngine:
         session.add(position)
         await session.flush()
         return position
+
+    async def _log_engine_error(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: int | None,
+        symbol: str | None,
+        exc: Exception,
+    ) -> None:
+        await add_action_deduped(
+            session,
+            action="ENGINE_ERROR",
+            status="alert",
+            message="Engine error",
+            meta={
+                "account_id": account_id,
+                "symbol": normalize_symbol(symbol) if symbol else None,
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            },
+        )
 
     async def _fetch_advice(self, summary) -> Optional[AdviceResponse]:
         cfg = self.llm_service.config

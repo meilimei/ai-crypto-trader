@@ -1,0 +1,60 @@
+Phase 4.1 Step 2 — Harden order execution + risk/position guardrails (backend only)
+
+Constraints:
+- Backend only. Do NOT touch frontend/, lockfiles, formatting-only changes, or generated artifacts.
+- Keep diffs minimal and focused.
+
+Goal:
+1) Paper trader engine must NEVER crash a cycle due to bad order inputs (qty <= 0, price <= 0, missing session, etc).
+2) Bad orders must be handled as "skipped/rejected" with a clear AdminAction, but MUST NOT spam (dedupe / cooldown).
+3) smoke-trade must return a JSON error (already in Phase 4.1 Step 1), and now must also validate qty/price before execution.
+
+Implementation plan:
+
+A) Add a small exception-safe helper for AdminAction logging with dedupe/cooldown
+- Create: src/ai_crypto_trader/services/admin_actions/helpers.py (or a nearby existing util module if already present)
+- Implement async function:
+  async def add_action_deduped(session, *, action: str, status: str, message: str, meta: dict, cooldown_seconds: int = 60) -> bool
+  Behavior:
+  - Normalize status via existing normalize_status()
+  - Ensure meta is JSON-safe (reuse json_safe() you added earlier; convert Decimal/datetime/ipaddress recursively)
+  - Query latest admin_actions row matching same action + message and (meta->>'symbol') (or meta->>'account_id') when present,
+    within NOW() - cooldown_seconds.
+  - If found, do NOT insert (return False). Else insert and return True.
+  Keep query simple; do not add DB schema changes.
+
+B) Harden the engine loop: isolate per-symbol failures so cycle never crashes
+- Edit: src/ai_crypto_trader/services/paper_trader/engine.py
+- In _cycle() and/or _process_symbol():
+  - Wrap the part that calls execute_market_order_with_costs/apply_market_order in try/except Exception.
+  - If exception occurs:
+    - Record a deduped AdminAction: action="ORDER_SKIPPED", status="alert" (or "warn" if you have), message="Execution skipped" with meta:
+      { "account_id": account.id, "symbol": symbol_normalized, "error_type": type(e).__name__, "error": str(e) }
+    - Do NOT raise; continue to next symbol.
+  - Also ensure runner/engine status fields do not crash when task exception is not set (avoid InvalidStateError).
+    If you have code calling task.exception() without checking task.done(), fix it.
+
+C) Add strict input validation before execution for smoke-trade and internal execution helpers
+- Edit: src/ai_crypto_trader/services/paper_trader/execution.py (or wherever execute_market_order_with_costs is defined)
+- Enforce:
+  - qty must be Decimal > 0
+  - price must be Decimal > 0
+  - symbol must be normalized (no slash). If input contains '/', normalize it or reject.
+- Instead of raising ValueError that bubbles to engine, raise a dedicated exception class (e.g., OrderValidationError)
+  OR keep ValueError but ensure engine catches it (from B) so it never crashes the cycle.
+
+D) Make smoke-trade reject invalid qty/price as a clean JSON 400 (not 500)
+- Edit: src/ai_crypto_trader/api/admin_paper_trader.py smoke-trade endpoint
+- If qty<=0 or price<=0 -> return JSONResponse(status_code=400, content={"ok": False, "error_type": "...", "error": "..."})
+- Log a deduped AdminAction(action="SMOKE_TRADE", status="error", message="Smoke trade rejected", meta=...) with cooldown 30s.
+
+E) Verify session is always passed (fix "missing session" regressions)
+- If any call stack shows apply_market_order() missing 'session', update the call sites in smoke-trade + engine path to pass session.
+
+Acceptance:
+- Engine running for 2 minutes must not stop due to exceptions.
+- If strategy generates invalid qty, you should see at most ONE ORDER_SKIPPED per symbol per minute (deduped).
+- smoke-trade with qty=0 must return HTTP 400 JSON, and must not print stack trace.
+
+Deliver:
+- Minimal code changes implementing A–E.

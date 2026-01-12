@@ -1,9 +1,12 @@
 import os
 import logging
+import traceback
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from ipaddress import IPv4Address, IPv6Address
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Body
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select, desc, delete
@@ -25,6 +28,7 @@ from ai_crypto_trader.common.models import (
     PaperPosition,
     PaperTrade,
     AdminAction,
+    utc_now,
 )
 
 from ai_crypto_trader.common.log_buffer import get_log_buffer
@@ -35,6 +39,7 @@ from ai_crypto_trader.services.paper_trader.execution import execute_market_orde
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
 from ai_crypto_trader.common.jsonable import to_jsonable
+from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
 from ai_crypto_trader.utils.json_safe import json_safe
 from sqlalchemy import text
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -106,8 +111,69 @@ async def stop_paper_trader(session: AsyncSession = Depends(get_db_session)) -> 
 
 
 @router.get("/status")
-async def paper_trader_status() -> dict:
-    return runner.status()
+async def paper_trader_status() -> JSONResponse:
+    defaults = {
+        "running": False,
+        "started_at": None,
+        "last_cycle_at": None,
+        "last_error": None,
+        "engine_task_state": None,
+        "engine_task_exception": None,
+        "reconcile_task_running": False,
+        "reconcile_task_state": None,
+        "reconcile_task_exception": None,
+        "reconcile_tick_count": 0,
+        "last_reconcile_at": None,
+        "reconcile_interval_seconds": 0,
+        "last_reconcile_error": None,
+        "last_reconcile_action_at": None,
+        "last_reconcile_action_status": None,
+    }
+    try:
+        runner_present = runner is not None
+        payload = dict(defaults)
+        if runner_present:
+            status = runner.status()
+            if isinstance(status, dict):
+                payload.update(status)
+            else:
+                payload["last_error"] = f"runner.status returned {type(status).__name__}"
+        payload["debug"] = {
+            "pid": os.getpid(),
+            "runner_present": runner_present,
+            "now": utc_now().isoformat(),
+        }
+        encoded = jsonable_encoder(
+            payload,
+            custom_encoder={
+                Decimal: lambda x: str(x),
+                IPv4Address: lambda x: str(x),
+                IPv6Address: lambda x: str(x),
+                Exception: lambda x: repr(x),
+            },
+        )
+        return JSONResponse(content=encoded, status_code=200)
+    except Exception as exc:
+        trace_lines = traceback.format_exception(exc.__class__, exc, exc.__traceback__)
+        trace_short = "\n".join(trace_lines[:20]) if trace_lines else None
+        payload = dict(defaults)
+        payload["last_error"] = repr(exc)
+        payload["debug"] = {
+            "pid": os.getpid(),
+            "runner_present": runner is not None,
+            "now": utc_now().isoformat(),
+            "traceback": trace_short,
+        }
+        encoded = jsonable_encoder(
+            payload,
+            custom_encoder={
+                Decimal: lambda x: str(x),
+                IPv4Address: lambda x: str(x),
+                IPv6Address: lambda x: str(x),
+                Exception: lambda x: repr(x),
+            },
+        )
+        return JSONResponse(content=encoded, status_code=200)
 
 
 @router.post("/reset")
@@ -347,37 +413,87 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
     qty_raw = payload.qty
     side = (payload.side or "buy").lower().strip()
     if "/" in symbol_in:
-        await _record_action(
+        await add_action_deduped(
             session,
-            "ORDER_REJECTED",
-            "warn",
-            "Order rejected",
-            meta=json_safe({
+            action="SMOKE_TRADE",
+            status="error",
+            message="Smoke trade rejected",
+            meta={
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
                 "side": side,
                 "qty": str(qty_raw),
                 "price": None,
                 "reason": "SYMBOL_CONTAINS_SLASH",
-            }),
+            },
+            cooldown_seconds=30,
         )
         raise HTTPException(status_code=400, detail="SYMBOL_CONTAINS_SLASH")
     if side not in {"buy", "sell"}:
-        await _record_action(
+        await add_action_deduped(
             session,
-            "ORDER_REJECTED",
-            "warn",
-            "Order rejected",
-            meta=json_safe({
+            action="SMOKE_TRADE",
+            status="error",
+            message="Smoke trade rejected",
+            meta={
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
                 "side": side,
                 "qty": str(payload.qty),
                 "price": None,
-                "reason": "side must be buy or sell",
-            }),
+                "reason": "SIDE_INVALID",
+            },
+            cooldown_seconds=30,
         )
         raise HTTPException(status_code=400, detail="side must be buy or sell")
+
+    try:
+        qty_dec_raw = Decimal(str(qty_raw))
+    except Exception:
+        await add_action_deduped(
+            session,
+            action="SMOKE_TRADE",
+            status="error",
+            message="Smoke trade rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(qty_raw),
+                "price": payload.price,
+                "reason": "QTY_INVALID",
+            },
+            cooldown_seconds=30,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error_type": "QTY_INVALID", "error": "qty must be a valid decimal"},
+        )
+
+    if qty_dec_raw <= 0:
+        await add_action_deduped(
+            session,
+            action="SMOKE_TRADE",
+            status="error",
+            message="Smoke trade rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(qty_dec_raw),
+                "price": payload.price,
+                "reason": "QTY_NOT_POSITIVE",
+            },
+            cooldown_seconds=30,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error_type": "QTY_NOT_POSITIVE", "error": "qty must be positive"},
+        )
 
     price = None
     price_source = None
@@ -385,37 +501,47 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         try:
             price = Decimal(str(payload.price))
         except (InvalidOperation, TypeError, ValueError):
-            await _record_action(
+            await add_action_deduped(
                 session,
-                "ORDER_REJECTED",
-                "warn",
-                "Order rejected",
-                meta=json_safe({
+                action="SMOKE_TRADE",
+                status="error",
+                message="Smoke trade rejected",
+                meta={
                     "account_id": payload.account_id,
                     "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
                     "side": side,
-                    "qty": str(payload.qty),
+                    "qty": str(qty_dec_raw),
                     "price": payload.price,
-                    "reason": "price must be a valid decimal",
-                }),
+                    "reason": "PRICE_INVALID",
+                },
+                cooldown_seconds=30,
             )
-            raise HTTPException(status_code=400, detail="price must be a valid decimal")
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error_type": "PRICE_INVALID", "error": "price must be a valid decimal"},
+            )
         if not price.is_finite() or price <= 0:
-            await _record_action(
+            await add_action_deduped(
                 session,
-                "ORDER_REJECTED",
-                "warn",
-                "Order rejected",
-                meta=json_safe({
+                action="SMOKE_TRADE",
+                status="error",
+                message="Smoke trade rejected",
+                meta={
                     "account_id": payload.account_id,
                     "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
                     "side": side,
-                    "qty": str(payload.qty),
+                    "qty": str(qty_dec_raw),
                     "price": str(price),
-                    "reason": "price must be positive",
-                }),
+                    "reason": "PRICE_NOT_POSITIVE",
+                },
+                cooldown_seconds=30,
             )
-            raise HTTPException(status_code=400, detail="price must be positive")
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error_type": "PRICE_NOT_POSITIVE", "error": "price must be positive"},
+            )
         price_source = "override"
     else:
         price = await _latest_price(session, symbol_norm)
@@ -445,21 +571,22 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                     price_source = "paper_trades_last"
 
     if price is None:
-        await _record_action(
+        await add_action_deduped(
             session,
-            "SMOKE_TRADE",
-            "error",
-            "Smoke trade price unavailable",
-            meta=json_safe({
+            action="SMOKE_TRADE",
+            status="error",
+            message="Smoke trade price unavailable",
+            meta={
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
                 "symbol_normalized": symbol_norm,
                 "side": side,
-                "qty": str(qty_raw),
+                "qty": str(qty_dec_raw),
                 "price": None,
                 "price_source": price_source,
                 "trade_id": None,
-            }),
+            },
+            cooldown_seconds=30,
         )
         raise HTTPException(
             status_code=400,
@@ -467,22 +594,24 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         )
 
     try:
-        prepared = prepare_order_inputs(symbol_in, qty_raw, price)
+        prepared = prepare_order_inputs(symbol_in, qty_dec_raw, price)
     except ValueError as exc:
-        await _record_action(
+        await add_action_deduped(
             session,
-            "ORDER_REJECTED",
-            "warn",
-            "Order rejected",
-            meta=json_safe({
+            action="ORDER_REJECTED",
+            status="warn",
+            message="Order rejected",
+            meta={
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
                 "side": side,
-                "qty": str(qty_raw),
+                "qty": str(qty_dec_raw),
                 "price": str(price) if price is not None else None,
                 "price_source": price_source,
                 "reason": str(exc),
-            }),
+            },
+            cooldown_seconds=30,
         )
         raise HTTPException(status_code=400, detail=str(exc))
 
