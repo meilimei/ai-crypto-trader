@@ -37,6 +37,7 @@ from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
 from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
+from ai_crypto_trader.services.paper_trader.policy_store import get_or_create_default_policies
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
@@ -684,6 +685,34 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         return _reject_response(reject, status_code=400)
 
     symbol_norm = prepared.symbol
+
+    _, position_policy = await get_or_create_default_policies(session, payload.account_id)
+    if position_policy.min_qty is not None:
+        min_qty = Decimal(str(position_policy.min_qty))
+        if min_qty > 0 and prepared.qty.copy_abs() < min_qty:
+            reject_reason = RejectReason(
+                code=RejectCode.MIN_QTY,
+                reason="Quantity below minimum",
+                details={"min_qty": str(min_qty)},
+            )
+            await _record_action(
+                session,
+                "ORDER_REJECTED",
+                "warn",
+                "Order rejected",
+                meta=json_safe({
+                    "account_id": payload.account_id,
+                    "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
+                    "side": side,
+                    "qty": str(prepared.qty),
+                    "price": str(prepared.price) if price is not None else None,
+                    "price_source": price_source,
+                    "reason": reject_reason.reason,
+                    "code": reject_reason.code,
+                }),
+            )
+            return _reject_response(reject_reason, status_code=400)
 
     config = PaperTraderConfig.from_env()
     reject_reason = await validate_order(

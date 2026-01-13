@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 
 class RejectCode(str, Enum):
+    MIN_QTY = "MIN_QTY"
     QTY_ZERO = "QTY_ZERO"
     INVALID_QTY = "INVALID_QTY"
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"

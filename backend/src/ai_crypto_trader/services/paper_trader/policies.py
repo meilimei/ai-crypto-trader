@@ -96,7 +96,7 @@ async def validate_order(
         return RejectReason(code=RejectCode.INVALID_QTY, reason="Price must be positive")
 
     if position_policy.min_qty and qty_dec < _quant(position_policy.min_qty, QTY_EXP):
-        return RejectReason(code=RejectCode.INVALID_QTY, reason="Quantity below minimum", details={"min_qty": str(position_policy.min_qty)})
+        return RejectReason(code=RejectCode.MIN_QTY, reason="Quantity below minimum", details={"min_qty": str(position_policy.min_qty)})
 
     exec_meta = compute_execution(price_dec, side, qty_dec, fee_bps, slippage_bps)
     notional = exec_meta["notional"]
