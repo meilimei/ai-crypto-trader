@@ -22,6 +22,7 @@ from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.engine import PaperTradingEngine
 from ai_crypto_trader.common.maintenance import ensure_and_sync_paper_id_sequences
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_apply, normalize_status
+from ai_crypto_trader.services.admin_actions_throttle import log_admin_action_throttled
 from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.common.database import AsyncSessionLocal
 
@@ -170,6 +171,14 @@ class PaperTraderRunner:
         config = PaperTraderConfig.from_env()
         account_name = f"paper-{config.exchange_name}"
         emit_ok = os.getenv("PAPER_TRADER_RECONCILE_EMIT_OK", "true").lower() in {"1", "true", "yes", "on"}
+        usdt_tolerance = Decimal(os.getenv("PAPER_RECONCILE_USDT_TOLERANCE", "0") or "0")
+        suppress_accounts = {
+            int(x)
+            for x in os.getenv("PAPER_RECONCILE_SUPPRESS_ACCOUNTS", "")
+            .replace(" ", "")
+            .split(",")
+            if x.strip().isdigit()
+        }
         while self.is_running and self.reconcile_interval_seconds > 0:
             try:
                 async with AsyncSessionLocal() as session:
@@ -181,11 +190,15 @@ class PaperTraderRunner:
                     report = await reconcile_report(session, account.id)
                     summary = report.get("summary") or {}
                     diff_count = summary.get("diff_count", 0) or 0
+                    usdt_diff = Decimal(str(summary.get("usdt_diff", "0") or "0"))
                     diffs_sample = report.get("diffs", [])[:5]
                     status = normalize_status("ok" if diff_count == 0 else "alert")
                     warn = None
                     if summary.get("has_negative_balance") or summary.get("has_equity_mismatch"):
                         warn = "unsafe_to_autofix"
+                    within_tolerance = usdt_tolerance > 0 and usdt_diff.copy_abs() <= usdt_tolerance
+                    if within_tolerance:
+                        status = "ok"
                     emit = False
                     now_mono = asyncio.get_running_loop().time()
                     if self._last_reconcile_action_at is None:
@@ -203,22 +216,27 @@ class PaperTraderRunner:
                                 emit = True
                             if diff_count == 0 and now_mono - self._last_reconcile_action_at >= 300:
                                 emit = True
+                    if account.id in suppress_accounts:
+                        await asyncio.sleep(self.reconcile_interval_seconds)
+                        continue
                     if emit and (emit_ok or diff_count > 0):
-                        session.add(
-                            AdminAction(
-                                action="RECONCILE_REPORT",
-                                status=status,
-                                message="Auto reconcile report",
-                                meta=to_jsonable({
-                                    "account_id": account.id,
-                                    "summary": summary,
-                                    "diff_count": diff_count,
-                                    "diffs_sample": diffs_sample,
-                                    "warning": warn,
-                                }),
-                            )
+                        await log_admin_action_throttled(
+                            session,
+                            action_type="RECONCILE_REPORT",
+                            status=status,
+                            message="Auto reconcile report",
+                            account_id=account.id,
+                            symbol=None,
+                            reason_code="RECONCILE_REPORT",
+                            cooldown_seconds=300,
+                            payload_json=to_jsonable({
+                                "account_id": account.id,
+                                "summary": summary,
+                                "diff_count": diff_count,
+                                "diffs_sample": diffs_sample,
+                                "warning": warn,
+                            }),
                         )
-                        await session.commit()
                         self._last_reconcile_summary = summary
                         self._last_reconcile_action_at = now_mono
                         self._last_reconcile_action_status = status
@@ -256,15 +274,17 @@ class PaperTraderRunner:
             except Exception as exc:
                 self.last_reconcile_error = str(exc)
                 async with AsyncSessionLocal() as session:
-                    session.add(
-                        AdminAction(
-                            action="RECONCILE_REPORT",
-                            status=normalize_status("error"),
-                            message="Auto reconcile error",
-                            meta=to_jsonable({"account": account_name, "error": str(exc)}),
-                        )
+                    await log_admin_action_throttled(
+                        session,
+                        action_type="RECONCILE_REPORT",
+                        status=normalize_status("error"),
+                        message="Auto reconcile error",
+                        account_id=None,
+                        symbol=None,
+                        reason_code=exc.__class__.__name__,
+                        cooldown_seconds=300,
+                        payload_json=to_jsonable({"account": account_name, "error": str(exc)}),
                     )
-                    await session.commit()
                 logger.exception("Auto reconcile loop error")
             await asyncio.sleep(self.reconcile_interval_seconds)
 

@@ -21,6 +21,8 @@ from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceRes
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
+from ai_crypto_trader.services.admin_actions_throttle import log_admin_action_throttled
+from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
 from ai_crypto_trader.services.paper_trader.utils import RiskRejected
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
@@ -190,16 +192,52 @@ class PaperTradingEngine:
         try:
             qty_dec = Decimal(str(delta_qty)).copy_abs()
             if qty_dec <= 0:
-                await add_action_deduped(
+                await log_admin_action_throttled(
                     session,
-                    action="ORDER_SKIPPED",
+                    action_type="ORDER_SKIPPED",
                     status="warn",
                     message="Execution skipped",
-                    meta={
+                    account_id=account_id,
+                    symbol=symbol_norm,
+                    reason_code="ZERO_OR_NEGATIVE_QTY",
+                    cooldown_seconds=120,
+                    payload_json={
                         "account_id": account_id,
                         "symbol": symbol_norm,
                         "qty": str(delta_qty),
                         "reason": "ZERO_OR_NEGATIVE_QTY",
+                    },
+                )
+                return
+                reject = await validate_order(
+                    session,
+                    account_id=account_id,
+                    symbol=symbol_norm,
+                    side=side,
+                    qty=qty_dec,
+                    price=summary.last_close,
+                    fee_bps=self.config.fee_bps,
+                    slippage_bps=self.config.slippage_bps,
+                risk_policy=DEFAULT_RISK_POLICY,
+                position_policy=DEFAULT_POSITION_POLICY,
+            )
+            if reject:
+                await log_admin_action_throttled(
+                    session,
+                    action_type="ORDER_SKIPPED",
+                    status="warn",
+                    message="Execution skipped",
+                    account_id=account_id,
+                    symbol=symbol_norm,
+                    reason_code=str(reject.code),
+                    cooldown_seconds=120,
+                    payload_json={
+                        "account_id": account_id,
+                        "symbol": symbol_norm,
+                        "side": side,
+                        "qty": str(qty_dec),
+                        "reason": reject.reason,
+                        "code": str(reject.code),
                     },
                 )
                 return
@@ -215,12 +253,16 @@ class PaperTradingEngine:
                 meta={"origin": "engine"},
             )
         except (RiskRejected, ValueError) as exc:
-            await add_action_deduped(
+            await log_admin_action_throttled(
                 session,
-                action="ORDER_SKIPPED",
+                action_type="ORDER_SKIPPED",
                 status="warn",
                 message="Execution skipped",
-                meta={
+                account_id=account_id,
+                symbol=symbol_norm,
+                reason_code=str(exc),
+                cooldown_seconds=120,
+                payload_json={
                     "account_id": account_id,
                     "symbol": symbol_norm,
                     "side": side,
@@ -232,12 +274,16 @@ class PaperTradingEngine:
             return
         except Exception as exc:  # safety net to keep engine alive
             logger.exception("Execution failed; skipping symbol", extra={"symbol": symbol_norm})
-            await add_action_deduped(
+            await log_admin_action_throttled(
                 session,
-                action="ORDER_SKIPPED",
+                action_type="ORDER_SKIPPED",
                 status="alert",
                 message="Execution skipped",
-                meta={
+                account_id=account_id,
+                symbol=symbol_norm,
+                reason_code=exc.__class__.__name__,
+                cooldown_seconds=120,
+                payload_json={
                     "symbol": symbol_norm,
                     "side": side,
                     "qty": str(delta_qty),

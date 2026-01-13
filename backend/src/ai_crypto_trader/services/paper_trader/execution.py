@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from ai_crypto_trader.common.models import PaperAccount, PaperBalance, PaperOrder, PaperPosition, PaperTrade, utc_now
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol, QTY_EXP, MONEY_EXP, PRICE_EXP
+from ai_crypto_trader.services.paper_trader.execution_costs import compute_execution
 from ai_crypto_trader.services.paper_trader.utils import guard_market_risk, prepare_order_inputs
 
 
@@ -179,17 +180,10 @@ async def execute_market_order_with_costs(
     if side_norm not in {"buy", "sell"}:
         raise ValueError("Side must be buy or sell")
     mid_price_dec = prepared.price
-    slip_mult = Decimal("1") + (slippage_bps / Decimal("10000"))
-    if side_norm == "sell":
-        slip_mult = Decimal("1") - (slippage_bps / Decimal("10000"))
-
-    fill_price = _quantize(mid_price_dec * slip_mult, PRICE_EXP)
-    if not fill_price.is_finite() or fill_price <= 0:
-        raise ValueError("Price must be positive")
-    notional = _quantize(qty_dec * fill_price, MONEY_EXP)
-    fee_usd = _quantize(notional * (fee_bps / Decimal("10000")), MONEY_EXP)
-    if not notional.is_finite() or not fee_usd.is_finite():
-        raise ValueError("Invalid notional or fee")
+    exec_meta = compute_execution(mid_price_dec, side_norm, qty_dec, fee_bps, slippage_bps)
+    fill_price = exec_meta["exec_price"]
+    notional = exec_meta["notional"]
+    fee_usd = exec_meta["fee"]
 
     # Use a savepoint if we're already inside a transaction (e.g., request-scoped session).
     if session.in_transaction():

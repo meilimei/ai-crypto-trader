@@ -1,0 +1,23 @@
+                                                                    Table "public.paper_trades"
+    Column    |            Type             | Collation | Nullable |                 Default                  | Storage  | Compression | Stats target | Description 
+--------------+-----------------------------+-----------+----------+------------------------------------------+----------+-------------+--------------+-------------
+ id           | bigint                      |           | not null | nextval('paper_trades_id_seq'::regclass) | plain    |             |              | 
+ account_id   | bigint                      |           |          |                                          | plain    |             |              | 
+ symbol       | text                        |           |          |                                          | extended |             |              | 
+ side         | text                        |           |          |                                          | extended |             |              | 
+ qty          | numeric(24,10)              |           |          |                                          | main     |             |              | 
+ price        | numeric(24,10)              |           |          |                                          | main     |             |              | 
+ fee          | numeric(24,10)              |           |          |                                          | main     |             |              | 
+ realized_pnl | numeric(24,10)              |           |          |                                          | main     |             |              | 
+ created_at   | timestamp without time zone |           |          |                                          | plain    |             |              | 
+Indexes:
+    "idx_16664_paper_trades_pkey" PRIMARY KEY, btree (id)
+    "idx_16664_ix_paper_trades_account_id" btree (account_id)
+    "idx_16664_ix_paper_trades_symbol_created_at" btree (symbol, created_at)
+    "ix_paper_trades_account_created" btree (account_id, created_at, id)
+Check constraints:
+    "ck_paper_trades_symbol_no_slash" CHECK (symbol !~~ '%/%'::text)
+Foreign-key constraints:
+    "paper_trades_account_id_fkey" FOREIGN KEY (account_id) REFERENCES paper_accounts(id) ON DELETE CASCADE
+Access method: heap
+

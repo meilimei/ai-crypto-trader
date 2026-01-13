@@ -459,9 +459,13 @@ class StrategyConfig(Base):
 
 class AdminAction(Base):
     __tablename__ = "admin_actions"
-    __table_args__ = (Index("ix_admin_actions_created_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_admin_actions_created_at", "created_at"),
+        Index("ix_admin_actions_dedupe_key", "dedupe_key"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     action: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32))
     message: Mapped[Optional[str]] = mapped_column(Text)

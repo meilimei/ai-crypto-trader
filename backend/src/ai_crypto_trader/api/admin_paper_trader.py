@@ -36,6 +36,8 @@ from ai_crypto_trader.services.paper_trader.config import get_active_bundle, Act
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
+from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
 from ai_crypto_trader.common.jsonable import to_jsonable
@@ -61,6 +63,27 @@ def require_admin_token(
     provided = admin_header or token_query or token_query_alt
     if provided != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing admin token")
+
+
+def _reject_response(reason: RejectReason, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"ok": False, "reject": reason.dict()})
+
+
+def _reject_from_reason(reason: str) -> RejectReason:
+    reason_norm = (reason or "").strip().upper()
+    if reason_norm in {"QTY_NOT_POSITIVE", "QTY_ZERO"}:
+        return RejectReason(code=RejectCode.QTY_ZERO, reason="Quantity must be positive")
+    if reason_norm in {"QTY_INVALID", "SYMBOL_EMPTY"}:
+        return RejectReason(code=RejectCode.INVALID_QTY, reason="Quantity is invalid")
+    if reason_norm.startswith("PRICE_"):
+        return RejectReason(code=RejectCode.INVALID_QTY, reason="Price is invalid")
+    if reason_norm in {"SYMBOL_CONTAINS_SLASH"}:
+        return RejectReason(code=RejectCode.SYMBOL_DISABLED, reason="Symbol not supported")
+    if reason_norm in {"INSUFFICIENT_CASH"}:
+        return RejectReason(code=RejectCode.INSUFFICIENT_BALANCE, reason="Insufficient balance for order")
+    if reason_norm in {"SHORT_NOT_ALLOWED", "INSUFFICIENT_POSITION"}:
+        return RejectReason(code=RejectCode.POSITION_LIMIT, reason="Position limits prevent this trade")
+    return RejectReason(code=RejectCode.INTERNAL_ERROR, reason=reason or "Rejected")
 
 
 router = APIRouter(prefix="/admin/paper-trader", tags=["admin"], dependencies=[Depends(require_admin_token)])
@@ -344,19 +367,66 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
     }
 
     if not risk_eval.get("allowed"):
-        await _record_action(session, "RISK_REJECT", "rejected", "Risk rejected order", meta=meta_payload)
-        return {"allowed": False, "risk": risk_eval}
+        reject = RejectReason(
+            code=RejectCode.POSITION_LIMIT,
+            reason="Risk checks rejected order",
+            details={"reasons": risk_eval.get("reasons")},
+        )
+        await _record_action(
+            session,
+            "RISK_REJECT",
+            "rejected",
+            "Risk rejected order",
+            meta={**meta_payload, "reject": reject.dict()},
+        )
+        return _reject_response(reject, status_code=400)
 
     qty = Decimal(str(risk_eval.get("qty", "0")))
     if qty <= 0:
-        await _record_action(session, "RISK_REJECT", "rejected", "Risk sizing returned non-positive qty", meta=meta_payload)
-        return {"allowed": False, "risk": risk_eval}
+        reject = RejectReason(code=RejectCode.QTY_ZERO, reason="Risk sizing returned non-positive qty")
+        await _record_action(
+            session,
+            "RISK_REJECT",
+            "rejected",
+            "Risk sizing returned non-positive qty",
+            meta={**meta_payload, "reject": reject.dict()},
+        )
+        return _reject_response(reject, status_code=400)
 
     fee_bps = Decimal(str(bundle["risk_policy"]["fee_bps"]))
     slippage_bps = Decimal(str(bundle["risk_policy"]["slippage_bps"]))
 
     try:
         prepared = prepare_order_inputs(payload.symbol, qty, payload.price)
+        reject_reason = await validate_order(
+            session,
+            account_id=payload.account_id,
+            symbol=prepared.symbol,
+            side=payload.side,
+            qty=prepared.qty,
+            price=prepared.price,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            risk_policy=DEFAULT_RISK_POLICY,
+            position_policy=DEFAULT_POSITION_POLICY,
+        )
+        if reject_reason:
+            await _record_action(
+                session,
+                "ORDER_REJECTED",
+                "warn",
+                "Order rejected",
+                meta={
+                    "account_id": payload.account_id,
+                    "symbol": payload.symbol,
+                    "side": payload.side,
+                    "qty": str(qty),
+                    "price": str(payload.price),
+                    "reason": reject_reason.reason,
+                    "code": reject_reason.code,
+                },
+            )
+            return _reject_response(reject_reason, status_code=400)
         execution = await execute_market_order_with_costs(
             session=session,
             account_id=payload.account_id,
@@ -369,6 +439,7 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
             meta={"origin": "admin_manual"},
         )
     except (RiskRejected, ValueError) as exc:
+        reject_reason = _reject_from_reason(str(exc))
         await _record_action(
             session,
             "ORDER_REJECTED",
@@ -380,10 +451,11 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
                 "side": payload.side,
                 "qty": str(qty),
                 "price": str(payload.price),
-                "reason": str(exc),
+                "reason": reject_reason.reason,
+                "code": reject_reason.code,
             },
         )
-        raise HTTPException(status_code=400, detail=str(exc))
+        return _reject_response(reject_reason, status_code=400)
 
     exec_payload = {
         **meta_payload,
@@ -429,7 +501,8 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             },
             cooldown_seconds=30,
         )
-        raise HTTPException(status_code=400, detail="SYMBOL_CONTAINS_SLASH")
+        reject = _reject_from_reason("SYMBOL_CONTAINS_SLASH")
+        return _reject_response(reject, status_code=400)
     if side not in {"buy", "sell"}:
         await add_action_deduped(
             session,
@@ -447,7 +520,8 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             },
             cooldown_seconds=30,
         )
-        raise HTTPException(status_code=400, detail="side must be buy or sell")
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
+        return _reject_response(reject, status_code=400)
 
     try:
         qty_dec_raw = Decimal(str(qty_raw))
@@ -468,10 +542,8 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             },
             cooldown_seconds=30,
         )
-        return JSONResponse(
-            status_code=400,
-            content={"ok": False, "error_type": "QTY_INVALID", "error": "qty must be a valid decimal"},
-        )
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="qty must be a valid decimal")
+        return _reject_response(reject, status_code=400)
 
     if qty_dec_raw <= 0:
         await add_action_deduped(
@@ -490,10 +562,8 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             },
             cooldown_seconds=30,
         )
-        return JSONResponse(
-            status_code=400,
-            content={"ok": False, "error_type": "QTY_NOT_POSITIVE", "error": "qty must be positive"},
-        )
+        reject = RejectReason(code=RejectCode.QTY_ZERO, reason="qty must be positive")
+        return _reject_response(reject, status_code=400)
 
     price = None
     price_source = None
@@ -517,10 +587,8 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                 },
                 cooldown_seconds=30,
             )
-            return JSONResponse(
-                status_code=400,
-                content={"ok": False, "error_type": "PRICE_INVALID", "error": "price must be a valid decimal"},
-            )
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be a valid decimal")
+            return _reject_response(reject, status_code=400)
         if not price.is_finite() or price <= 0:
             await add_action_deduped(
                 session,
@@ -538,10 +606,8 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                 },
                 cooldown_seconds=30,
             )
-            return JSONResponse(
-                status_code=400,
-                content={"ok": False, "error_type": "PRICE_NOT_POSITIVE", "error": "price must be positive"},
-            )
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be positive")
+            return _reject_response(reject, status_code=400)
         price_source = "override"
     else:
         price = await _latest_price(session, symbol_norm)
@@ -588,10 +654,11 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             },
             cooldown_seconds=30,
         )
-        raise HTTPException(
-            status_code=400,
-            detail=f"No price data for symbol {symbol_norm}; pass price to override",
+        reject = RejectReason(
+            code=RejectCode.SYMBOL_DISABLED,
+            reason=f"No price data for symbol {symbol_norm}; pass price to override",
         )
+        return _reject_response(reject, status_code=400)
 
     try:
         prepared = prepare_order_inputs(symbol_in, qty_dec_raw, price)
@@ -613,24 +680,25 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             },
             cooldown_seconds=30,
         )
-        raise HTTPException(status_code=400, detail=str(exc))
+        reject = _reject_from_reason(str(exc))
+        return _reject_response(reject, status_code=400)
 
     symbol_norm = prepared.symbol
 
     config = PaperTraderConfig.from_env()
-    try:
-        execution = await execute_market_order_with_costs(
-            session=session,
-            account_id=payload.account_id,
-            symbol=symbol_norm,
-            side=side,
-            qty=prepared.qty,
-            mid_price=prepared.price,
-            fee_bps=config.fee_bps,
-            slippage_bps=config.slippage_bps,
-            meta={"origin": "admin_smoke"},
-        )
-    except (RiskRejected, ValueError) as exc:
+    reject_reason = await validate_order(
+        session,
+        account_id=payload.account_id,
+        symbol=symbol_norm,
+        side=side,
+        qty=prepared.qty,
+        price=prepared.price,
+        fee_bps=config.fee_bps,
+        slippage_bps=config.slippage_bps,
+        risk_policy=DEFAULT_RISK_POLICY,
+        position_policy=DEFAULT_POSITION_POLICY,
+    )
+    if reject_reason:
         await _record_action(
             session,
             "ORDER_REJECTED",
@@ -644,10 +712,43 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                 "qty": str(prepared.qty),
                 "price": str(prepared.price) if price is not None else None,
                 "price_source": price_source,
-                "reason": str(exc),
+                "reason": reject_reason.reason,
+                "code": reject_reason.code,
             }),
         )
-        raise HTTPException(status_code=400, detail=str(exc))
+        return _reject_response(reject_reason, status_code=400)
+    try:
+        execution = await execute_market_order_with_costs(
+            session=session,
+            account_id=payload.account_id,
+            symbol=symbol_norm,
+            side=side,
+            qty=prepared.qty,
+            mid_price=prepared.price,
+            fee_bps=config.fee_bps,
+            slippage_bps=config.slippage_bps,
+            meta={"origin": "admin_smoke"},
+        )
+    except (RiskRejected, ValueError) as exc:
+        reject_reason = _reject_from_reason(str(exc))
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "warn",
+            "Order rejected",
+            meta=json_safe({
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(prepared.qty),
+                "price": str(prepared.price) if price is not None else None,
+                "price_source": price_source,
+                "reason": reject_reason.reason,
+                "code": reject_reason.code,
+            }),
+        )
+        return _reject_response(reject_reason, status_code=400)
     except Exception as exc:
         await _record_action(
             session,
@@ -736,6 +837,25 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
 
 @router.post("/smoke-trade")
 async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
+    if not runner.is_running:
+        reject = RejectReason(code=RejectCode.ENGINE_NOT_RUNNING, reason="Paper trader engine is not running")
+        await add_action_deduped(
+            session,
+            action="SMOKE_TRADE",
+            status="error",
+            message="Smoke trade rejected",
+            meta={
+                "account_id": payload.account_id,
+                "symbol_in": getattr(payload, "symbol", None),
+                "side": getattr(payload, "side", None),
+                "qty": str(getattr(payload, "qty", None)),
+                "price_override": getattr(payload, "price", None),
+                "reason": reject.reason,
+                "code": reject.code,
+            },
+            cooldown_seconds=30,
+        )
+        return _reject_response(reject, status_code=400)
     try:
         return await _smoke_trade_impl(payload, session)
     except HTTPException:
