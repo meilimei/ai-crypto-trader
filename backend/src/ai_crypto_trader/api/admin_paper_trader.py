@@ -747,6 +747,49 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             )
             return _reject_response(reject_reason, status_code=400)
 
+    if position_policy.max_position_notional_per_symbol_usdt is not None:
+        limit = Decimal(str(position_policy.max_position_notional_per_symbol_usdt))
+        current_qty = await session.scalar(
+            select(PaperPosition.qty)
+            .where(PaperPosition.account_id == payload.account_id, PaperPosition.symbol == symbol_norm)
+            .limit(1)
+        )
+        current_qty_dec = Decimal(str(current_qty)) if current_qty is not None else Decimal("0")
+        delta_qty = prepared.qty if side == "buy" else -prepared.qty
+        next_qty = current_qty_dec + delta_qty
+        next_notional = next_qty.copy_abs() * prepared.price
+        if next_notional > limit:
+            reject_reason = RejectReason(
+                code=RejectCode.MAX_POSITION_NOTIONAL,
+                reason="Position notional above maximum",
+                details={
+                    "max_position_notional_usdt": str(limit),
+                    "next_notional": str(next_notional),
+                    "current_qty": str(current_qty_dec),
+                    "next_qty": str(next_qty),
+                    "qty": str(prepared.qty),
+                    "market_price": str(prepared.price),
+                },
+            )
+            await _record_action(
+                session,
+                "ORDER_REJECTED",
+                "warn",
+                "Order rejected",
+                meta=json_safe({
+                    "account_id": payload.account_id,
+                    "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
+                    "side": side,
+                    "qty": str(prepared.qty),
+                    "price": str(prepared.price) if price is not None else None,
+                    "price_source": price_source,
+                    "reason": reject_reason.reason,
+                    "code": reject_reason.code,
+                }),
+            )
+            return _reject_response(reject_reason, status_code=400)
+
     config = PaperTraderConfig.from_env()
     reject_reason = await validate_order(
         session,
