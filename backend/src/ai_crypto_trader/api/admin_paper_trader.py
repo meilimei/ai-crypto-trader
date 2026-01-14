@@ -686,7 +686,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
 
     symbol_norm = prepared.symbol
 
-    _, position_policy = await get_or_create_default_policies(session, payload.account_id)
+    risk_policy, position_policy = await get_or_create_default_policies(session, payload.account_id)
     if position_policy.min_qty is not None:
         min_qty = Decimal(str(position_policy.min_qty))
         if min_qty > 0 and prepared.qty.copy_abs() < min_qty:
@@ -694,6 +694,39 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                 code=RejectCode.MIN_QTY,
                 reason="Quantity below minimum",
                 details={"min_qty": str(min_qty)},
+            )
+            await _record_action(
+                session,
+                "ORDER_REJECTED",
+                "warn",
+                "Order rejected",
+                meta=json_safe({
+                    "account_id": payload.account_id,
+                    "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
+                    "side": side,
+                    "qty": str(prepared.qty),
+                    "price": str(prepared.price) if price is not None else None,
+                    "price_source": price_source,
+                    "reason": reject_reason.reason,
+                    "code": reject_reason.code,
+                }),
+            )
+            return _reject_response(reject_reason, status_code=400)
+
+    if risk_policy.max_order_notional_usdt is not None:
+        max_notional = Decimal(str(risk_policy.max_order_notional_usdt))
+        notional = prepared.qty.copy_abs() * prepared.price
+        if notional > max_notional:
+            reject_reason = RejectReason(
+                code=RejectCode.MAX_ORDER_NOTIONAL,
+                reason="Order notional above maximum",
+                details={
+                    "max_order_notional_usdt": str(max_notional),
+                    "notional": str(notional),
+                    "qty": str(prepared.qty),
+                    "market_price": str(prepared.price),
+                },
             )
             await _record_action(
                 session,

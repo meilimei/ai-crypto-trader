@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 class RejectCode(str, Enum):
     MIN_QTY = "MIN_QTY"
+    MAX_ORDER_NOTIONAL = "MAX_ORDER_NOTIONAL"
     QTY_ZERO = "QTY_ZERO"
     INVALID_QTY = "INVALID_QTY"
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
