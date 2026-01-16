@@ -104,9 +104,14 @@ async def validate_order(
 
     if position_policy.min_order_notional and notional < _quant(position_policy.min_order_notional, MONEY_EXP):
         return RejectReason(
-            code=RejectCode.POSITION_LIMIT,
+            code=RejectCode.MIN_ORDER_NOTIONAL,
             reason="Order notional below minimum",
-            details={"min_order_notional": str(position_policy.min_order_notional)},
+            details={
+                "min_order_notional_usdt": str(position_policy.min_order_notional),
+                "notional": str(notional),
+                "qty": str(qty_dec),
+                "market_price": str(price_dec),
+            },
         )
 
     available = await _available_balance(session, account_id)

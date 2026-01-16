@@ -36,8 +36,8 @@ from ai_crypto_trader.services.paper_trader.config import get_active_bundle, Act
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
 from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
-from ai_crypto_trader.services.paper_trader.policy_store import get_or_create_default_policies
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
@@ -482,328 +482,21 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
     # Self-test: NEW_ID=3 smoke buy 0.01 + sell 0.005 (with price), then verify positions/balances,
     # reconcile?account_id=3 diff_count ok, /status has no InvalidStateError, admin_actions meta serializes.
     symbol_in = (payload.symbol or "ETHUSDT").strip()
-    symbol_norm = normalize_symbol(symbol_in)
-    qty_raw = payload.qty
     side = (payload.side or "buy").lower().strip()
-    if "/" in symbol_in:
-        await add_action_deduped(
-            session,
-            action="SMOKE_TRADE",
-            status="error",
-            message="Smoke trade rejected",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(qty_raw),
-                "price": None,
-                "reason": "SYMBOL_CONTAINS_SLASH",
-            },
-            cooldown_seconds=30,
-        )
-        reject = _reject_from_reason("SYMBOL_CONTAINS_SLASH")
-        return _reject_response(reject, status_code=400)
-    if side not in {"buy", "sell"}:
-        await add_action_deduped(
-            session,
-            action="SMOKE_TRADE",
-            status="error",
-            message="Smoke trade rejected",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(payload.qty),
-                "price": None,
-                "reason": "SIDE_INVALID",
-            },
-            cooldown_seconds=30,
-        )
-        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
-        return _reject_response(reject, status_code=400)
-
-    try:
-        qty_dec_raw = Decimal(str(qty_raw))
-    except Exception:
-        await add_action_deduped(
-            session,
-            action="SMOKE_TRADE",
-            status="error",
-            message="Smoke trade rejected",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(qty_raw),
-                "price": payload.price,
-                "reason": "QTY_INVALID",
-            },
-            cooldown_seconds=30,
-        )
-        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="qty must be a valid decimal")
-        return _reject_response(reject, status_code=400)
-
-    if qty_dec_raw <= 0:
-        await add_action_deduped(
-            session,
-            action="SMOKE_TRADE",
-            status="error",
-            message="Smoke trade rejected",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(qty_dec_raw),
-                "price": payload.price,
-                "reason": "QTY_NOT_POSITIVE",
-            },
-            cooldown_seconds=30,
-        )
-        reject = RejectReason(code=RejectCode.QTY_ZERO, reason="qty must be positive")
-        return _reject_response(reject, status_code=400)
-
-    price = None
-    price_source = None
-    if payload.price is not None:
-        try:
-            price = Decimal(str(payload.price))
-        except (InvalidOperation, TypeError, ValueError):
-            await add_action_deduped(
-                session,
-                action="SMOKE_TRADE",
-                status="error",
-                message="Smoke trade rejected",
-                meta={
-                    "account_id": payload.account_id,
-                    "symbol_in": symbol_in,
-                    "symbol_normalized": symbol_norm,
-                    "side": side,
-                    "qty": str(qty_dec_raw),
-                    "price": payload.price,
-                    "reason": "PRICE_INVALID",
-                },
-                cooldown_seconds=30,
-            )
-            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be a valid decimal")
-            return _reject_response(reject, status_code=400)
-        if not price.is_finite() or price <= 0:
-            await add_action_deduped(
-                session,
-                action="SMOKE_TRADE",
-                status="error",
-                message="Smoke trade rejected",
-                meta={
-                    "account_id": payload.account_id,
-                    "symbol_in": symbol_in,
-                    "symbol_normalized": symbol_norm,
-                    "side": side,
-                    "qty": str(qty_dec_raw),
-                    "price": str(price),
-                    "reason": "PRICE_NOT_POSITIVE",
-                },
-                cooldown_seconds=30,
-            )
-            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be positive")
-            return _reject_response(reject, status_code=400)
-        price_source = "override"
-    else:
-        price = await _latest_price(session, symbol_norm)
-        if price is not None and price.is_finite():
-            price_source = "latest"
-        else:
-            price = None
-            symbol_slash = None
-            if "/" in symbol_in:
-                symbol_slash = symbol_in
-            elif symbol_norm.endswith("USDT") and len(symbol_norm) > 4:
-                symbol_slash = f"{symbol_norm[:-4]}/USDT"
-            symbols = [symbol_norm]
-            if symbol_slash and symbol_slash not in symbols:
-                symbols.append(symbol_slash)
-            last_trade = await session.execute(
-                select(PaperTrade.price)
-                .where(PaperTrade.symbol.in_(symbols))
-                .order_by(desc(PaperTrade.created_at).nullslast(), PaperTrade.id.desc())
-                .limit(1)
-            )
-            row = last_trade.first()
-            if row and row[0] is not None:
-                candidate = Decimal(str(row[0]))
-                if candidate.is_finite() and candidate > 0:
-                    price = candidate
-                    price_source = "paper_trades_last"
-
-    if price is None:
-        await add_action_deduped(
-            session,
-            action="SMOKE_TRADE",
-            status="error",
-            message="Smoke trade price unavailable",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(qty_dec_raw),
-                "price": None,
-                "price_source": price_source,
-                "trade_id": None,
-            },
-            cooldown_seconds=30,
-        )
-        reject = RejectReason(
-            code=RejectCode.SYMBOL_DISABLED,
-            reason=f"No price data for symbol {symbol_norm}; pass price to override",
-        )
-        return _reject_response(reject, status_code=400)
-
-    try:
-        prepared = prepare_order_inputs(symbol_in, qty_dec_raw, price)
-    except ValueError as exc:
-        await add_action_deduped(
-            session,
-            action="ORDER_REJECTED",
-            status="warn",
-            message="Order rejected",
-            meta={
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(qty_dec_raw),
-                "price": str(price) if price is not None else None,
-                "price_source": price_source,
-                "reason": str(exc),
-            },
-            cooldown_seconds=30,
-        )
-        reject = _reject_from_reason(str(exc))
-        return _reject_response(reject, status_code=400)
-
-    symbol_norm = prepared.symbol
-
-    risk_policy, position_policy = await get_or_create_default_policies(session, payload.account_id)
-    if position_policy.min_qty is not None:
-        min_qty = Decimal(str(position_policy.min_qty))
-        if min_qty > 0 and prepared.qty.copy_abs() < min_qty:
-            reject_reason = RejectReason(
-                code=RejectCode.MIN_QTY,
-                reason="Quantity below minimum",
-                details={"min_qty": str(min_qty)},
-            )
-            await _record_action(
-                session,
-                "ORDER_REJECTED",
-                "warn",
-                "Order rejected",
-                meta=json_safe({
-                    "account_id": payload.account_id,
-                    "symbol_in": symbol_in,
-                    "symbol_normalized": symbol_norm,
-                    "side": side,
-                    "qty": str(prepared.qty),
-                    "price": str(prepared.price) if price is not None else None,
-                    "price_source": price_source,
-                    "reason": reject_reason.reason,
-                    "code": reject_reason.code,
-                }),
-            )
-            return _reject_response(reject_reason, status_code=400)
-
-    if risk_policy.max_order_notional_usdt is not None:
-        max_notional = Decimal(str(risk_policy.max_order_notional_usdt))
-        notional = prepared.qty.copy_abs() * prepared.price
-        if notional > max_notional:
-            reject_reason = RejectReason(
-                code=RejectCode.MAX_ORDER_NOTIONAL,
-                reason="Order notional above maximum",
-                details={
-                    "max_order_notional_usdt": str(max_notional),
-                    "notional": str(notional),
-                    "qty": str(prepared.qty),
-                    "market_price": str(prepared.price),
-                },
-            )
-            await _record_action(
-                session,
-                "ORDER_REJECTED",
-                "warn",
-                "Order rejected",
-                meta=json_safe({
-                    "account_id": payload.account_id,
-                    "symbol_in": symbol_in,
-                    "symbol_normalized": symbol_norm,
-                    "side": side,
-                    "qty": str(prepared.qty),
-                    "price": str(prepared.price) if price is not None else None,
-                    "price_source": price_source,
-                    "reason": reject_reason.reason,
-                    "code": reject_reason.code,
-                }),
-            )
-            return _reject_response(reject_reason, status_code=400)
-
-    if position_policy.max_position_notional_per_symbol_usdt is not None:
-        limit = Decimal(str(position_policy.max_position_notional_per_symbol_usdt))
-        current_qty = await session.scalar(
-            select(PaperPosition.qty)
-            .where(PaperPosition.account_id == payload.account_id, PaperPosition.symbol == symbol_norm)
-            .limit(1)
-        )
-        current_qty_dec = Decimal(str(current_qty)) if current_qty is not None else Decimal("0")
-        delta_qty = prepared.qty if side == "buy" else -prepared.qty
-        next_qty = current_qty_dec + delta_qty
-        next_notional = next_qty.copy_abs() * prepared.price
-        if next_notional > limit:
-            reject_reason = RejectReason(
-                code=RejectCode.MAX_POSITION_NOTIONAL,
-                reason="Position notional above maximum",
-                details={
-                    "max_position_notional_usdt": str(limit),
-                    "next_notional": str(next_notional),
-                    "current_qty": str(current_qty_dec),
-                    "next_qty": str(next_qty),
-                    "qty": str(prepared.qty),
-                    "market_price": str(prepared.price),
-                },
-            )
-            await _record_action(
-                session,
-                "ORDER_REJECTED",
-                "warn",
-                "Order rejected",
-                meta=json_safe({
-                    "account_id": payload.account_id,
-                    "symbol_in": symbol_in,
-                    "symbol_normalized": symbol_norm,
-                    "side": side,
-                    "qty": str(prepared.qty),
-                    "price": str(prepared.price) if price is not None else None,
-                    "price_source": price_source,
-                    "reason": reject_reason.reason,
-                    "code": reject_reason.code,
-                }),
-            )
-            return _reject_response(reject_reason, status_code=400)
 
     config = PaperTraderConfig.from_env()
-    reject_reason = await validate_order(
+    result = await place_order_unified(
         session,
         account_id=payload.account_id,
-        symbol=symbol_norm,
+        symbol=symbol_in,
         side=side,
-        qty=prepared.qty,
-        price=prepared.price,
+        qty=payload.qty,
+        price_override=payload.price,
         fee_bps=config.fee_bps,
         slippage_bps=config.slippage_bps,
-        risk_policy=DEFAULT_RISK_POLICY,
-        position_policy=DEFAULT_POSITION_POLICY,
+        meta={"origin": "admin_smoke"},
     )
-    if reject_reason:
+    if isinstance(result, RejectReason):
         await _record_action(
             session,
             "ORDER_REJECTED",
@@ -812,67 +505,20 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             meta=json_safe({
                 "account_id": payload.account_id,
                 "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
+                "symbol_normalized": normalize_symbol(symbol_in),
                 "side": side,
-                "qty": str(prepared.qty),
-                "price": str(prepared.price) if price is not None else None,
-                "price_source": price_source,
-                "reason": reject_reason.reason,
-                "code": reject_reason.code,
+                "qty": str(payload.qty),
+                "price": payload.price,
+                "reason": result.reason,
+                "code": result.code,
             }),
         )
-        return _reject_response(reject_reason, status_code=400)
-    try:
-        execution = await execute_market_order_with_costs(
-            session=session,
-            account_id=payload.account_id,
-            symbol=symbol_norm,
-            side=side,
-            qty=prepared.qty,
-            mid_price=prepared.price,
-            fee_bps=config.fee_bps,
-            slippage_bps=config.slippage_bps,
-            meta={"origin": "admin_smoke"},
-        )
-    except (RiskRejected, ValueError) as exc:
-        reject_reason = _reject_from_reason(str(exc))
-        await _record_action(
-            session,
-            "ORDER_REJECTED",
-            "warn",
-            "Order rejected",
-            meta=json_safe({
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(prepared.qty),
-                "price": str(prepared.price) if price is not None else None,
-                "price_source": price_source,
-                "reason": reject_reason.reason,
-                "code": reject_reason.code,
-            }),
-        )
-        return _reject_response(reject_reason, status_code=400)
-    except Exception as exc:
-        await _record_action(
-            session,
-            "SMOKE_TRADE",
-            "error",
-            "Smoke trade failed",
-            meta=json_safe({
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": symbol_norm,
-                "side": side,
-                "qty": str(prepared.qty),
-                "price": str(price) if price is not None else None,
-                "price_source": price_source,
-                "trade_id": None,
-                "error": str(exc),
-            }),
-        )
-        raise
+        return _reject_response(result, status_code=400)
+
+    execution = result.execution
+    prepared = result.prepared
+    symbol_norm = prepared.symbol
+    price_source = result.price_source
 
     await _record_action(
         session,
@@ -885,7 +531,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             "symbol_normalized": symbol_norm,
             "side": side,
             "qty": str(prepared.qty),
-            "price": str(price) if price is not None else None,
+            "price": str(prepared.price),
             "price_source": price_source,
             "trade_id": execution.trade.id,
         }),

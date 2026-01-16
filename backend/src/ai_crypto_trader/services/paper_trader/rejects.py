@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 class RejectCode(str, Enum):
     MIN_QTY = "MIN_QTY"
+    MIN_ORDER_NOTIONAL = "MIN_ORDER_NOTIONAL"
     MAX_ORDER_NOTIONAL = "MAX_ORDER_NOTIONAL"
     MAX_POSITION_NOTIONAL = "MAX_POSITION_NOTIONAL"
     QTY_ZERO = "QTY_ZERO"

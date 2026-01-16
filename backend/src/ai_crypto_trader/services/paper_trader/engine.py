@@ -20,10 +20,9 @@ from ai_crypto_trader.services.llm_agent.config import LLMConfig
 from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceResponse, MarketSummary as AdviceMarketSummary, PerformanceSummary
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
-from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
 from ai_crypto_trader.services.admin_actions_throttle import log_admin_action_throttled
-from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
-from ai_crypto_trader.services.paper_trader.utils import RiskRejected
+from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
+from ai_crypto_trader.services.paper_trader.rejects import RejectReason
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
 from ai_crypto_trader.services.paper_trader.market_summary import MarketSummaryBuilder
@@ -209,19 +208,20 @@ class PaperTradingEngine:
                     },
                 )
                 return
-                reject = await validate_order(
-                    session,
-                    account_id=account_id,
-                    symbol=symbol_norm,
-                    side=side,
-                    qty=qty_dec,
-                    price=summary.last_close,
-                    fee_bps=self.config.fee_bps,
-                    slippage_bps=self.config.slippage_bps,
-                risk_policy=DEFAULT_RISK_POLICY,
-                position_policy=DEFAULT_POSITION_POLICY,
+
+            result = await place_order_unified(
+                session,
+                account_id=account_id,
+                symbol=symbol,
+                side=side,
+                qty=qty_dec,
+                market_price=summary.last_close,
+                market_price_source="engine",
+                fee_bps=self.config.fee_bps,
+                slippage_bps=self.config.slippage_bps,
+                meta={"origin": "engine"},
             )
-            if reject:
+            if isinstance(result, RejectReason):
                 await log_admin_action_throttled(
                     session,
                     action_type="ORDER_SKIPPED",
@@ -229,49 +229,19 @@ class PaperTradingEngine:
                     message="Execution skipped",
                     account_id=account_id,
                     symbol=symbol_norm,
-                    reason_code=str(reject.code),
+                    reason_code=str(result.code),
                     cooldown_seconds=120,
                     payload_json={
                         "account_id": account_id,
                         "symbol": symbol_norm,
                         "side": side,
                         "qty": str(qty_dec),
-                        "reason": reject.reason,
-                        "code": str(reject.code),
+                        "reason": result.reason,
+                        "code": str(result.code),
                     },
                 )
                 return
-            fill = await execute_market_order_with_costs(
-                session=session,
-                account_id=account_id,
-                symbol=symbol,
-                side=side,
-                qty=qty_dec,
-                mid_price=summary.last_close,
-                fee_bps=self.config.fee_bps,
-                slippage_bps=self.config.slippage_bps,
-                meta={"origin": "engine"},
-            )
-        except (RiskRejected, ValueError) as exc:
-            await log_admin_action_throttled(
-                session,
-                action_type="ORDER_SKIPPED",
-                status="warn",
-                message="Execution skipped",
-                account_id=account_id,
-                symbol=symbol_norm,
-                reason_code=str(exc),
-                cooldown_seconds=120,
-                payload_json={
-                    "account_id": account_id,
-                    "symbol": symbol_norm,
-                    "side": side,
-                    "qty": str(qty_dec),
-                    "reason": str(exc),
-                    "error_type": exc.__class__.__name__,
-                },
-            )
-            return
+            fill = result.execution
         except Exception as exc:  # safety net to keep engine alive
             logger.exception("Execution failed; skipping symbol", extra={"symbol": symbol_norm})
             await log_admin_action_throttled(
