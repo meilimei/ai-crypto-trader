@@ -8,6 +8,8 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import Candle, PaperPosition, PaperTrade
+from ai_crypto_trader.services.admin_actions.reject_log import log_order_rejected_throttled
+from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.execution import ExecutionResult, execute_market_order_with_costs
 from ai_crypto_trader.services.paper_trader.policy_store import get_or_create_default_policies
@@ -96,70 +98,165 @@ async def place_order_unified(
     market_price: object | None = None,
     market_price_source: str | None = None,
     meta: Optional[dict[str, str]] = None,
+    reject_action_type: str = "ORDER_REJECTED",
+    reject_window_seconds: int = 120,
 ) -> UnifiedOrderResult | RejectReason:
     symbol_in = (symbol or "ETHUSDT").strip()
     symbol_norm = normalize_symbol(symbol_in)
     side_norm = (side or "buy").lower().strip()
+    price_source: Optional[str] = None
+
+    async def _log_reject(
+        reject: RejectReason,
+        *,
+        prepared: PreparedOrder | None = None,
+        notional: Decimal | None = None,
+        risk_policy=None,
+        position_policy=None,
+    ) -> None:
+        policy_snapshot = {}
+        if position_policy is not None:
+            policy_snapshot.update(
+                {
+                    "min_qty": str(position_policy.min_qty) if position_policy.min_qty is not None else None,
+                    "min_order_notional_usdt": str(position_policy.min_order_notional_usdt)
+                    if position_policy.min_order_notional_usdt is not None
+                    else None,
+                    "max_position_notional_per_symbol_usdt": str(position_policy.max_position_notional_per_symbol_usdt)
+                    if position_policy.max_position_notional_per_symbol_usdt is not None
+                    else None,
+                    "max_total_notional_usdt": str(position_policy.max_total_notional_usdt)
+                    if position_policy.max_total_notional_usdt is not None
+                    else None,
+                }
+            )
+        if risk_policy is not None:
+            policy_snapshot.update(
+                {
+                    "max_order_notional_usdt": str(risk_policy.max_order_notional_usdt)
+                    if getattr(risk_policy, "max_order_notional_usdt", None) is not None
+                    else None,
+                }
+            )
+        payload = {
+            "message": "Execution skipped" if reject_action_type == "ORDER_SKIPPED" else "Order rejected",
+            "reject": reject.dict(),
+            "account_id": account_id,
+            "symbol": symbol_norm,
+            "request": {
+                "account_id": account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side_norm,
+                "qty": str(qty),
+                "price_override": str(price_override) if price_override is not None else None,
+            },
+            "market_price": str(prepared.price) if prepared is not None else str(market_price) if market_price is not None else None,
+            "price_source": price_source or market_price_source,
+            "notional": str(notional) if notional is not None else None,
+            "policies": policy_snapshot,
+        }
+        if reject_action_type == "ORDER_REJECTED":
+            await log_order_rejected_throttled(
+                session,
+                account_id=account_id,
+                symbol=symbol_norm,
+                reject_code=str(reject.code),
+                reject_reason=reject.reason,
+                meta=payload,
+                window_seconds=reject_window_seconds,
+            )
+        else:
+            await write_admin_action_throttled(
+                session,
+                action_type=reject_action_type,
+                account_id=account_id,
+                symbol=symbol_norm,
+                status=str(reject.code),
+                payload=payload,
+                window_seconds=reject_window_seconds,
+            )
 
     if "/" in symbol_in:
-        return RejectReason(code=RejectCode.SYMBOL_DISABLED, reason="Symbol not supported")
+        reject = RejectReason(code=RejectCode.SYMBOL_DISABLED, reason="Symbol not supported")
+        await _log_reject(reject)
+        return reject
     if side_norm not in {"buy", "sell"}:
-        return RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
+        await _log_reject(reject)
+        return reject
 
     try:
         qty_dec_raw = Decimal(str(qty))
     except Exception:
-        return RejectReason(code=RejectCode.INVALID_QTY, reason="qty must be a valid decimal")
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="qty must be a valid decimal")
+        await _log_reject(reject)
+        return reject
     if qty_dec_raw <= 0:
-        return RejectReason(code=RejectCode.QTY_ZERO, reason="qty must be positive")
+        reject = RejectReason(code=RejectCode.QTY_ZERO, reason="qty must be positive")
+        await _log_reject(reject)
+        return reject
 
     price = None
-    price_source = None
     if price_override is not None:
         try:
             price = Decimal(str(price_override))
         except (InvalidOperation, TypeError, ValueError):
-            return RejectReason(code=RejectCode.INVALID_QTY, reason="price must be a valid decimal")
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be a valid decimal")
+            await _log_reject(reject)
+            return reject
         if not price.is_finite() or price <= 0:
-            return RejectReason(code=RejectCode.INVALID_QTY, reason="price must be positive")
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be positive")
+            await _log_reject(reject)
+            return reject
         price_source = "override"
     elif market_price is not None:
         try:
             price = Decimal(str(market_price))
         except (InvalidOperation, TypeError, ValueError):
-            return RejectReason(code=RejectCode.INVALID_QTY, reason="price must be a valid decimal")
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be a valid decimal")
+            await _log_reject(reject)
+            return reject
         if not price.is_finite() or price <= 0:
-            return RejectReason(code=RejectCode.INVALID_QTY, reason="price must be positive")
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price must be positive")
+            await _log_reject(reject)
+            return reject
         price_source = market_price_source or "engine"
     else:
         price, price_source = await _resolve_market_price(session, symbol_in=symbol_in, symbol_norm=symbol_norm)
         if price is None:
-            return RejectReason(
+            reject = RejectReason(
                 code=RejectCode.SYMBOL_DISABLED,
                 reason=f"No price data for symbol {symbol_norm}; pass price to override",
             )
+            await _log_reject(reject)
+            return reject
 
     try:
         prepared = prepare_order_inputs(symbol_in, qty_dec_raw, price)
     except ValueError as exc:
-        return _reject_from_reason(str(exc))
+        reject = _reject_from_reason(str(exc))
+        await _log_reject(reject)
+        return reject
 
     risk_policy, position_policy = await get_or_create_default_policies(session, account_id)
 
     if position_policy.min_qty is not None:
         min_qty = Decimal(str(position_policy.min_qty))
         if min_qty > 0 and prepared.qty.copy_abs() < min_qty:
-            return RejectReason(
+            reject = RejectReason(
                 code=RejectCode.MIN_QTY,
                 reason="Quantity below minimum",
                 details={"min_qty": str(min_qty)},
             )
+            await _log_reject(reject, prepared=prepared, risk_policy=risk_policy, position_policy=position_policy)
+            return reject
 
     notional = prepared.qty.copy_abs() * prepared.price
     if position_policy.min_order_notional_usdt is not None:
         min_notional = Decimal(str(position_policy.min_order_notional_usdt))
         if notional < min_notional:
-            return RejectReason(
+            reject = RejectReason(
                 code=RejectCode.MIN_ORDER_NOTIONAL,
                 reason="Order notional below minimum",
                 details={
@@ -169,11 +266,19 @@ async def place_order_unified(
                     "market_price": str(prepared.price),
                 },
             )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                notional=notional,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
 
     if risk_policy.max_order_notional_usdt is not None:
         max_notional = Decimal(str(risk_policy.max_order_notional_usdt))
         if notional > max_notional:
-            return RejectReason(
+            reject = RejectReason(
                 code=RejectCode.MAX_ORDER_NOTIONAL,
                 reason="Order notional above maximum",
                 details={
@@ -183,6 +288,14 @@ async def place_order_unified(
                     "market_price": str(prepared.price),
                 },
             )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                notional=notional,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
 
     current_qty_dec = None
     next_qty = None
@@ -203,7 +316,7 @@ async def place_order_unified(
         limit = Decimal(str(position_policy.max_position_notional_per_symbol_usdt))
         next_notional = next_qty.copy_abs() * prepared.price
         if next_notional > limit:
-            return RejectReason(
+            reject = RejectReason(
                 code=RejectCode.MAX_POSITION_NOTIONAL,
                 reason="Position notional above maximum",
                 details={
@@ -215,6 +328,14 @@ async def place_order_unified(
                     "market_price": str(prepared.price),
                 },
             )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                notional=next_notional,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
 
     if position_policy.max_total_notional_usdt is not None:
         limit = Decimal(str(position_policy.max_total_notional_usdt))
@@ -233,7 +354,7 @@ async def place_order_unified(
                 price_for_total = Decimal(str(avg_price or 0))
             total_notional += qty_for_total.copy_abs() * price_for_total
         if total_notional > limit:
-            return RejectReason(
+            reject = RejectReason(
                 code=RejectCode.POSITION_LIMIT,
                 reason="Account notional above maximum",
                 details={
@@ -243,6 +364,14 @@ async def place_order_unified(
                     "market_price": str(prepared.price),
                 },
             )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                notional=total_notional,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
 
     try:
         execution = await execute_market_order_with_costs(
@@ -257,7 +386,15 @@ async def place_order_unified(
             meta=meta,
         )
     except (RiskRejected, ValueError) as exc:
-        return _reject_from_reason(str(exc))
+        reject = _reject_from_reason(str(exc))
+        await _log_reject(
+            reject,
+            prepared=prepared,
+            notional=notional,
+            risk_policy=risk_policy,
+            position_policy=position_policy,
+        )
+        return reject
 
     return UnifiedOrderResult(
         execution=execution,

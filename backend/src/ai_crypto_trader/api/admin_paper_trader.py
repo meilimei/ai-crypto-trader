@@ -43,6 +43,7 @@ from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, R
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
 from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
+from ai_crypto_trader.services.admin_actions.reject_log import log_order_rejected_throttled
 from ai_crypto_trader.utils.json_safe import json_safe
 from sqlalchemy import text
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -412,20 +413,24 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
             position_policy=DEFAULT_POSITION_POLICY,
         )
         if reject_reason:
-            await _record_action(
+            await log_order_rejected_throttled(
                 session,
-                "ORDER_REJECTED",
-                "warn",
-                "Order rejected",
+                account_id=payload.account_id,
+                symbol=normalize_symbol(payload.symbol),
+                reject_code=str(reject_reason.code),
+                reject_reason=reject_reason.reason,
                 meta={
-                    "account_id": payload.account_id,
-                    "symbol": payload.symbol,
-                    "side": payload.side,
-                    "qty": str(qty),
-                    "price": str(payload.price),
-                    "reason": reject_reason.reason,
-                    "code": reject_reason.code,
+                    "message": "Order rejected",
+                    "reject": reject_reason.dict(),
+                    "request": {
+                        "account_id": payload.account_id,
+                        "symbol_in": payload.symbol,
+                        "side": payload.side,
+                        "qty": str(qty),
+                        "price_override": str(payload.price),
+                    },
                 },
+                window_seconds=120,
             )
             return _reject_response(reject_reason, status_code=400)
         execution = await execute_market_order_with_costs(
@@ -441,20 +446,24 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
         )
     except (RiskRejected, ValueError) as exc:
         reject_reason = _reject_from_reason(str(exc))
-        await _record_action(
+        await log_order_rejected_throttled(
             session,
-            "ORDER_REJECTED",
-            "warn",
-            "Order rejected",
+            account_id=payload.account_id,
+            symbol=normalize_symbol(payload.symbol),
+            reject_code=str(reject_reason.code),
+            reject_reason=reject_reason.reason,
             meta={
-                "account_id": payload.account_id,
-                "symbol": payload.symbol,
-                "side": payload.side,
-                "qty": str(qty),
-                "price": str(payload.price),
-                "reason": reject_reason.reason,
-                "code": reject_reason.code,
+                "message": "Order rejected",
+                "reject": reject_reason.dict(),
+                "request": {
+                    "account_id": payload.account_id,
+                    "symbol_in": payload.symbol,
+                    "side": payload.side,
+                    "qty": str(qty),
+                    "price_override": str(payload.price),
+                },
             },
+            window_seconds=120,
         )
         return _reject_response(reject_reason, status_code=400)
 
@@ -497,22 +506,6 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         meta={"origin": "admin_smoke"},
     )
     if isinstance(result, RejectReason):
-        await _record_action(
-            session,
-            "ORDER_REJECTED",
-            "warn",
-            "Order rejected",
-            meta=json_safe({
-                "account_id": payload.account_id,
-                "symbol_in": symbol_in,
-                "symbol_normalized": normalize_symbol(symbol_in),
-                "side": side,
-                "qty": str(payload.qty),
-                "price": payload.price,
-                "reason": result.reason,
-                "code": result.code,
-            }),
-        )
         return _reject_response(result, status_code=400)
 
     execution = result.execution
@@ -590,21 +583,24 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
 async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
     if not runner.is_running:
         reject = RejectReason(code=RejectCode.ENGINE_NOT_RUNNING, reason="Paper trader engine is not running")
-        await add_action_deduped(
+        await log_order_rejected_throttled(
             session,
-            action="SMOKE_TRADE",
-            status="error",
-            message="Smoke trade rejected",
+            account_id=payload.account_id,
+            symbol=normalize_symbol(getattr(payload, "symbol", "")),
+            reject_code=str(reject.code),
+            reject_reason=reject.reason,
             meta={
-                "account_id": payload.account_id,
-                "symbol_in": getattr(payload, "symbol", None),
-                "side": getattr(payload, "side", None),
-                "qty": str(getattr(payload, "qty", None)),
-                "price_override": getattr(payload, "price", None),
-                "reason": reject.reason,
-                "code": reject.code,
+                "message": "Smoke trade rejected",
+                "reject": reject.dict(),
+                "request": {
+                    "account_id": payload.account_id,
+                    "symbol_in": getattr(payload, "symbol", None),
+                    "side": getattr(payload, "side", None),
+                    "qty": str(getattr(payload, "qty", None)),
+                    "price_override": getattr(payload, "price", None),
+                },
             },
-            cooldown_seconds=30,
+            window_seconds=120,
         )
         return _reject_response(reject, status_code=400)
     try:

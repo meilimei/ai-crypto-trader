@@ -462,12 +462,13 @@ class AdminAction(Base):
     __table_args__ = (
         Index("ix_admin_actions_created_at", "created_at"),
         Index("ix_admin_actions_dedupe_key", "dedupe_key"),
+        Index("ix_admin_actions_dedupe_key_created_at", "dedupe_key", "created_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     dedupe_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     action: Mapped[str] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(64))
     message: Mapped[Optional[str]] = mapped_column(Text)
     meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(

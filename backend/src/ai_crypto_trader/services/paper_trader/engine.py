@@ -20,7 +20,7 @@ from ai_crypto_trader.services.llm_agent.config import LLMConfig
 from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceResponse, MarketSummary as AdviceMarketSummary, PerformanceSummary
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
-from ai_crypto_trader.services.admin_actions_throttle import log_admin_action_throttled
+from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
 from ai_crypto_trader.services.paper_trader.rejects import RejectReason
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
@@ -191,21 +191,20 @@ class PaperTradingEngine:
         try:
             qty_dec = Decimal(str(delta_qty)).copy_abs()
             if qty_dec <= 0:
-                await log_admin_action_throttled(
+                await write_admin_action_throttled(
                     session,
                     action_type="ORDER_SKIPPED",
-                    status="warn",
-                    message="Execution skipped",
                     account_id=account_id,
                     symbol=symbol_norm,
-                    reason_code="ZERO_OR_NEGATIVE_QTY",
-                    cooldown_seconds=120,
-                    payload_json={
+                    status="ZERO_OR_NEGATIVE_QTY",
+                    payload={
+                        "message": "Execution skipped",
                         "account_id": account_id,
                         "symbol": symbol_norm,
                         "qty": str(delta_qty),
                         "reason": "ZERO_OR_NEGATIVE_QTY",
                     },
+                    window_seconds=120,
                 )
                 return
 
@@ -220,40 +219,22 @@ class PaperTradingEngine:
                 fee_bps=self.config.fee_bps,
                 slippage_bps=self.config.slippage_bps,
                 meta={"origin": "engine"},
+                reject_action_type="ORDER_SKIPPED",
+                reject_window_seconds=120,
             )
             if isinstance(result, RejectReason):
-                await log_admin_action_throttled(
-                    session,
-                    action_type="ORDER_SKIPPED",
-                    status="warn",
-                    message="Execution skipped",
-                    account_id=account_id,
-                    symbol=symbol_norm,
-                    reason_code=str(result.code),
-                    cooldown_seconds=120,
-                    payload_json={
-                        "account_id": account_id,
-                        "symbol": symbol_norm,
-                        "side": side,
-                        "qty": str(qty_dec),
-                        "reason": result.reason,
-                        "code": str(result.code),
-                    },
-                )
                 return
             fill = result.execution
         except Exception as exc:  # safety net to keep engine alive
             logger.exception("Execution failed; skipping symbol", extra={"symbol": symbol_norm})
-            await log_admin_action_throttled(
+            await write_admin_action_throttled(
                 session,
                 action_type="ORDER_SKIPPED",
-                status="alert",
-                message="Execution skipped",
                 account_id=account_id,
                 symbol=symbol_norm,
-                reason_code=exc.__class__.__name__,
-                cooldown_seconds=120,
-                payload_json={
+                status=exc.__class__.__name__,
+                payload={
+                    "message": "Execution skipped",
                     "symbol": symbol_norm,
                     "side": side,
                     "qty": str(delta_qty),
@@ -261,6 +242,7 @@ class PaperTradingEngine:
                     "error_type": exc.__class__.__name__,
                     "account_id": account_id,
                 },
+                window_seconds=120,
             )
             return
 
