@@ -22,6 +22,11 @@ from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.engine import PaperTradingEngine
 from ai_crypto_trader.common.maintenance import ensure_and_sync_paper_id_sequences
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_apply, normalize_status
+from ai_crypto_trader.services.paper_trader.reconcile_policy import (
+    apply_reconcile_policy_status,
+    get_reconcile_policy,
+    policy_snapshot,
+)
 from ai_crypto_trader.services.admin_actions.reconcile_log import log_reconcile_report_throttled
 from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.common.database import AsyncSessionLocal
@@ -187,7 +192,8 @@ class PaperTraderRunner:
                         await asyncio.sleep(self.reconcile_interval_seconds)
                         continue
                     self.last_reconcile_at = datetime.now(timezone.utc)
-                    report = await reconcile_report(session, account.id)
+                    policy = await get_reconcile_policy(session, account.id)
+                    report = await reconcile_report(session, account.id, policy=policy)
                     summary = report.get("summary") or {}
                     diff_count = summary.get("diff_count", 0) or 0
                     usdt_diff = Decimal(str(summary.get("usdt_diff", "0") or "0"))
@@ -199,6 +205,11 @@ class PaperTraderRunner:
                     within_tolerance = usdt_tolerance > 0 and usdt_diff.copy_abs() <= usdt_tolerance
                     if within_tolerance:
                         status = "ok"
+                    status = apply_reconcile_policy_status(
+                        summary=summary,
+                        base_status=status,
+                        policy=policy,
+                    )
                     emit = False
                     now_mono = asyncio.get_running_loop().time()
                     if self._last_reconcile_action_at is None:
@@ -220,6 +231,9 @@ class PaperTraderRunner:
                         await asyncio.sleep(self.reconcile_interval_seconds)
                         continue
                     if emit and (emit_ok or diff_count > 0):
+                        window_seconds = 600
+                        if policy and policy.log_window_seconds:
+                            window_seconds = int(policy.log_window_seconds)
                         await log_reconcile_report_throttled(
                             status=status,
                             account_id=account.id,
@@ -230,7 +244,10 @@ class PaperTraderRunner:
                                 "diff_count": diff_count,
                                 "diffs_sample": diffs_sample,
                                 "warning": warn,
+                                "policy": policy_snapshot(policy),
+                                "baseline_source": (report.get("derived") or {}).get("baseline_source"),
                             }),
+                            window_seconds=window_seconds,
                         )
                         self._last_reconcile_summary = summary
                         self._last_reconcile_action_at = now_mono

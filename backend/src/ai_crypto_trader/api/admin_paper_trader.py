@@ -41,6 +41,11 @@ from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POL
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
+from ai_crypto_trader.services.paper_trader.reconcile_policy import (
+    apply_reconcile_policy_status,
+    get_reconcile_policy,
+    policy_snapshot,
+)
 from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
 from ai_crypto_trader.services.admin_actions.reconcile_log import log_reconcile_report_throttled
@@ -787,9 +792,18 @@ async def paper_trader_equity(limit: int = Query(200, ge=1, le=2000), session: A
 async def reconcile(account_id: int = Query(..., ge=1), mode: str | None = Query(default=None), session: AsyncSession = Depends(get_db_session)) -> dict:
     if mode and mode.lower().strip() == "apply":
         raise HTTPException(status_code=400, detail="GET reconcile is report-only; use POST /reconcile/apply")
-    report = await reconcile_report(session, account_id)
+    policy = await get_reconcile_policy(session, account_id)
+    report = await reconcile_report(session, account_id, policy=policy)
     status = normalize_status("ok" if report.get("ok") else "alert")
+    status = apply_reconcile_policy_status(
+        summary=report.get("summary") or {},
+        base_status=status,
+        policy=policy,
+    )
     diffs_sample = report.get("diffs", [])[:10]
+    window_seconds = 600
+    if policy and policy.log_window_seconds:
+        window_seconds = int(policy.log_window_seconds)
     await log_reconcile_report_throttled(
         account_id=account_id,
         status=status,
@@ -799,7 +813,10 @@ async def reconcile(account_id: int = Query(..., ge=1), mode: str | None = Query
             "diff_count": len(report.get("diffs", [])),
             "diffs_sample": diffs_sample,
             "warnings": report.get("warnings"),
+            "policy": policy_snapshot(policy),
+            "baseline_source": (report.get("derived") or {}).get("baseline_source"),
         },
+        window_seconds=window_seconds,
     )
     return report
 

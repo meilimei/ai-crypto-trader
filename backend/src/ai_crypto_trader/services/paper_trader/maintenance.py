@@ -22,6 +22,7 @@ from ai_crypto_trader.services.admin_actions.reconcile_log import log_reconcile_
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol, MONEY_EXP
 from ai_crypto_trader.services.paper_trader.ledger import get_initial_usdt, simulate_positions_and_cash
+from ai_crypto_trader.services.paper_trader.reconcile_policy import ReconcilePolicy, get_reconcile_policy, policy_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -194,11 +195,21 @@ async def _ensure_unique_index(
     await session.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} ON {table_name} ({col_sql})"))
 
 
-async def compute_derived_state(session: AsyncSession, account_id: int) -> Dict[str, Any]:
+async def compute_derived_state(
+    session: AsyncSession,
+    account_id: int,
+    *,
+    baseline_cash: Decimal | None = None,
+    baseline_source: str | None = None,
+) -> Dict[str, Any]:
     """
     Derive positions and balances from trades (best-effort).
     """
-    baseline_cash, baseline_source = await get_initial_usdt(session, account_id)
+    if baseline_cash is None:
+        baseline_cash, baseline_source = await get_initial_usdt(session, account_id)
+    else:
+        baseline_cash = to_decimal(baseline_cash)
+        baseline_source = baseline_source or "policy"
 
     trades: List[PaperTrade] = (
         await session.scalars(
@@ -316,11 +327,24 @@ def diff_states(
     return {"diffs": diffs, "summary": summary}
 
 
-async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, Any]:
+async def reconcile_report(
+    session: AsyncSession,
+    account_id: int,
+    policy: ReconcilePolicy | None = None,
+) -> Dict[str, Any]:
     try:
         account = await session.get(PaperAccount, account_id)
         if not account:
             return {"ok": True, "account_id": account_id, "db": {}, "derived": {}, "diffs": [], "summary": {}}
+
+        if policy is None:
+            policy = await get_reconcile_policy(session, account_id)
+        policy_data = policy_snapshot(policy)
+        baseline_cash_override = None
+        baseline_source = None
+        if policy and policy.baseline_cash_usdt is not None:
+            baseline_cash_override = policy.baseline_cash_usdt
+            baseline_source = "policy"
 
         warnings: List[str] = []
         db_positions_query = await session.scalars(
@@ -385,7 +409,12 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
         }
 
         try:
-            derived_state = await compute_derived_state(session, account_id)
+            derived_state = await compute_derived_state(
+                session,
+                account_id,
+                baseline_cash=baseline_cash_override,
+                baseline_source=baseline_source,
+            )
         except (InvalidOperation, ZeroDivisionError) as exc:
             warnings.append(f"DERIVED_STATE_ERROR:{exc.__class__.__name__}")
             derived_state = {
@@ -422,6 +451,7 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
             "derived": derived_state,
             "diffs": diff_result["diffs"],
             "summary": diff_result["summary"],
+            "policy": policy_data,
             "warnings": warnings,
             "debug_counts": debug_counts,
         }
@@ -476,6 +506,8 @@ async def reconcile_fix(session: AsyncSession, account_id: int, apply: bool) -> 
                 "diff_count": (report_before.get("summary") or {}).get("diff_count"),
                 "diffs_sample": diffs[:20],
                 "warnings": report_before.get("warnings"),
+                "policy": report_before.get("policy"),
+                "baseline_source": (report_before.get("derived") or {}).get("baseline_source"),
             },
         )
         return {

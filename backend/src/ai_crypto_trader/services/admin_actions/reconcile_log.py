@@ -62,6 +62,10 @@ def _build_meta(account_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         meta["warning"] = payload.get("warning")
     if "warnings" in payload:
         meta["warnings"] = payload.get("warnings")
+    if "policy" in payload:
+        meta["policy"] = payload.get("policy")
+    if "baseline_source" in payload:
+        meta["baseline_source"] = payload.get("baseline_source")
     if "debug_counts" in payload:
         meta["debug_counts"] = payload.get("debug_counts")
     if "debug" in payload:
