@@ -18,6 +18,7 @@ from ai_crypto_trader.common.models import (
     utc_now,
 )
 from ai_crypto_trader.common.jsonable import to_jsonable
+from ai_crypto_trader.services.admin_actions.reconcile_log import log_reconcile_report_throttled
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol, MONEY_EXP
 from ai_crypto_trader.services.paper_trader.ledger import get_initial_usdt, simulate_positions_and_cash
@@ -433,28 +434,17 @@ async def reconcile_report(session: AsyncSession, account_id: int) -> Dict[str, 
             "generated_at": utc_now().isoformat(),
             "account_id": account_id,
         }
-        try:
-            session.add(
-                AdminAction(
-                    action="RECONCILE_REPORT",
-                    status=normalize_status("error"),
-                    message="Reconcile report error",
-                    meta=to_jsonable(
-                        {
-                            "account_id": account_id,
-                            "error_type": exc.__class__.__name__,
-                            "error": str(exc),
-                        }
-                    ),
-                )
-            )
-            if not session.in_transaction():
-                await session.commit()
-        except Exception:
-            try:
-                await session.rollback()
-            except Exception:
-                pass
+        await log_reconcile_report_throttled(
+            account_id=account_id,
+            status="error",
+            message="Reconcile report error",
+            report_meta={
+                "account_id": account_id,
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+                "diff_count": None,
+            },
+        )
         return error_payload
 
 
@@ -477,20 +467,17 @@ async def reconcile_fix(session: AsyncSession, account_id: int, apply: bool) -> 
 
     if not apply:
         status = normalize_status("ok" if report_before.get("ok") else "alert")
-        session.add(
-            AdminAction(
-                action="RECONCILE_REPORT",
-                status=status,
-                message="Reconcile report (dry run)",
-                meta=to_jsonable({
-                    "account_id": account_id,
-                    "summary": report_before.get("summary"),
-                    "diffs_sample": diffs[:20],
-                }),
-            )
+        await log_reconcile_report_throttled(
+            account_id=account_id,
+            status=status,
+            message="Reconcile report (dry run)",
+            report_meta={
+                "summary": report_before.get("summary"),
+                "diff_count": (report_before.get("summary") or {}).get("diff_count"),
+                "diffs_sample": diffs[:20],
+                "warnings": report_before.get("warnings"),
+            },
         )
-        if not session.in_transaction():
-            await session.commit()
         return {
             "mode": "dry_run",
             "before": report_before,

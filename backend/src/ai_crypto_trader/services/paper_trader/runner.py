@@ -22,7 +22,7 @@ from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.engine import PaperTradingEngine
 from ai_crypto_trader.common.maintenance import ensure_and_sync_paper_id_sequences
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_apply, normalize_status
-from ai_crypto_trader.services.admin_actions_throttle import log_admin_action_throttled
+from ai_crypto_trader.services.admin_actions.reconcile_log import log_reconcile_report_throttled
 from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.common.database import AsyncSessionLocal
 
@@ -220,16 +220,11 @@ class PaperTraderRunner:
                         await asyncio.sleep(self.reconcile_interval_seconds)
                         continue
                     if emit and (emit_ok or diff_count > 0):
-                        await log_admin_action_throttled(
-                            session,
-                            action_type="RECONCILE_REPORT",
+                        await log_reconcile_report_throttled(
                             status=status,
-                            message="Auto reconcile report",
                             account_id=account.id,
-                            symbol=None,
-                            reason_code="RECONCILE_REPORT",
-                            cooldown_seconds=300,
-                            payload_json=to_jsonable({
+                            message="Auto reconcile report",
+                            report_meta=to_jsonable({
                                 "account_id": account.id,
                                 "summary": summary,
                                 "diff_count": diff_count,
@@ -274,16 +269,11 @@ class PaperTraderRunner:
             except Exception as exc:
                 self.last_reconcile_error = str(exc)
                 async with AsyncSessionLocal() as session:
-                    await log_admin_action_throttled(
-                        session,
-                        action_type="RECONCILE_REPORT",
+                    await log_reconcile_report_throttled(
+                        account_id=0,
                         status=normalize_status("error"),
                         message="Auto reconcile error",
-                        account_id=None,
-                        symbol=None,
-                        reason_code=exc.__class__.__name__,
-                        cooldown_seconds=300,
-                        payload_json=to_jsonable({"account": account_name, "error": str(exc)}),
+                        report_meta=to_jsonable({"account": account_name, "error": str(exc)}),
                     )
                 logger.exception("Auto reconcile loop error")
             await asyncio.sleep(self.reconcile_interval_seconds)

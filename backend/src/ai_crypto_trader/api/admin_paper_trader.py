@@ -43,6 +43,7 @@ from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, R
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_fix, reconcile_apply, normalize_status
 from ai_crypto_trader.common.jsonable import to_jsonable
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
+from ai_crypto_trader.services.admin_actions.reconcile_log import log_reconcile_report_throttled
 from ai_crypto_trader.services.admin_actions.reject_log import log_order_rejected_throttled
 from ai_crypto_trader.utils.json_safe import json_safe
 from sqlalchemy import text
@@ -789,16 +790,15 @@ async def reconcile(account_id: int = Query(..., ge=1), mode: str | None = Query
     report = await reconcile_report(session, account_id)
     status = normalize_status("ok" if report.get("ok") else "alert")
     diffs_sample = report.get("diffs", [])[:10]
-    await _record_action(
-        session,
-        "RECONCILE_REPORT",
-        status,
-        "Paper trader reconcile report",
-        meta={
-            "account_id": account_id,
+    await log_reconcile_report_throttled(
+        account_id=account_id,
+        status=status,
+        message="Paper trader reconcile report",
+        report_meta={
             "summary": report.get("summary"),
             "diff_count": len(report.get("diffs", [])),
             "diffs_sample": diffs_sample,
+            "warnings": report.get("warnings"),
         },
     )
     return report
