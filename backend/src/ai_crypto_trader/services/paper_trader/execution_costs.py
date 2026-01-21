@@ -1,6 +1,7 @@
 from decimal import Decimal, ROUND_DOWN
 
 from ai_crypto_trader.services.paper_trader.accounting import PRICE_EXP, MONEY_EXP
+from ai_crypto_trader.services.paper_trader.costs import compute_execution_costs
 
 
 def _quant(val: Decimal, exp: str) -> Decimal:
@@ -34,9 +35,18 @@ def compute_execution(
     fee_bps: Decimal,
     slippage_bps: Decimal,
 ) -> dict:
-    exec_price = apply_slippage(market_price, side, Decimal(str(slippage_bps)))
-    notional = _quant(Decimal(str(qty)) * exec_price, MONEY_EXP)
-    fee = calc_fee(notional, Decimal(str(fee_bps)))
+    costs = compute_execution_costs(
+        side=side,
+        qty=Decimal(str(qty)),
+        market_price=Decimal(str(market_price)),
+        fee_rate=Decimal(str(fee_bps)) / Decimal("10000"),
+        slippage_bps=Decimal(str(slippage_bps)),
+        quantize_usdt=Decimal(MONEY_EXP),
+        quantize_price=Decimal(PRICE_EXP),
+    )
+    exec_price = costs.effective_price
+    notional = costs.notional_usdt
+    fee = costs.fee_usdt
     return {
         "exec_price": exec_price,
         "notional": notional,

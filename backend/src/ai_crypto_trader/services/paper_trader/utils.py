@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import PaperAccount, PaperBalance, PaperPosition
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol, QTY_EXP, PRICE_EXP, MONEY_EXP
+from ai_crypto_trader.services.paper_trader.costs import compute_execution_costs
 
 
 def _quantize(val: Decimal, exp: str) -> Decimal:
@@ -89,12 +90,18 @@ async def guard_market_risk(
     )
     current_qty = Decimal(str(pos_qty)) if pos_qty is not None else Decimal("0")
 
-    notional = _quantize(qty * price, MONEY_EXP)
-    fee_est = _quantize(notional * (fee_bps / Decimal("10000")), MONEY_EXP)
-    slip_est = _quantize(notional * (slippage_bps / Decimal("10000")), MONEY_EXP)
+    costs = compute_execution_costs(
+        side=side_norm,
+        qty=Decimal(str(qty)),
+        market_price=Decimal(str(price)),
+        fee_rate=Decimal(str(fee_bps)) / Decimal("10000"),
+        slippage_bps=Decimal(str(slippage_bps)),
+        quantize_usdt=Decimal(MONEY_EXP),
+        quantize_price=Decimal(PRICE_EXP),
+    )
 
     if side_norm == "buy":
-        needed = notional + fee_est + slip_est
+        needed = costs.notional_usdt + costs.fee_usdt
         if cash < needed:
             raise RiskRejected("INSUFFICIENT_CASH")
     else:

@@ -227,6 +227,7 @@ async def compute_derived_state(
     stats = ledger.get("stats", {})
     total_fees = _quant(stats.get("fees_usd", Decimal("0")), MONEY_EXP)
     total_slippage = _quant(stats.get("slippage_usd", Decimal("0")), MONEY_EXP)
+    total_cash_delta = _quant(stats.get("sum_cash_delta", Decimal("0")), MONEY_EXP)
 
     derived = {
         "positions_by_symbol": positions_by_symbol,
@@ -238,6 +239,7 @@ async def compute_derived_state(
         "baseline_source": baseline_source,
         "debug_cash_components": {
             "baseline_cash": str(_quant(baseline_cash, MONEY_EXP)),
+            "sum_cash_delta": str(total_cash_delta),
             "sum_buy_notional": str(_quant(stats.get("sum_buy_notional", Decimal("0")), MONEY_EXP)),
             "sum_sell_notional": str(_quant(stats.get("sum_sell_notional", Decimal("0")), MONEY_EXP)),
             "sum_fees": str(total_fees),

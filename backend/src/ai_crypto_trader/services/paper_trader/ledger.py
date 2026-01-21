@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Iterable, Tuple
 
 from ai_crypto_trader.common.models import PaperAccount
@@ -12,7 +12,7 @@ from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 
 
 def _q(val: Decimal, exp: str) -> Decimal:
-    return Decimal(val).quantize(Decimal(exp))
+    return Decimal(val).quantize(Decimal(exp), rounding=ROUND_DOWN)
 
 
 def normalize_trade_side(side: str) -> int:
@@ -43,6 +43,7 @@ def simulate_positions_and_cash(
         "fees_usd": Decimal("0"),
         "sum_buy_notional": Decimal("0"),
         "sum_sell_notional": Decimal("0"),
+        "sum_cash_delta": Decimal("0"),
         "trade_count": 0,
     }
 
@@ -54,17 +55,17 @@ def simulate_positions_and_cash(
         if qty_raw is None or price_raw is None or symbol_raw is None:
             continue
 
-        qty_signed = signed_qty(side, Decimal(str(qty_raw)))
+        qty_signed = signed_qty(side, _q(Decimal(str(qty_raw)), QTY_EXP))
         if qty_signed == 0:
             continue
         qty_abs = qty_signed.copy_abs()
-        price = Decimal(str(price_raw))
+        price = _q(Decimal(str(price_raw)), PRICE_EXP)
         symbol = normalize_symbol(str(symbol_raw))
         if not symbol:
             continue
 
         fee_raw = getattr(trade, "fee", None)
-        fee = Decimal(str(fee_raw)) if fee_raw is not None else Decimal("0")
+        fee = _q(Decimal(str(fee_raw)), MONEY_EXP) if fee_raw is not None else Decimal("0")
         realized_raw = getattr(trade, "realized_pnl", None)
         realized_override = (
             Decimal(str(realized_raw)) if realized_raw is not None else None
@@ -72,12 +73,15 @@ def simulate_positions_and_cash(
 
         notional = _q(qty_abs * price, MONEY_EXP)
         if qty_signed > 0:
-            cash["USDT"]["free"] = _q(cash["USDT"]["free"] - notional - fee, MONEY_EXP)
+            cash_delta = _q(-(notional + fee), MONEY_EXP)
+            cash["USDT"]["free"] = _q(cash["USDT"]["free"] + cash_delta, MONEY_EXP)
             stats["sum_buy_notional"] += notional
         else:
-            cash["USDT"]["free"] = _q(cash["USDT"]["free"] + notional - fee, MONEY_EXP)
+            cash_delta = _q(notional - fee, MONEY_EXP)
+            cash["USDT"]["free"] = _q(cash["USDT"]["free"] + cash_delta, MONEY_EXP)
             stats["sum_sell_notional"] += notional
 
+        stats["sum_cash_delta"] += cash_delta
         stats["fees_usd"] += fee
         stats["trade_count"] += 1
 
@@ -122,6 +126,8 @@ def simulate_positions_and_cash(
                         pos_qty = _q(new_qty, QTY_EXP)
                         pos_avg = _q(pos_avg, PRICE_EXP)
 
+        pos_qty = _q(pos_qty, QTY_EXP)
+        pos_avg = _q(pos_avg, PRICE_EXP)
         positions[symbol] = {"qty": pos_qty, "avg_entry": pos_avg}
 
     return {"positions": positions, "cash": cash, "stats": stats}

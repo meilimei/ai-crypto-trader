@@ -142,7 +142,7 @@ async def apply_trade_to_state(
         side,
     )
     position.qty = new_qty
-    position.avg_entry_price = new_avg
+    position.avg_entry_price = _quantize(Decimal(str(new_avg)), PRICE_EXP)
     position.side = side_state
     position.updated_at = utc_now()
 
