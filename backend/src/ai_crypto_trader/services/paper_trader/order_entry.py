@@ -8,12 +8,10 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import Candle, PaperPosition, PaperTrade
-from ai_crypto_trader.services.admin_actions.reject_log import log_order_rejected_throttled
-from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.execution import ExecutionResult, execute_market_order_with_costs
 from ai_crypto_trader.services.paper_trader.policy_store import get_or_create_default_policies
-from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
+from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason, log_reject_throttled, make_reject
 from ai_crypto_trader.services.paper_trader.utils import PreparedOrder, RiskRejected, prepare_order_inputs
 
 
@@ -138,9 +136,10 @@ async def place_order_unified(
                     else None,
                 }
             )
+        reject_payload = make_reject(reject.code, reject.reason, reject.details)
         payload = {
             "message": "Execution skipped" if reject_action_type == "ORDER_SKIPPED" else "Order rejected",
-            "reject": reject.dict(),
+            "reject": reject_payload,
             "account_id": account_id,
             "symbol": symbol_norm,
             "request": {
@@ -156,26 +155,15 @@ async def place_order_unified(
             "notional": str(notional) if notional is not None else None,
             "policies": policy_snapshot,
         }
-        if reject_action_type == "ORDER_REJECTED":
-            await log_order_rejected_throttled(
-                session,
-                account_id=account_id,
-                symbol=symbol_norm,
-                reject_code=str(reject.code),
-                reject_reason=reject.reason,
-                meta=payload,
-                window_seconds=reject_window_seconds,
-            )
-        else:
-            await write_admin_action_throttled(
-                session,
-                action_type=reject_action_type,
-                account_id=account_id,
-                symbol=symbol_norm,
-                status=str(reject.code),
-                payload=payload,
-                window_seconds=reject_window_seconds,
-            )
+        await log_reject_throttled(
+            action=reject_action_type,
+            account_id=account_id,
+            symbol=symbol_norm,
+            reject=reject_payload,
+            message=payload.get("message"),
+            meta=payload,
+            window_seconds=reject_window_seconds,
+        )
 
     if "/" in symbol_in:
         reject = RejectReason(code=RejectCode.SYMBOL_DISABLED, reason="Symbol not supported")

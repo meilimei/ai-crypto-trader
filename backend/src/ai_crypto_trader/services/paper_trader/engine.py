@@ -20,9 +20,8 @@ from ai_crypto_trader.services.llm_agent.config import LLMConfig
 from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceResponse, MarketSummary as AdviceMarketSummary, PerformanceSummary
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
-from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
-from ai_crypto_trader.services.paper_trader.rejects import RejectReason
+from ai_crypto_trader.services.paper_trader.rejects import RejectReason, log_reject_throttled, make_reject
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
 from ai_crypto_trader.services.paper_trader.market_summary import MarketSummaryBuilder
@@ -191,14 +190,14 @@ class PaperTradingEngine:
         try:
             qty_dec = Decimal(str(delta_qty)).copy_abs()
             if qty_dec <= 0:
-                await write_admin_action_throttled(
-                    session,
-                    action_type="ORDER_SKIPPED",
+                reject = make_reject("ZERO_OR_NEGATIVE_QTY", "Execution skipped")
+                await log_reject_throttled(
+                    action="ORDER_SKIPPED",
                     account_id=account_id,
                     symbol=symbol_norm,
-                    status="ZERO_OR_NEGATIVE_QTY",
-                    payload={
-                        "message": "Execution skipped",
+                    reject=reject,
+                    message="Execution skipped",
+                    meta={
                         "account_id": account_id,
                         "symbol": symbol_norm,
                         "qty": str(delta_qty),
@@ -227,14 +226,14 @@ class PaperTradingEngine:
             fill = result.execution
         except Exception as exc:  # safety net to keep engine alive
             logger.exception("Execution failed; skipping symbol", extra={"symbol": symbol_norm})
-            await write_admin_action_throttled(
-                session,
-                action_type="ORDER_SKIPPED",
+            reject = make_reject(exc.__class__.__name__, "Execution skipped", {"error": str(exc)})
+            await log_reject_throttled(
+                action="ORDER_SKIPPED",
                 account_id=account_id,
                 symbol=symbol_norm,
-                status=exc.__class__.__name__,
-                payload={
-                    "message": "Execution skipped",
+                reject=reject,
+                message="Execution skipped",
+                meta={
                     "symbol": symbol_norm,
                     "side": side,
                     "qty": str(delta_qty),

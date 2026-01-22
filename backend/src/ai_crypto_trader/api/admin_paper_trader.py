@@ -589,15 +589,21 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
 async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
     if not runner.is_running:
         reject = RejectReason(code=RejectCode.ENGINE_NOT_RUNNING, reason="Paper trader engine is not running")
+        engine_status = runner.status()
         await log_order_rejected_throttled(
             session,
             account_id=payload.account_id,
             symbol=normalize_symbol(getattr(payload, "symbol", "")),
-            reject_code=str(reject.code),
+            reject_code=reject.code,
             reject_reason=reject.reason,
             meta={
                 "message": "Smoke trade rejected",
                 "reject": reject.dict(),
+                "endpoint": "POST /admin/paper-trader/smoke-trade",
+                "engine_running": runner.is_running,
+                "engine_task_state": engine_status.get("engine_task_state"),
+                "engine_last_cycle_at": engine_status.get("last_cycle_at"),
+                "engine_last_error": engine_status.get("last_error"),
                 "request": {
                     "account_id": payload.account_id,
                     "symbol_in": getattr(payload, "symbol", None),
