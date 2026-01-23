@@ -37,12 +37,23 @@ def _normalize_strategy_id(strategy_id: UUID | str | None) -> UUID | None:
         return None
 
 
+def _to_int(value: object | None) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class EffectiveRiskPolicy:
     max_drawdown_pct: Optional[Decimal]
     max_daily_loss_usdt: Optional[Decimal]
     min_equity_usdt: Optional[Decimal]
     max_order_notional_usdt: Optional[Decimal]
+    order_rate_limit_max: Optional[int]
+    order_rate_limit_window_seconds: Optional[int]
     source: str
     strategy_id: Optional[UUID]
 
@@ -70,6 +81,8 @@ async def get_effective_risk_policy(
     max_daily_loss_usdt = _to_decimal(base_risk.max_daily_loss_usdt)
     min_equity_usdt = _to_decimal(base_risk.min_equity_usdt)
     max_order_notional_usdt = _to_decimal(getattr(base_risk, "max_order_notional_usdt", None))
+    order_rate_limit_max = _to_int(getattr(base_risk, "order_rate_limit_max", None))
+    order_rate_limit_window_seconds = _to_int(getattr(base_risk, "order_rate_limit_window_seconds", None))
 
     if strategy_id_norm is not None:
         override = await session.scalar(
@@ -84,12 +97,18 @@ async def get_effective_risk_policy(
             source = "strategy_override"
             if override.max_order_notional_usdt is not None:
                 max_order_notional_usdt = _to_decimal(override.max_order_notional_usdt)
+            if override.order_rate_limit_max is not None:
+                order_rate_limit_max = _to_int(override.order_rate_limit_max)
+            if override.order_rate_limit_window_seconds is not None:
+                order_rate_limit_window_seconds = _to_int(override.order_rate_limit_window_seconds)
 
     return EffectiveRiskPolicy(
         max_drawdown_pct=max_drawdown_pct,
         max_daily_loss_usdt=max_daily_loss_usdt,
         min_equity_usdt=min_equity_usdt,
         max_order_notional_usdt=max_order_notional_usdt,
+        order_rate_limit_max=order_rate_limit_max,
+        order_rate_limit_window_seconds=order_rate_limit_window_seconds,
         source=source,
         strategy_id=strategy_id_norm,
     )

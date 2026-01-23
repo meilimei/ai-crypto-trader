@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Optional
+from uuid import UUID
 
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,7 @@ from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
     get_effective_risk_policy,
 )
+from ai_crypto_trader.services.paper_trader.rate_limit import check_and_record_rate_limit
 from ai_crypto_trader.services.paper_trader.symbol_limits import get_symbol_limit
 from ai_crypto_trader.services.paper_trader.utils import PreparedOrder, RiskRejected, prepare_order_inputs
 
@@ -121,6 +123,7 @@ async def place_order_unified(
         notional: Decimal | None = None,
         risk_policy=None,
         position_policy=None,
+        extra_meta: dict | None = None,
     ) -> None:
         policy_snapshot = {}
         if position_policy is not None:
@@ -143,6 +146,12 @@ async def place_order_unified(
                 {
                     "max_order_notional_usdt": str(risk_policy.max_order_notional_usdt)
                     if getattr(risk_policy, "max_order_notional_usdt", None) is not None
+                    else None,
+                    "order_rate_limit_max": str(risk_policy.order_rate_limit_max)
+                    if getattr(risk_policy, "order_rate_limit_max", None) is not None
+                    else None,
+                    "order_rate_limit_window_seconds": str(risk_policy.order_rate_limit_window_seconds)
+                    if getattr(risk_policy, "order_rate_limit_window_seconds", None) is not None
                     else None,
                 }
             )
@@ -183,6 +192,8 @@ async def place_order_unified(
                 else None,
             },
         }
+        if extra_meta:
+            payload.update(extra_meta)
         await log_reject_throttled(
             action=reject_action_type,
             account_id=account_id,
@@ -262,11 +273,64 @@ async def place_order_unified(
         or getattr(position_policy, "strategy_id", None)
         or strategy_id_norm
     )
+    if strategy_id_norm is not None and not isinstance(strategy_id_norm, UUID):
+        try:
+            strategy_id_norm = UUID(str(strategy_id_norm))
+        except Exception:
+            strategy_id_norm = None
     if strategy_id_norm and (
         getattr(risk_policy, "source", None) == "strategy_override"
         or getattr(position_policy, "source", None) == "strategy_override"
     ):
         policy_source = "strategy_override"
+
+    rate_limit_max = getattr(risk_policy, "order_rate_limit_max", None)
+    rate_limit_window = getattr(risk_policy, "order_rate_limit_window_seconds", None)
+    rate_limit_max_int = None
+    rate_limit_window_int = None
+    if rate_limit_max is not None and rate_limit_window is not None:
+        try:
+            rate_limit_max_int = int(rate_limit_max)
+            rate_limit_window_int = int(rate_limit_window)
+        except (TypeError, ValueError):
+            rate_limit_max_int = None
+            rate_limit_window_int = None
+    if rate_limit_max_int and rate_limit_window_int and rate_limit_max_int > 0 and rate_limit_window_int > 0:
+        allowed, count = await check_and_record_rate_limit(
+            session,
+            account_id=account_id,
+            strategy_id=strategy_id_norm,
+            symbol=prepared.symbol,
+            max_requests=rate_limit_max_int,
+            window_seconds=rate_limit_window_int,
+        )
+        if not allowed:
+            reject = RejectReason(
+                code=RejectCode.RATE_LIMITED,
+                reason="Too many order requests in time window",
+                details={
+                    "max": rate_limit_max_int,
+                    "window_seconds": rate_limit_window_int,
+                    "count": count,
+                },
+            )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+                extra_meta={
+                    "rate_limit": {
+                        "max": rate_limit_max_int,
+                        "window_seconds": rate_limit_window_int,
+                        "count": count,
+                        "account_id": account_id,
+                        "strategy_id": str(strategy_id_norm) if strategy_id_norm is not None else None,
+                        "symbol": prepared.symbol,
+                    }
+                },
+            )
+            return reject
 
     if position_policy.min_qty is not None:
         min_qty = Decimal(str(position_policy.min_qty))

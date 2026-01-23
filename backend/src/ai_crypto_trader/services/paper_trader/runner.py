@@ -22,6 +22,11 @@ from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.engine import PaperTradingEngine
 from ai_crypto_trader.common.maintenance import ensure_and_sync_paper_id_sequences
 from ai_crypto_trader.services.paper_trader.maintenance import reconcile_report, reconcile_apply, normalize_status
+from ai_crypto_trader.services.paper_trader.equity import (
+    compute_equity,
+    log_equity_snapshot_failed,
+    write_equity_snapshot,
+)
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -192,6 +197,7 @@ class PaperTraderRunner:
                         await asyncio.sleep(self.reconcile_interval_seconds)
                         continue
                     self.last_reconcile_at = datetime.now(timezone.utc)
+                    suppressed = account.id in suppress_accounts
                     policy = await get_reconcile_policy(session, account.id)
                     report = await reconcile_report(session, account.id, policy=policy)
                     summary = report.get("summary") or {}
@@ -227,7 +233,28 @@ class PaperTraderRunner:
                                 emit = True
                             if diff_count == 0 and now_mono - self._last_reconcile_action_at >= 300:
                                 emit = True
-                    if account.id in suppress_accounts:
+                    try:
+                        accounts = await session.scalars(select(PaperAccount.id))
+                        for account_id in accounts.all():
+                            try:
+                                data = await compute_equity(session, account_id, price_source="runner")
+                                wrote = await write_equity_snapshot(
+                                    session,
+                                    account_id,
+                                    data,
+                                    source="runner",
+                                    min_interval_seconds=60,
+                                )
+                                if wrote:
+                                    await session.commit()
+                            except Exception as exc:
+                                self.last_reconcile_error = str(exc)
+                                await session.rollback()
+                                await log_equity_snapshot_failed(account_id, exc)
+                    except Exception as exc:
+                        self.last_reconcile_error = str(exc)
+                        logger.exception("Equity snapshot write failed")
+                    if suppressed:
                         await asyncio.sleep(self.reconcile_interval_seconds)
                         continue
                     if emit and (emit_ok or diff_count > 0):

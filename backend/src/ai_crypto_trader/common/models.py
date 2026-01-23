@@ -400,6 +400,11 @@ class EquitySnapshot(Base):
     equity: Mapped[Decimal] = mapped_column(Numeric(24, 10))
     balance: Mapped[Decimal] = mapped_column(Numeric(24, 10))
     unrealized_pnl: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    equity_usdt: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10), nullable=True)
+    cash_usdt: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10), nullable=True)
+    positions_notional_usdt: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10), nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    meta: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
 
     account: Mapped["PaperAccount"] = relationship(back_populates="snapshots")

@@ -20,6 +20,8 @@ class PaperRiskPolicy(Base):
     max_daily_loss_usdt: Mapped[Decimal | None] = mapped_column(Numeric(24, 10), nullable=True)
     min_equity_usdt: Mapped[Decimal | None] = mapped_column(Numeric(24, 10), nullable=True)
     max_order_notional_usdt: Mapped[Decimal | None] = mapped_column(Numeric(24, 10), nullable=True)
+    order_rate_limit_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    order_rate_limit_window_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=text("CURRENT_TIMESTAMP"),
@@ -93,6 +95,8 @@ class PaperRiskPolicyOverride(Base):
     account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"), nullable=False)
     strategy_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     max_order_notional_usdt: Mapped[Decimal | None] = mapped_column(Numeric(24, 10), nullable=True)
+    order_rate_limit_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    order_rate_limit_window_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         server_default=text("CURRENT_TIMESTAMP"),
@@ -142,5 +146,29 @@ class PaperSymbolLimit(Base):
         server_default=text("CURRENT_TIMESTAMP"),
         default=utc_now,
         onupdate=utc_now,
+        nullable=False,
+    )
+
+
+class PaperOrderRequestEvent(Base):
+    __tablename__ = "paper_order_request_events"
+    __table_args__ = (
+        Index(
+            "ix_paper_order_request_events_key_created_at",
+            "account_id",
+            "strategy_id",
+            "symbol",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"), nullable=False)
+    strategy_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=text("CURRENT_TIMESTAMP"),
+        default=utc_now,
         nullable=False,
     )
