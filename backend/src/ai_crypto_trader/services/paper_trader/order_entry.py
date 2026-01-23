@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 from uuid import UUID
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_crypto_trader.common.models import Candle, PaperPosition, PaperTrade
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.execution import ExecutionResult, execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason, log_reject_throttled, make_reject
 from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
@@ -146,6 +148,15 @@ async def place_order_unified(
                 {
                     "max_order_notional_usdt": str(risk_policy.max_order_notional_usdt)
                     if getattr(risk_policy, "max_order_notional_usdt", None) is not None
+                    else None,
+                    "max_daily_loss_usdt": str(risk_policy.max_daily_loss_usdt)
+                    if getattr(risk_policy, "max_daily_loss_usdt", None) is not None
+                    else None,
+                    "max_drawdown_usdt": str(risk_policy.max_drawdown_usdt)
+                    if getattr(risk_policy, "max_drawdown_usdt", None) is not None
+                    else None,
+                    "equity_lookback_hours": str(risk_policy.equity_lookback_hours)
+                    if getattr(risk_policy, "equity_lookback_hours", None) is not None
                     else None,
                     "order_rate_limit_max": str(risk_policy.order_rate_limit_max)
                     if getattr(risk_policy, "order_rate_limit_max", None) is not None
@@ -283,6 +294,28 @@ async def place_order_unified(
         or getattr(position_policy, "source", None) == "strategy_override"
     ):
         policy_source = "strategy_override"
+
+    equity_reject = await check_equity_risk(
+        session,
+        account_id=account_id,
+        strategy_id=strategy_id_norm,
+        policy=risk_policy,
+        now_utc=datetime.now(timezone.utc),
+    )
+    if equity_reject:
+        reject = RejectReason(
+            code=RejectCode(equity_reject.get("code")),
+            reason=equity_reject.get("reason", "Equity risk limit exceeded"),
+            details=equity_reject.get("details"),
+        )
+        await _log_reject(
+            reject,
+            prepared=prepared,
+            risk_policy=risk_policy,
+            position_policy=position_policy,
+            extra_meta={"equity_risk": equity_reject.get("details")},
+        )
+        return reject
 
     rate_limit_max = getattr(risk_policy, "order_rate_limit_max", None)
     rate_limit_window = getattr(risk_policy, "order_rate_limit_window_seconds", None)

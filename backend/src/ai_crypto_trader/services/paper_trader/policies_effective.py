@@ -52,6 +52,8 @@ class EffectiveRiskPolicy:
     max_daily_loss_usdt: Optional[Decimal]
     min_equity_usdt: Optional[Decimal]
     max_order_notional_usdt: Optional[Decimal]
+    max_drawdown_usdt: Optional[Decimal]
+    equity_lookback_hours: Optional[int]
     order_rate_limit_max: Optional[int]
     order_rate_limit_window_seconds: Optional[int]
     source: str
@@ -81,6 +83,8 @@ async def get_effective_risk_policy(
     max_daily_loss_usdt = _to_decimal(base_risk.max_daily_loss_usdt)
     min_equity_usdt = _to_decimal(base_risk.min_equity_usdt)
     max_order_notional_usdt = _to_decimal(getattr(base_risk, "max_order_notional_usdt", None))
+    max_drawdown_usdt = _to_decimal(getattr(base_risk, "max_drawdown_usdt", None))
+    equity_lookback_hours = _to_int(getattr(base_risk, "equity_lookback_hours", None))
     order_rate_limit_max = _to_int(getattr(base_risk, "order_rate_limit_max", None))
     order_rate_limit_window_seconds = _to_int(getattr(base_risk, "order_rate_limit_window_seconds", None))
 
@@ -97,6 +101,12 @@ async def get_effective_risk_policy(
             source = "strategy_override"
             if override.max_order_notional_usdt is not None:
                 max_order_notional_usdt = _to_decimal(override.max_order_notional_usdt)
+            if override.max_daily_loss_usdt is not None:
+                max_daily_loss_usdt = _to_decimal(override.max_daily_loss_usdt)
+            if override.max_drawdown_usdt is not None:
+                max_drawdown_usdt = _to_decimal(override.max_drawdown_usdt)
+            if override.equity_lookback_hours is not None:
+                equity_lookback_hours = _to_int(override.equity_lookback_hours)
             if override.order_rate_limit_max is not None:
                 order_rate_limit_max = _to_int(override.order_rate_limit_max)
             if override.order_rate_limit_window_seconds is not None:
@@ -107,6 +117,8 @@ async def get_effective_risk_policy(
         max_daily_loss_usdt=max_daily_loss_usdt,
         min_equity_usdt=min_equity_usdt,
         max_order_notional_usdt=max_order_notional_usdt,
+        max_drawdown_usdt=max_drawdown_usdt,
+        equity_lookback_hours=equity_lookback_hours,
         order_rate_limit_max=order_rate_limit_max,
         order_rate_limit_window_seconds=order_rate_limit_window_seconds,
         source=source,

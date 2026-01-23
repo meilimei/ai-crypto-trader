@@ -22,6 +22,9 @@ class RiskPolicy:
     max_drawdown_pct: Optional[Decimal] = None
     max_daily_loss: Optional[Decimal] = None
     min_equity: Optional[Decimal] = None
+    max_daily_loss_usdt: Optional[Decimal] = None
+    max_drawdown_usdt: Optional[Decimal] = None
+    equity_lookback_hours: Optional[int] = None
 
 
 @dataclass
