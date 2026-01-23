@@ -15,6 +15,7 @@ from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
     get_effective_risk_policy,
 )
+from ai_crypto_trader.services.paper_trader.symbol_limits import get_symbol_limit
 from ai_crypto_trader.services.paper_trader.utils import PreparedOrder, RiskRejected, prepare_order_inputs
 
 
@@ -111,6 +112,7 @@ async def place_order_unified(
     price_source: Optional[str] = None
     policy_source = "account_default"
     strategy_id_norm = strategy_id
+    symbol_limit = None
 
     async def _log_reject(
         reject: RejectReason,
@@ -145,11 +147,13 @@ async def place_order_unified(
                 }
             )
         reject_payload = make_reject(reject.code, reject.reason, reject.details)
+        policy_source_local = policy_source
         if strategy_id_norm and (
             getattr(risk_policy, "source", None) == "strategy_override"
             or getattr(position_policy, "source", None) == "strategy_override"
         ):
-            policy_source = "strategy_override"
+            policy_source_local = "strategy_override"
+        symbol_limit_source = getattr(symbol_limit, "source", None)
         payload = {
             "message": "Execution skipped" if reject_action_type == "ORDER_SKIPPED" else "Order rejected",
             "reject": reject_payload,
@@ -168,8 +172,16 @@ async def place_order_unified(
             "price_source": price_source or market_price_source,
             "notional": str(notional) if notional is not None else None,
             "policies": policy_snapshot,
-            "policy_source": policy_source,
+            "policy_source": policy_source_local,
             "strategy_id": str(strategy_id_norm) if strategy_id_norm is not None else None,
+            "symbol_limit_source": symbol_limit_source,
+            "symbol_limits": {
+                "max_order_qty": str(symbol_limit.max_order_qty) if symbol_limit and symbol_limit.max_order_qty is not None else None,
+                "max_position_qty": str(symbol_limit.max_position_qty) if symbol_limit and symbol_limit.max_position_qty is not None else None,
+                "max_position_notional_usdt": str(symbol_limit.max_position_notional_usdt)
+                if symbol_limit and symbol_limit.max_position_notional_usdt is not None
+                else None,
+            },
         }
         await log_reject_throttled(
             action=reject_action_type,
@@ -267,6 +279,30 @@ async def place_order_unified(
             await _log_reject(reject, prepared=prepared, risk_policy=risk_policy, position_policy=position_policy)
             return reject
 
+    symbol_limit = await get_symbol_limit(session, account_id, strategy_id_norm, prepared.symbol)
+    if symbol_limit is not None:
+        if symbol_limit.source == "strategy":
+            policy_source = "strategy_override"
+    if symbol_limit is not None and symbol_limit.max_order_qty is not None:
+        max_order_qty = Decimal(str(symbol_limit.max_order_qty))
+        if prepared.qty.copy_abs() > max_order_qty:
+            reject = RejectReason(
+                code=RejectCode.SYMBOL_MAX_ORDER_QTY,
+                reason="Order quantity exceeds symbol max",
+                details={
+                    "max_order_qty": str(max_order_qty),
+                    "qty": str(prepared.qty),
+                    "symbol": prepared.symbol,
+                },
+            )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
+
     notional = prepared.qty.copy_abs() * prepared.price
     if position_policy.min_order_notional_usdt is not None:
         min_notional = Decimal(str(position_policy.min_order_notional_usdt))
@@ -317,6 +353,7 @@ async def place_order_unified(
     if (
         position_policy.max_position_notional_per_symbol_usdt is not None
         or position_policy.max_total_notional_usdt is not None
+        or (symbol_limit is not None and (symbol_limit.max_position_qty is not None or symbol_limit.max_position_notional_usdt is not None))
     ):
         current_qty = await session.scalar(
             select(PaperPosition.qty)
@@ -326,6 +363,54 @@ async def place_order_unified(
         current_qty_dec = Decimal(str(current_qty)) if current_qty is not None else Decimal("0")
         delta_qty = prepared.qty if side_norm == "buy" else -prepared.qty
         next_qty = current_qty_dec + delta_qty
+
+    if symbol_limit is not None and symbol_limit.max_position_qty is not None:
+        max_pos_qty = Decimal(str(symbol_limit.max_position_qty))
+        if next_qty is not None and next_qty.copy_abs() > max_pos_qty:
+            reject = RejectReason(
+                code=RejectCode.SYMBOL_MAX_POSITION_QTY,
+                reason="Position quantity exceeds symbol max",
+                details={
+                    "max_position_qty": str(max_pos_qty),
+                    "current_qty": str(current_qty_dec),
+                    "next_qty": str(next_qty),
+                    "qty": str(prepared.qty),
+                    "symbol": prepared.symbol,
+                },
+            )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
+
+    if symbol_limit is not None and symbol_limit.max_position_notional_usdt is not None:
+        limit_notional = Decimal(str(symbol_limit.max_position_notional_usdt))
+        if next_qty is not None:
+            next_notional = next_qty.copy_abs() * prepared.price
+            if next_notional > limit_notional:
+                reject = RejectReason(
+                    code=RejectCode.SYMBOL_MAX_POSITION_NOTIONAL,
+                    reason="Position notional exceeds symbol max",
+                    details={
+                        "max_position_notional_usdt": str(limit_notional),
+                        "next_notional": str(next_notional),
+                        "current_qty": str(current_qty_dec),
+                        "next_qty": str(next_qty),
+                        "qty": str(prepared.qty),
+                        "market_price": str(prepared.price),
+                    },
+                )
+                await _log_reject(
+                    reject,
+                    prepared=prepared,
+                    notional=next_notional,
+                    risk_policy=risk_policy,
+                    position_policy=position_policy,
+                )
+                return reject
 
     if position_policy.max_position_notional_per_symbol_usdt is not None:
         limit = Decimal(str(position_policy.max_position_notional_per_symbol_usdt))
