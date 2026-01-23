@@ -35,6 +35,18 @@ def _to_int(value: object | None) -> Optional[int]:
         return None
 
 
+def fmt_decimal(value: Decimal | None, *, eps: Decimal = Decimal("1e-9")) -> str | None:
+    if value is None:
+        return None
+    try:
+        dec = Decimal(value)
+    except Exception:
+        return str(value)
+    if dec.copy_abs() < eps:
+        return "0.00"
+    return format(dec, "f")
+
+
 def _equity_col():
     return func.coalesce(EquitySnapshot.equity_usdt, EquitySnapshot.equity)
 
@@ -46,13 +58,14 @@ async def check_equity_risk(
     strategy_id: UUID | None,
     policy: object,
     now_utc: datetime,
+    return_details: bool = False,
 ) -> dict | None:
     max_daily_loss = _to_decimal(getattr(policy, "max_daily_loss_usdt", None))
     max_drawdown = _to_decimal(getattr(policy, "max_drawdown_usdt", None))
     lookback_hours = _to_int(getattr(policy, "equity_lookback_hours", None)) or 24
 
     if max_daily_loss is None and max_drawdown is None:
-        return None
+        return None if not return_details else {"code": None, "reason": None, "details": None}
 
     try:
         equity_expr = _equity_col()
@@ -64,7 +77,7 @@ async def check_equity_risk(
         )
         latest = latest_row.first()
         if not latest or latest[0] is None:
-            return None
+            return None if not return_details else {"code": None, "reason": None, "details": None}
         current_equity = Decimal(str(latest[0]))
 
         now = now_utc if now_utc.tzinfo else now_utc.replace(tzinfo=timezone.utc)
@@ -114,13 +127,13 @@ async def check_equity_risk(
         details = {
             "account_id": account_id,
             "strategy_id": str(strategy_id) if strategy_id is not None else None,
-            "current_equity": str(current_equity),
-            "peak_equity": str(peak_equity) if peak_equity is not None else None,
+            "current_equity": fmt_decimal(current_equity),
+            "peak_equity": fmt_decimal(peak_equity),
             "drawdown_usdt": None,
-            "max_drawdown_usdt": str(max_drawdown) if max_drawdown is not None else None,
-            "sod_equity": str(sod_equity) if sod_equity is not None else None,
+            "max_drawdown_usdt": fmt_decimal(max_drawdown),
+            "sod_equity": fmt_decimal(sod_equity),
             "daily_loss_usdt": None,
-            "max_daily_loss_usdt": str(max_daily_loss) if max_daily_loss is not None else None,
+            "max_daily_loss_usdt": fmt_decimal(max_daily_loss),
             "window_start": window_start.isoformat(),
             "now": now.isoformat(),
             "equity_lookback_hours": lookback_hours,
@@ -128,7 +141,7 @@ async def check_equity_risk(
 
         if max_daily_loss is not None and sod_equity is not None:
             daily_loss = sod_equity - current_equity
-            details["daily_loss_usdt"] = str(daily_loss)
+            details["daily_loss_usdt"] = fmt_decimal(daily_loss)
             if daily_loss > max_daily_loss:
                 return make_reject(
                     "MAX_DAILY_LOSS",
@@ -138,7 +151,7 @@ async def check_equity_risk(
 
         if max_drawdown is not None and peak_equity is not None:
             drawdown = peak_equity - current_equity
-            details["drawdown_usdt"] = str(drawdown)
+            details["drawdown_usdt"] = fmt_decimal(drawdown)
             if drawdown > max_drawdown:
                 return make_reject(
                     "MAX_DRAWDOWN",
@@ -146,7 +159,9 @@ async def check_equity_risk(
                     details,
                 )
 
+        if return_details:
+            return {"code": None, "reason": None, "details": details}
         return None
     except Exception:
         logger.warning("Equity risk check failed; skipping", exc_info=False)
-        return None
+        return None if not return_details else {"code": None, "reason": None, "details": None}

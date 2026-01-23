@@ -27,6 +27,9 @@ from ai_crypto_trader.services.paper_trader.equity import (
     log_equity_snapshot_failed,
     write_equity_snapshot,
 )
+from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
+from ai_crypto_trader.services.paper_trader.policies_effective import get_effective_risk_policy
+from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -56,6 +59,7 @@ class PaperTraderRunner:
         self._last_reconcile_summary: Optional[Dict[str, object]] = None
         self._last_reconcile_action_at: Optional[float] = None
         self._last_reconcile_action_status: Optional[str] = None
+        self._equity_risk_state: Dict[int, Dict[str, object]] = {}
 
     @classmethod
     def instance(cls) -> "PaperTraderRunner":
@@ -168,6 +172,17 @@ class PaperTraderRunner:
             if self._last_reconcile_action_at
             else None,
             "last_reconcile_action_status": self._last_reconcile_action_status,
+            "equity_risk_state": {
+                str(account_id): {
+                    "risk_last_checked_at": state.get("risk_last_checked_at").isoformat()
+                    if state.get("risk_last_checked_at")
+                    else None,
+                    "equity_risk_blocked": state.get("equity_risk_blocked", False),
+                    "blocked_reason": state.get("blocked_reason"),
+                    "last_details": state.get("last_details"),
+                }
+                for account_id, state in self._equity_risk_state.items()
+            },
         }
 
     def _reconcile_done(self, task: asyncio.Task) -> None:
@@ -247,6 +262,63 @@ class PaperTraderRunner:
                                 )
                                 if wrote:
                                     await session.commit()
+                                now_utc = datetime.now(timezone.utc)
+                                risk_policy = await get_effective_risk_policy(session, account_id, None)
+                                risk_result = await check_equity_risk(
+                                    session,
+                                    account_id=account_id,
+                                    strategy_id=None,
+                                    policy=risk_policy,
+                                    now_utc=now_utc,
+                                    return_details=True,
+                                )
+                                blocked_reason = None
+                                details = None
+                                if risk_result:
+                                    blocked_reason = risk_result.get("code")
+                                    details = risk_result.get("details")
+                                blocked = bool(blocked_reason)
+                                state_key = f"{blocked}:{blocked_reason or 'ok'}"
+                                prev = self._equity_risk_state.get(account_id) or {}
+                                prev_key = prev.get("state_key")
+                                enabled = (
+                                    getattr(risk_policy, "max_drawdown_usdt", None) is not None
+                                    or getattr(risk_policy, "max_daily_loss_usdt", None) is not None
+                                )
+                                should_log = enabled or blocked
+                                if state_key != prev_key and should_log:
+                                    status = "blocked" if blocked else "ok"
+                                    await write_admin_action_throttled(
+                                        None,
+                                        action_type="EQUITY_RISK_STATE",
+                                        account_id=account_id,
+                                        symbol=None,
+                                        status=status,
+                                        payload={
+                                            "account_id": str(account_id),
+                                            "blocked": blocked,
+                                            "reason": blocked_reason or "ok",
+                                            "details": details,
+                                            "policy": {
+                                                "max_daily_loss_usdt": str(risk_policy.max_daily_loss_usdt)
+                                                if getattr(risk_policy, "max_daily_loss_usdt", None) is not None
+                                                else None,
+                                                "max_drawdown_usdt": str(risk_policy.max_drawdown_usdt)
+                                                if getattr(risk_policy, "max_drawdown_usdt", None) is not None
+                                                else None,
+                                                "equity_lookback_hours": risk_policy.equity_lookback_hours,
+                                            },
+                                        },
+                                        window_seconds=120,
+                                        dedupe_key=f"EQUITY_RISK_STATE:{account_id}:{blocked_reason or 'ok'}",
+                                    )
+                                self._equity_risk_state[account_id] = {
+                                    "risk_last_checked_at": now_utc,
+                                    "equity_risk_blocked": blocked,
+                                    "blocked_reason": blocked_reason,
+                                    "last_details": details,
+                                    "state_key": state_key,
+                                }
                             except Exception as exc:
                                 self.last_reconcile_error = str(exc)
                                 await session.rollback()

@@ -295,28 +295,6 @@ async def place_order_unified(
     ):
         policy_source = "strategy_override"
 
-    equity_reject = await check_equity_risk(
-        session,
-        account_id=account_id,
-        strategy_id=strategy_id_norm,
-        policy=risk_policy,
-        now_utc=datetime.now(timezone.utc),
-    )
-    if equity_reject:
-        reject = RejectReason(
-            code=RejectCode(equity_reject.get("code")),
-            reason=equity_reject.get("reason", "Equity risk limit exceeded"),
-            details=equity_reject.get("details"),
-        )
-        await _log_reject(
-            reject,
-            prepared=prepared,
-            risk_policy=risk_policy,
-            position_policy=position_policy,
-            extra_meta={"equity_risk": equity_reject.get("details")},
-        )
-        return reject
-
     rate_limit_max = getattr(risk_policy, "order_rate_limit_max", None)
     rate_limit_window = getattr(risk_policy, "order_rate_limit_window_seconds", None)
     rate_limit_max_int = None
@@ -364,6 +342,28 @@ async def place_order_unified(
                 },
             )
             return reject
+
+    equity_reject = await check_equity_risk(
+        session,
+        account_id=account_id,
+        strategy_id=strategy_id_norm,
+        policy=risk_policy,
+        now_utc=datetime.now(timezone.utc),
+    )
+    if equity_reject:
+        reject = RejectReason(
+            code=RejectCode(equity_reject.get("code")),
+            reason=equity_reject.get("reason", "Equity risk limit exceeded"),
+            details=equity_reject.get("details"),
+        )
+        await _log_reject(
+            reject,
+            prepared=prepared,
+            risk_policy=risk_policy,
+            position_policy=position_policy,
+            extra_meta={"equity_risk": equity_reject.get("details")},
+        )
+        return reject
 
     if position_policy.min_qty is not None:
         min_qty = Decimal(str(position_policy.min_qty))
