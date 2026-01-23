@@ -10,8 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_crypto_trader.common.models import Candle, PaperPosition, PaperTrade
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.execution import ExecutionResult, execute_market_order_with_costs
-from ai_crypto_trader.services.paper_trader.policy_store import get_or_create_default_policies
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason, log_reject_throttled, make_reject
+from ai_crypto_trader.services.paper_trader.policies_effective import (
+    get_effective_position_policy,
+    get_effective_risk_policy,
+)
 from ai_crypto_trader.services.paper_trader.utils import PreparedOrder, RiskRejected, prepare_order_inputs
 
 
@@ -20,6 +23,8 @@ class UnifiedOrderResult:
     execution: ExecutionResult
     prepared: PreparedOrder
     price_source: Optional[str]
+    policy_source: Optional[str]
+    strategy_id: Optional[str]
 
 
 def _reject_from_reason(reason: str) -> RejectReason:
@@ -90,6 +95,7 @@ async def place_order_unified(
     symbol: str,
     side: str,
     qty: object,
+    strategy_id: object | None = None,
     fee_bps: Decimal,
     slippage_bps: Decimal,
     price_override: object | None = None,
@@ -103,6 +109,8 @@ async def place_order_unified(
     symbol_norm = normalize_symbol(symbol_in)
     side_norm = (side or "buy").lower().strip()
     price_source: Optional[str] = None
+    policy_source = "account_default"
+    strategy_id_norm = strategy_id
 
     async def _log_reject(
         reject: RejectReason,
@@ -137,6 +145,11 @@ async def place_order_unified(
                 }
             )
         reject_payload = make_reject(reject.code, reject.reason, reject.details)
+        if strategy_id_norm and (
+            getattr(risk_policy, "source", None) == "strategy_override"
+            or getattr(position_policy, "source", None) == "strategy_override"
+        ):
+            policy_source = "strategy_override"
         payload = {
             "message": "Execution skipped" if reject_action_type == "ORDER_SKIPPED" else "Order rejected",
             "reject": reject_payload,
@@ -149,11 +162,14 @@ async def place_order_unified(
                 "side": side_norm,
                 "qty": str(qty),
                 "price_override": str(price_override) if price_override is not None else None,
+                "strategy_id": str(strategy_id_norm) if strategy_id_norm is not None else None,
             },
             "market_price": str(prepared.price) if prepared is not None else str(market_price) if market_price is not None else None,
             "price_source": price_source or market_price_source,
             "notional": str(notional) if notional is not None else None,
             "policies": policy_snapshot,
+            "policy_source": policy_source,
+            "strategy_id": str(strategy_id_norm) if strategy_id_norm is not None else None,
         }
         await log_reject_throttled(
             action=reject_action_type,
@@ -227,7 +243,18 @@ async def place_order_unified(
         await _log_reject(reject)
         return reject
 
-    risk_policy, position_policy = await get_or_create_default_policies(session, account_id)
+    risk_policy = await get_effective_risk_policy(session, account_id, strategy_id_norm)
+    position_policy = await get_effective_position_policy(session, account_id, strategy_id_norm)
+    strategy_id_norm = (
+        getattr(risk_policy, "strategy_id", None)
+        or getattr(position_policy, "strategy_id", None)
+        or strategy_id_norm
+    )
+    if strategy_id_norm and (
+        getattr(risk_policy, "source", None) == "strategy_override"
+        or getattr(position_policy, "source", None) == "strategy_override"
+    ):
+        policy_source = "strategy_override"
 
     if position_policy.min_qty is not None:
         min_qty = Decimal(str(position_policy.min_qty))
@@ -388,4 +415,6 @@ async def place_order_unified(
         execution=execution,
         prepared=prepared,
         price_source=price_source,
+        policy_source=policy_source,
+        strategy_id=str(strategy_id_norm) if strategy_id_norm is not None else None,
     )

@@ -47,9 +47,9 @@ class PaperTradingEngine:
         self.started_at = datetime.now(timezone.utc)
 
         while not self.stop_event.is_set():
+            self.last_cycle_at = datetime.now(timezone.utc)
             try:
                 await self._cycle()
-                self.last_cycle_at = datetime.now(timezone.utc)
                 self.last_error = None
             except MissingGreenlet as exc:
                 self.last_error = "MissingGreenlet"

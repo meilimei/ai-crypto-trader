@@ -317,6 +317,7 @@ class SmokeTradeRequest(BaseModel):
     side: str = "buy"
     qty: Decimal = Decimal("0.01")
     price: str | None = None
+    strategy_id: str | None = None
 
 
 class PaperAccountCreateRequest(BaseModel):
@@ -506,6 +507,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         symbol=symbol_in,
         side=side,
         qty=payload.qty,
+        strategy_id=payload.strategy_id,
         price_override=payload.price,
         fee_bps=config.fee_bps,
         slippage_bps=config.slippage_bps,
@@ -533,6 +535,8 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             "price": str(prepared.price),
             "price_source": price_source,
             "trade_id": execution.trade.id,
+            "strategy_id": result.strategy_id,
+            "policy_source": result.policy_source,
         }),
     )
 
