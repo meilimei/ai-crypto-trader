@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import Integer, String, and_, cast, func, or_, select
+from sqlalchemy import Integer, String, and_, cast, func, or_, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import AdminAction
@@ -32,6 +32,12 @@ def meta_text(col, key):  # type: ignore[no-untyped-def]
 
 def meta_int(col, key):  # type: ignore[no-untyped-def]
     return cast(meta_text(col, key), Integer)
+
+
+def _col_text_or_meta(model, col_name: str, meta_key: str):
+    if hasattr(model, col_name):
+        return func.coalesce(cast(getattr(model, col_name), String), meta_text(model.meta, meta_key))
+    return meta_text(model.meta, meta_key)
 
 
 def _to_utc(value: datetime) -> datetime:
@@ -85,42 +91,53 @@ async def maybe_alert_strategy_stalls(
     throttle_seconds: int = ALERT_THROTTLE_SECONDS,
 ) -> None:
     now = _to_utc(now_utc)
-    try:
-        meta = {"now_utc": now.isoformat()}
-        reconcile_tick_count = session.info.get("reconcile_tick_count")
-        if isinstance(reconcile_tick_count, int):
-            meta["reconcile_tick_count"] = reconcile_tick_count
-        await write_admin_action_throttled(
-            session,
-            action_type="STRATEGY_STALL_TICK",
-            account_id=0,
-            symbol=None,
-            status="ok",
-            payload={
-                "message": "strategy stall monitoring tick",
-                **meta,
-            },
-            window_seconds=60,
-            dedupe_key="STRATEGY_STALL_TICK:global",
-        )
-    except Exception:
-        logger.exception("Strategy stall tick heartbeat write failed")
-
     stall_seconds = _parse_int(os.getenv("PAPER_STALL_SECONDS"), stall_seconds)
     activity_grace_seconds = _parse_int(os.getenv("PAPER_ACTIVITY_GRACE_SECONDS"), activity_grace_seconds)
     throttle_seconds = _parse_int(os.getenv("PAPER_STALL_THROTTLE_SECONDS"), throttle_seconds)
 
     window_start = now - timedelta(hours=24)
-    account_text = meta_text(AdminAction.meta, "account_id")
-    account_expr = cast(account_text, Integer)
-    strategy_expr = meta_text(AdminAction.meta, "strategy_id")
-    symbol_expr = func.upper(cast(meta_text(AdminAction.meta, "symbol"), String))
-    account_filters = [account_text.isnot(None), account_text != ""]
-    strategy_filters = [strategy_expr.isnot(None), strategy_expr != ""]
-    symbol_filters = [symbol_expr.isnot(None), symbol_expr != ""]
+    account_text_meta = meta_text(AdminAction.meta, "account_id")
+    strategy_text_meta = meta_text(AdminAction.meta, "strategy_id")
+    symbol_text_meta = meta_text(AdminAction.meta, "symbol")
+    account_expr_meta = cast(account_text_meta, Integer)
+    strategy_expr_meta = strategy_text_meta
+    symbol_expr_meta = func.upper(cast(symbol_text_meta, String))
+
+    account_text_any = _col_text_or_meta(AdminAction, "account_id", "account_id")
+    strategy_text_any = _col_text_or_meta(AdminAction, "strategy_id", "strategy_id")
+    symbol_text_any = _col_text_or_meta(AdminAction, "symbol", "symbol")
+    account_expr = cast(account_text_any, Integer)
+    strategy_expr = strategy_text_any
+    symbol_expr = func.upper(cast(symbol_text_any, String))
+
+    account_filters = [account_text_any.isnot(None), account_text_any != ""]
+    strategy_filters = [strategy_text_any.isnot(None), strategy_text_any != ""]
+    symbol_filters = [symbol_text_any.isnot(None), symbol_text_any != ""]
+    counter_filters = [
+        account_text_meta.isnot(None),
+        account_text_meta != "",
+        strategy_text_meta.isnot(None),
+        strategy_text_meta != "",
+        symbol_text_meta.isnot(None),
+        symbol_text_meta != "",
+    ]
 
     try:
-        rows = await session.execute(
+        counter_select = (
+            select(
+                account_expr_meta.label("account_id"),
+                strategy_expr_meta.label("strategy_id"),
+                symbol_expr_meta.label("symbol"),
+            )
+            .where(
+                and_(
+                    AdminAction.action == "STRATEGY_REJECT_COUNTER",
+                    AdminAction.created_at >= window_start,
+                    *counter_filters,
+                )
+            )
+        )
+        any_select = (
             select(
                 account_expr.label("account_id"),
                 strategy_expr.label("strategy_id"),
@@ -128,20 +145,50 @@ async def maybe_alert_strategy_stalls(
             )
             .where(
                 and_(
-                    AdminAction.action == "STRATEGY_REJECT_COUNTER",
                     AdminAction.created_at >= window_start,
                     *account_filters,
                     *strategy_filters,
                     *symbol_filters,
                 )
             )
-            .distinct()
+        )
+        pair_union = union(counter_select, any_select).subquery()
+        rows = await session.execute(
+            select(pair_union.c.account_id, pair_union.c.strategy_id, pair_union.c.symbol)
         )
     except Exception:
         logger.exception("strategy_stall pair scan failed")
         return
 
     pairs = _get_strategy_pairs(rows.all())
+    try:
+        heartbeat_meta = {
+            "message": "strategy stall monitoring tick",
+            "now_utc": now.isoformat(),
+            "pairs_scanned": len(pairs),
+            "pairs_sample": [
+                {"account_id": acct, "strategy_id": strat, "symbol": sym}
+                for acct, strat, sym in pairs[:3]
+            ],
+            "stall_seconds": stall_seconds,
+            "activity_grace_seconds": activity_grace_seconds,
+            "throttle_seconds": throttle_seconds,
+        }
+        reconcile_tick_count = session.info.get("reconcile_tick_count")
+        if isinstance(reconcile_tick_count, int):
+            heartbeat_meta["reconcile_tick_count"] = reconcile_tick_count
+        await write_admin_action_throttled(
+            session,
+            action_type="STRATEGY_STALL_TICK",
+            account_id=0,
+            symbol=None,
+            status="ok",
+            payload=heartbeat_meta,
+            window_seconds=60,
+            dedupe_key="STRATEGY_STALL_TICK:global",
+        )
+    except Exception:
+        logger.exception("Strategy stall tick heartbeat write failed")
     logger.info("strategy_stalls tick pairs=%s", len(pairs))
     if not pairs:
         return
