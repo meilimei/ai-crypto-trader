@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -18,6 +19,7 @@ from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
     get_effective_risk_policy,
 )
+from ai_crypto_trader.services.monitoring.strategy_alerts import maybe_alert_strategy_reject_burst
 from ai_crypto_trader.services.paper_trader.rate_limit import check_and_record_rate_limit
 from ai_crypto_trader.services.paper_trader.symbol_limits import get_symbol_limit
 from ai_crypto_trader.services.paper_trader.utils import PreparedOrder, RiskRejected, prepare_order_inputs
@@ -30,6 +32,9 @@ class UnifiedOrderResult:
     price_source: Optional[str]
     policy_source: Optional[str]
     strategy_id: Optional[str]
+
+
+logger = logging.getLogger(__name__)
 
 
 def _reject_from_reason(reason: str) -> RejectReason:
@@ -214,6 +219,18 @@ async def place_order_unified(
             meta=payload,
             window_seconds=reject_window_seconds,
         )
+        if strategy_id_norm is not None:
+            try:
+                await maybe_alert_strategy_reject_burst(
+                    session,
+                    account_id=account_id,
+                    strategy_id=strategy_id_norm,
+                    symbol=symbol_norm,
+                    reject_code=reject.code,
+                    now_utc=datetime.now(timezone.utc),
+                )
+            except Exception:
+                logger.exception("Strategy reject burst alert failed")
 
     if "/" in symbol_in:
         reject = RejectReason(code=RejectCode.SYMBOL_DISABLED, reason="Symbol not supported")
