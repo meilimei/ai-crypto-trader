@@ -30,6 +30,7 @@ from ai_crypto_trader.services.paper_trader.equity import (
 from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.policies_effective import get_effective_risk_policy
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
+from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -52,6 +53,7 @@ class PaperTraderRunner:
         self.started_at: Optional[datetime] = None
         self.last_error: Optional[str] = None
         self._reconcile_task: Optional[asyncio.Task[None]] = None
+        self._stall_monitor_task: Optional[asyncio.Task[None]] = None
         self.last_reconcile_at: Optional[datetime] = None
         self.reconcile_tick_count: int = 0
         self.reconcile_interval_seconds: int = 0
@@ -100,6 +102,7 @@ class PaperTraderRunner:
         if self.reconcile_interval_seconds > 0:
             self._reconcile_task = asyncio.create_task(self._reconcile_loop(auto_apply=auto_reconcile), name="paper_reconcile")
             self._reconcile_task.add_done_callback(self._reconcile_done)
+        self._stall_monitor_task = asyncio.create_task(self._stall_monitor_loop(), name="paper_stall_monitor")
         self._task = asyncio.create_task(_run(), name="paper-trader")
 
     async def stop(self) -> None:
@@ -121,6 +124,13 @@ class PaperTraderRunner:
             except asyncio.CancelledError:
                 pass
         self._reconcile_task = None
+        if self._stall_monitor_task:
+            self._stall_monitor_task.cancel()
+            try:
+                await self._stall_monitor_task
+            except asyncio.CancelledError:
+                pass
+        self._stall_monitor_task = None
         self.last_reconcile_at = None
         self.reconcile_tick_count = 0
         self.last_reconcile_error = None
@@ -392,7 +402,29 @@ class PaperTraderRunner:
                         report_meta=to_jsonable({"account": account_name, "error": str(exc)}),
                     )
                 logger.exception("Auto reconcile loop error")
+            try:
+                now_utc = datetime.now(timezone.utc)
+                async with AsyncSessionLocal() as session:
+                    session.info["reconcile_tick_count"] = self.reconcile_tick_count
+                    await maybe_alert_strategy_stalls(session, now_utc=now_utc)
+                logger.info("strategy_stalls wired tick executed")
+            except Exception:
+                logger.exception("Strategy stalls wired tick failed")
             await asyncio.sleep(self.reconcile_interval_seconds)
+
+    async def _stall_monitor_loop(self) -> None:
+        last_cycle_at: Optional[datetime] = None
+        while self.is_running:
+            try:
+                engine = self._engine
+                cycle_at = engine.last_cycle_at if engine else None
+                if cycle_at and (last_cycle_at is None or cycle_at > last_cycle_at):
+                    last_cycle_at = cycle_at
+                    async with AsyncSessionLocal() as session:
+                        await maybe_alert_strategy_stalls(session, now_utc=cycle_at)
+            except Exception:
+                logger.exception("Strategy stall monitor failed")
+            await asyncio.sleep(1)
 
 
 async def reset_paper_data(session: AsyncSession) -> Dict[str, object]:
