@@ -211,6 +211,8 @@ async def maybe_alert_strategy_stalls(
     for account_id, strategy_id, symbol in pairs:
         try:
             symbol_key = symbol.upper()
+            strategy_id_key = str(strategy_id).strip() or None
+            strategy_id_filter_val = strategy_id_key or ""
             last_trade_at = await session.scalar(
                 select(func.max(AdminAction.created_at)).where(
                     and_(
@@ -263,13 +265,95 @@ async def maybe_alert_strategy_stalls(
                 if isinstance(effective_last_trade_at, datetime)
                 else effective_last_trade_at
             )
+            episode_key = effective_last_trade_at_meta or last_trade_at_meta
 
             seconds_since_trade = _seconds_since(now, effective_last_trade_at)
             seconds_since_activity = (
                 _seconds_since(now, last_activity_at) if isinstance(last_activity_at, datetime) else seconds_since_trade
             )
 
-            if seconds_since_trade <= stall_seconds or seconds_since_activity <= activity_grace_seconds:
+            # Look up the latest NO_TRADE_STALL alert for this pair so we can dedupe per stall episode.
+            strategy_expr_alert = func.coalesce(meta_strategy_id(AdminAction.meta), "")
+            latest_stall_stmt = (
+                select(AdminAction)
+                .where(
+                    and_(
+                        AdminAction.action == "STRATEGY_ALERT",
+                        AdminAction.status == "NO_TRADE_STALL",
+                        meta_account_id(AdminAction.meta) == account_id,
+                        strategy_expr_alert == strategy_id_filter_val,
+                        meta_symbol_upper(AdminAction.meta) == symbol_key,
+                    )
+                )
+                .order_by(AdminAction.created_at.desc())
+                .limit(1)
+            )
+            latest_stall_row = (await session.execute(latest_stall_stmt)).scalars().first()
+            prev_episode_key: str | None = None
+            if latest_stall_row and isinstance(latest_stall_row.meta, dict):
+                prev_meta = latest_stall_row.meta
+                prev_episode_key = prev_meta.get("effective_last_trade_at") or prev_meta.get("last_trade_at")
+
+            is_stalled = seconds_since_trade > stall_seconds and seconds_since_activity > activity_grace_seconds
+            if not is_stalled:
+                # Optional recovery alert: emit once per new episode after a prior stall.
+                if prev_episode_key and episode_key and prev_episode_key != episode_key:
+                    latest_recovery_stmt = (
+                        select(AdminAction)
+                        .where(
+                            and_(
+                                AdminAction.action == "STRATEGY_ALERT",
+                                AdminAction.status == "STALL_RECOVERED",
+                                meta_account_id(AdminAction.meta) == account_id,
+                                strategy_expr_alert == strategy_id_filter_val,
+                                meta_symbol_upper(AdminAction.meta) == symbol_key,
+                            )
+                        )
+                        .order_by(AdminAction.created_at.desc())
+                        .limit(1)
+                    )
+                    latest_recovery_row = (await session.execute(latest_recovery_stmt)).scalars().first()
+                    prev_recovery_episode_key: str | None = None
+                    if latest_recovery_row and isinstance(latest_recovery_row.meta, dict):
+                        recovery_meta = latest_recovery_row.meta
+                        prev_recovery_episode_key = (
+                            recovery_meta.get("effective_last_trade_at") or recovery_meta.get("last_trade_at")
+                        )
+                    if prev_recovery_episode_key != episode_key:
+                        recovery_payload = json_safe(
+                            {
+                                "message": "Strategy stall recovered",
+                                "account_id": account_id,
+                                "strategy_id": strategy_id_key,
+                                "symbol": symbol_key,
+                                "effective_last_trade_at": effective_last_trade_at_meta,
+                                "last_trade_at": last_trade_at_meta,
+                                "first_seen_at": first_seen_at_meta,
+                                "last_activity_at": last_activity_at_meta,
+                                "stall_seconds": stall_seconds,
+                                "activity_grace_seconds": activity_grace_seconds,
+                                "throttle_seconds": throttle_seconds,
+                                "seconds_since_trade": seconds_since_trade,
+                                "seconds_since_activity": seconds_since_activity,
+                                "now_utc": now.isoformat(),
+                            }
+                        )
+                        episode_fragment = episode_key or "unknown"
+                        await write_admin_action_throttled(
+                            session,
+                            action_type="STRATEGY_ALERT",
+                            account_id=account_id,
+                            symbol=None,
+                            status="STALL_RECOVERED",
+                            payload=recovery_payload if isinstance(recovery_payload, dict) else {"meta": recovery_payload},
+                            window_seconds=max(throttle_seconds, 1),
+                            dedupe_key=(
+                                f"STRATEGY_ALERT:STALL_RECOVERED:{account_id}:{strategy_id_filter_val}:{symbol_key}:"
+                                f"{episode_fragment}"
+                            ),
+                        )
+                continue
+            if prev_episode_key and episode_key and prev_episode_key == episode_key:
                 continue
 
             message = (
@@ -279,7 +363,7 @@ async def maybe_alert_strategy_stalls(
                 {
                     "message": message,
                     "account_id": account_id,
-                    "strategy_id": str(strategy_id),
+                    "strategy_id": strategy_id_key,
                     "symbol": symbol_key,
                     "effective_last_trade_at": effective_last_trade_at_meta,
                     "last_trade_at": last_trade_at_meta,
@@ -302,13 +386,13 @@ async def maybe_alert_strategy_stalls(
                 status="NO_TRADE_STALL",
                 payload=payload if isinstance(payload, dict) else {"meta": payload},
                 window_seconds=max(throttle_seconds, 1),
-                dedupe_key=f"STRATEGY_ALERT:NO_TRADE_STALL:{account_id}:{strategy_id}:{symbol_key}",
+                dedupe_key=f"STRATEGY_ALERT:NO_TRADE_STALL:{account_id}:{strategy_id_filter_val}:{symbol_key}",
             )
             logger.info(
                 "strategy_stall alert fired",
                 extra={
                     "account_id": account_id,
-                    "strategy_id": str(strategy_id),
+                    "strategy_id": strategy_id_key,
                     "symbol": symbol_key,
                     "seconds_since_trade": seconds_since_trade,
                     "seconds_since_activity": seconds_since_activity,
