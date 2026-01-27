@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_crypto_trader.api.admin_paper_trader import require_admin_token
 from ai_crypto_trader.common.database import get_db_session
 from ai_crypto_trader.common.models import AdminAction
+from ai_crypto_trader.services.monitoring.strategy_health import get_strategy_health
 from ai_crypto_trader.utils.json_safe import json_safe
 
 router = APIRouter(prefix="/admin/monitoring", tags=["admin"], dependencies=[Depends(require_admin_token)])
@@ -105,7 +106,34 @@ async def get_strategy_alerts(
     return {"ok": True, "items": items}
 
 
+@router.get("/strategy-health")
+async def get_strategy_health_endpoint(
+    limit: int = Query(DEFAULT_LIMIT, description="Number of pairs to return (max 200)"),
+    account_id: int | None = Query(default=None, description="Filter by meta.account_id"),
+    strategy_id: str | None = Query(default=None, description="Filter by meta.strategy_id"),
+    symbol: str | None = Query(default=None, description="Filter by symbol (normalized, uppercased)"),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    bounded_limit = _bounded_limit(limit)
+    strategy_id_key = strategy_id.strip() if strategy_id else None
+    if strategy_id_key == "":
+        strategy_id_key = None
+    symbol_key = symbol.strip() if symbol else None
+    if symbol_key == "":
+        symbol_key = None
+
+    items = await get_strategy_health(
+        session,
+        account_id=account_id,
+        strategy_id=strategy_id_key,
+        symbol=symbol_key,
+        limit=bounded_limit,
+    )
+    return {"ok": True, "items": items}
+
+
 # Manual verification:
 # curl -sS "$BASE_URL/api/admin/monitoring/strategy-alerts?limit=5&account_id=5&strategy_id=1&symbol=ETHUSDT" \
 #   -H "X-Admin-Token: dev-admin-123"
-
+# curl -sS "$BASE_URL/api/admin/monitoring/strategy-health?limit=5&account_id=5&strategy_id=1&symbol=ETHUSDT" \
+#   -H "X-Admin-Token: dev-admin-123"
