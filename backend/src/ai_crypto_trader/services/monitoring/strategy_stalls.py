@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import Integer, String, and_, cast, func, select, union
+from sqlalchemy import BigInteger, Integer, and_, cast, func, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import AdminAction
@@ -30,14 +30,28 @@ def meta_text(col, key):  # type: ignore[no-untyped-def]
     return col.op("->>")(key)
 
 
+def meta_symbol_text(col):  # type: ignore[no-untyped-def]
+    return func.coalesce(
+        meta_text(col, "symbol_normalized"),
+        meta_text(col, "symbol"),
+        meta_text(col, "symbol_in"),
+    )
+
+
+def meta_symbol_upper(col):  # type: ignore[no-untyped-def]
+    return func.upper(meta_symbol_text(col))
+
+
 def meta_int(col, key):  # type: ignore[no-untyped-def]
     return cast(meta_text(col, key), Integer)
 
 
-def _col_text_or_meta(model, col_name: str, meta_key: str):
-    if hasattr(model, col_name):
-        return func.coalesce(cast(getattr(model, col_name), String), meta_text(model.meta, meta_key))
-    return meta_text(model.meta, meta_key)
+def meta_account_id(col):  # type: ignore[no-untyped-def]
+    return cast(meta_text(col, "account_id"), BigInteger)
+
+
+def meta_strategy_id(col):  # type: ignore[no-untyped-def]
+    return meta_text(col, "strategy_id")
 
 
 def _to_utc(value: datetime) -> datetime:
@@ -98,17 +112,18 @@ async def maybe_alert_strategy_stalls(
     window_start = now - timedelta(hours=24)
     account_text_meta = meta_text(AdminAction.meta, "account_id")
     strategy_text_meta = meta_text(AdminAction.meta, "strategy_id")
-    symbol_text_meta = meta_text(AdminAction.meta, "symbol")
-    account_expr_meta = cast(account_text_meta, Integer)
-    strategy_expr_meta = strategy_text_meta
-    symbol_expr_meta = func.upper(cast(symbol_text_meta, String))
+    symbol_text_meta = meta_symbol_text(AdminAction.meta)
+    account_expr_meta = meta_account_id(AdminAction.meta)
+    strategy_expr_meta = meta_strategy_id(AdminAction.meta)
+    symbol_expr_meta = meta_symbol_upper(AdminAction.meta)
 
-    account_text_any = _col_text_or_meta(AdminAction, "account_id", "account_id")
-    strategy_text_any = _col_text_or_meta(AdminAction, "strategy_id", "strategy_id")
-    symbol_text_any = _col_text_or_meta(AdminAction, "symbol", "symbol")
-    account_expr = cast(account_text_any, Integer)
-    strategy_expr = strategy_text_any
-    symbol_expr = func.upper(cast(symbol_text_any, String))
+    # AdminAction does not have account_id/strategy_id/symbol columns in the DB; read from meta only.
+    account_text_any = meta_text(AdminAction.meta, "account_id")
+    strategy_text_any = meta_strategy_id(AdminAction.meta)
+    symbol_text_any = meta_symbol_text(AdminAction.meta)
+    account_expr = meta_account_id(AdminAction.meta)
+    strategy_expr = meta_strategy_id(AdminAction.meta)
+    symbol_expr = meta_symbol_upper(AdminAction.meta)
 
     account_filters = [account_text_any.isnot(None), account_text_any != ""]
     strategy_filters = [strategy_text_any.isnot(None), strategy_text_any != ""]
@@ -240,6 +255,15 @@ async def maybe_alert_strategy_stalls(
             if not effective_last_trade_at:
                 continue
 
+            last_trade_at_meta = last_trade_at.isoformat() if isinstance(last_trade_at, datetime) else None
+            first_seen_at_meta = first_seen_at.isoformat() if isinstance(first_seen_at, datetime) else None
+            last_activity_at_meta = last_activity_at.isoformat() if isinstance(last_activity_at, datetime) else None
+            effective_last_trade_at_meta = (
+                effective_last_trade_at.isoformat()
+                if isinstance(effective_last_trade_at, datetime)
+                else effective_last_trade_at
+            )
+
             seconds_since_trade = _seconds_since(now, effective_last_trade_at)
             seconds_since_activity = (
                 _seconds_since(now, last_activity_at) if isinstance(last_activity_at, datetime) else seconds_since_trade
@@ -256,17 +280,17 @@ async def maybe_alert_strategy_stalls(
                     "message": message,
                     "account_id": account_id,
                     "strategy_id": str(strategy_id),
-                    "symbol": symbol,
-                    "effective_last_trade_at": effective_last_trade_at,
-                    "last_trade_at": last_trade_at,
-                    "first_seen_at": first_seen_at,
-                    "last_activity_at": last_activity_at,
+                    "symbol": symbol_key,
+                    "effective_last_trade_at": effective_last_trade_at_meta,
+                    "last_trade_at": last_trade_at_meta,
+                    "first_seen_at": first_seen_at_meta,
+                    "last_activity_at": last_activity_at_meta,
                     "stall_seconds": stall_seconds,
                     "activity_grace_seconds": activity_grace_seconds,
                     "throttle_seconds": throttle_seconds,
                     "seconds_since_trade": seconds_since_trade,
                     "seconds_since_activity": seconds_since_activity,
-                    "now_utc": now,
+                    "now_utc": now.isoformat(),
                 }
             )
 
@@ -278,14 +302,14 @@ async def maybe_alert_strategy_stalls(
                 status="NO_TRADE_STALL",
                 payload=payload if isinstance(payload, dict) else {"meta": payload},
                 window_seconds=max(throttle_seconds, 1),
-                dedupe_key=f"STRATEGY_ALERT:NO_TRADE_STALL:{account_id}:{strategy_id}:{symbol}",
+                dedupe_key=f"STRATEGY_ALERT:NO_TRADE_STALL:{account_id}:{strategy_id}:{symbol_key}",
             )
             logger.info(
                 "strategy_stall alert fired",
                 extra={
                     "account_id": account_id,
                     "strategy_id": str(strategy_id),
-                    "symbol": symbol,
+                    "symbol": symbol_key,
                     "seconds_since_trade": seconds_since_trade,
                     "seconds_since_activity": seconds_since_activity,
                 },

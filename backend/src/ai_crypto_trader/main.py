@@ -14,6 +14,7 @@ from ai_crypto_trader.api.paper_trader_dashboard import router as paper_trader_d
 from ai_crypto_trader.api.admin_paper_trader import router as admin_paper_trader_router, admin_router as admin_actions_router
 from ai_crypto_trader.api.admin_config import router as admin_config_router
 from ai_crypto_trader.api.admin_db import router as admin_db_router
+from ai_crypto_trader.api.admin.monitoring import router as admin_monitoring_router
 
 
 def create_application() -> FastAPI:
@@ -48,6 +49,7 @@ def create_application() -> FastAPI:
     application.include_router(admin_actions_router, prefix="/api")
     application.include_router(admin_config_router, prefix="/api")
     application.include_router(admin_db_router, prefix="/api")
+    application.include_router(admin_monitoring_router, prefix="/api")
     application.add_api_route("/health", lambda: {"status": "ok"}, methods=["GET"], tags=["system"])
     return application
 
