@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import Integer, String, and_, cast, func, or_, select, union
+from sqlalchemy import Integer, String, and_, cast, func, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import AdminAction
@@ -195,7 +195,7 @@ async def maybe_alert_strategy_stalls(
 
     for account_id, strategy_id, symbol in pairs:
         try:
-            symbol_match = or_(symbol_expr == symbol.upper(), symbol_expr == symbol)
+            symbol_key = symbol.upper()
             last_trade_at = await session.scalar(
                 select(func.max(AdminAction.created_at)).where(
                     and_(
@@ -203,62 +203,53 @@ async def maybe_alert_strategy_stalls(
                         AdminAction.status == "ok",
                         account_expr == account_id,
                         strategy_expr == strategy_id,
-                        symbol_match,
+                        symbol_expr == symbol_key,
                     )
                 )
             )
             if isinstance(last_trade_at, datetime):
                 last_trade_at = _to_utc(last_trade_at)
 
-            activity_filters = [
-                AdminAction.action.in_(ACTIVITY_ACTIONS),
-                account_expr == account_id,
-                strategy_expr == strategy_id,
-                symbol_match,
-            ]
-
             last_activity_at = await session.scalar(
-                select(func.max(AdminAction.created_at)).where(*activity_filters)
+                select(func.max(AdminAction.created_at)).where(
+                    and_(
+                        AdminAction.action.in_(ACTIVITY_ACTIONS),
+                        account_expr == account_id,
+                        strategy_expr == strategy_id,
+                        symbol_expr == symbol_key,
+                    )
+                )
             )
             if isinstance(last_activity_at, datetime):
                 last_activity_at = _to_utc(last_activity_at)
 
-            counter_meta = await session.scalar(
-                select(AdminAction.meta)
-                .where(
+            first_seen_at = await session.scalar(
+                select(func.min(AdminAction.created_at)).where(
                     and_(
                         AdminAction.action == "STRATEGY_REJECT_COUNTER",
-                        account_expr == account_id,
-                        strategy_expr == strategy_id,
-                        symbol_match,
+                        account_expr_meta == account_id,
+                        strategy_expr_meta == strategy_id,
+                        symbol_expr_meta == symbol_key,
                     )
                 )
-                .order_by(AdminAction.created_at.desc())
-                .limit(1)
             )
-            first_seen_at = None
-            if isinstance(counter_meta, dict):
-                first_seen_at = counter_meta.get("first_seen_at")
-            first_seen_at = _to_utc(first_seen_at) if isinstance(first_seen_at, datetime) else None
-            if isinstance(first_seen_at, str):
-                try:
-                    first_seen_at = _to_utc(datetime.fromisoformat(first_seen_at.replace("Z", "+00:00")))
-                except ValueError:
-                    first_seen_at = None
+            if isinstance(first_seen_at, datetime):
+                first_seen_at = _to_utc(first_seen_at)
 
             effective_last_trade_at = last_trade_at or first_seen_at or last_activity_at
-            if not effective_last_trade_at or not last_activity_at:
+            if not effective_last_trade_at:
                 continue
 
             seconds_since_trade = _seconds_since(now, effective_last_trade_at)
-            seconds_since_activity = _seconds_since(now, last_activity_at)
+            seconds_since_activity = (
+                _seconds_since(now, last_activity_at) if isinstance(last_activity_at, datetime) else seconds_since_trade
+            )
 
             if seconds_since_trade <= stall_seconds or seconds_since_activity <= activity_grace_seconds:
                 continue
 
             message = (
-                f"Strategy stalled: no trades for {seconds_since_trade}s and "
-                f"no activity for {seconds_since_activity}s"
+                f"No trades for {seconds_since_trade}s (activity {seconds_since_activity}s) > {stall_seconds}s"
             )
             payload = json_safe(
                 {
@@ -266,18 +257,21 @@ async def maybe_alert_strategy_stalls(
                     "account_id": account_id,
                     "strategy_id": str(strategy_id),
                     "symbol": symbol,
+                    "effective_last_trade_at": effective_last_trade_at,
                     "last_trade_at": last_trade_at,
                     "first_seen_at": first_seen_at,
                     "last_activity_at": last_activity_at,
                     "stall_seconds": stall_seconds,
                     "activity_grace_seconds": activity_grace_seconds,
+                    "throttle_seconds": throttle_seconds,
                     "seconds_since_trade": seconds_since_trade,
                     "seconds_since_activity": seconds_since_activity,
+                    "now_utc": now,
                 }
             )
 
             await write_admin_action_throttled(
-                None,
+                session,
                 action_type="STRATEGY_ALERT",
                 account_id=account_id,
                 symbol=None,
