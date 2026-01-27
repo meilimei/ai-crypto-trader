@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import BigInteger, Integer, String, bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.utils.json_safe import json_safe
@@ -153,6 +153,11 @@ LEFT JOIN last_equity_state les ON les.account_id = b.account_id
 ORDER BY la.last_alert_at DESC NULLS LAST, lt.last_trade_at DESC NULLS LAST, b.account_id, b.symbol
 LIMIT :limit
 """
+).bindparams(
+    bindparam("account_id", type_=BigInteger),
+    bindparam("strategy_id", type_=String),
+    bindparam("symbol", type_=String),
+    bindparam("limit", type_=Integer),
 )
 
 
@@ -229,4 +234,3 @@ async def get_strategy_health(
         )
 
     return items
-

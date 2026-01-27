@@ -76,6 +76,25 @@ def _seconds_since(now: datetime, prior: datetime) -> int:
     return int(delta)
 
 
+def _latest_datetime(*values: datetime | None) -> datetime | None:
+    candidates = [value for value in values if isinstance(value, datetime)]
+    return max(candidates) if candidates else None
+
+
+def _env_int(primary_key: str, fallback_key: str, default: int) -> int:
+    """
+    Resolve an int threshold from env vars.
+    Primary keys are STRATEGY_STALL_*; PAPER_* are supported as a fallback.
+
+    Fast dev test:
+      STRATEGY_STALL_SECONDS=20 STRATEGY_STALL_ACTIVITY_GRACE_SECONDS=5
+    """
+    primary_val = os.getenv(primary_key)
+    if primary_val:
+        return _parse_int(primary_val, default)
+    return _parse_int(os.getenv(fallback_key), default)
+
+
 def _get_strategy_pairs(rows: Iterable[object]) -> list[tuple[int, str, str]]:
     pairs: list[tuple[int, str, str]] = []
     for row in rows:
@@ -105,9 +124,17 @@ async def maybe_alert_strategy_stalls(
     throttle_seconds: int = ALERT_THROTTLE_SECONDS,
 ) -> None:
     now = _to_utc(now_utc)
-    stall_seconds = _parse_int(os.getenv("PAPER_STALL_SECONDS"), stall_seconds)
-    activity_grace_seconds = _parse_int(os.getenv("PAPER_ACTIVITY_GRACE_SECONDS"), activity_grace_seconds)
-    throttle_seconds = _parse_int(os.getenv("PAPER_STALL_THROTTLE_SECONDS"), throttle_seconds)
+    stall_seconds = _env_int("STRATEGY_STALL_SECONDS", "PAPER_STALL_SECONDS", stall_seconds)
+    activity_grace_seconds = _env_int(
+        "STRATEGY_STALL_ACTIVITY_GRACE_SECONDS",
+        "PAPER_ACTIVITY_GRACE_SECONDS",
+        activity_grace_seconds,
+    )
+    throttle_seconds = _env_int(
+        "STRATEGY_STALL_THROTTLE_SECONDS",
+        "PAPER_STALL_THROTTLE_SECONDS",
+        throttle_seconds,
+    )
 
     window_start = now - timedelta(hours=24)
     account_text_meta = meta_text(AdminAction.meta, "account_id")
@@ -290,14 +317,24 @@ async def maybe_alert_strategy_stalls(
             )
             latest_stall_row = (await session.execute(latest_stall_stmt)).scalars().first()
             prev_episode_key: str | None = None
+            last_stall_at: datetime | None = None
             if latest_stall_row and isinstance(latest_stall_row.meta, dict):
                 prev_meta = latest_stall_row.meta
                 prev_episode_key = prev_meta.get("effective_last_trade_at") or prev_meta.get("last_trade_at")
+            if latest_stall_row and isinstance(latest_stall_row.created_at, datetime):
+                last_stall_at = _to_utc(latest_stall_row.created_at)
+            last_stall_at_meta = last_stall_at.isoformat() if isinstance(last_stall_at, datetime) else None
+
+            last_signal_at = _latest_datetime(last_trade_at, last_activity_at)
+            if isinstance(last_signal_at, datetime):
+                last_signal_at = _to_utc(last_signal_at)
+            last_signal_at_meta = last_signal_at.isoformat() if isinstance(last_signal_at, datetime) else None
 
             is_stalled = seconds_since_trade > stall_seconds and seconds_since_activity > activity_grace_seconds
             if not is_stalled:
-                # Optional recovery alert: emit once per new episode after a prior stall.
-                if prev_episode_key and episode_key and prev_episode_key != episode_key:
+                # Recovery alert: emit once when we transition from stalled -> healthy.
+                # Requires a prior stall and a post-stall trade/activity signal.
+                if last_stall_at and last_signal_at and last_signal_at > last_stall_at:
                     latest_recovery_stmt = (
                         select(AdminAction)
                         .where(
@@ -313,13 +350,11 @@ async def maybe_alert_strategy_stalls(
                         .limit(1)
                     )
                     latest_recovery_row = (await session.execute(latest_recovery_stmt)).scalars().first()
-                    prev_recovery_episode_key: str | None = None
+                    prev_recovery_stall_at: str | None = None
                     if latest_recovery_row and isinstance(latest_recovery_row.meta, dict):
                         recovery_meta = latest_recovery_row.meta
-                        prev_recovery_episode_key = (
-                            recovery_meta.get("effective_last_trade_at") or recovery_meta.get("last_trade_at")
-                        )
-                    if prev_recovery_episode_key != episode_key:
+                        prev_recovery_stall_at = recovery_meta.get("last_stall_at")
+                    if prev_recovery_stall_at != last_stall_at_meta:
                         recovery_payload = json_safe(
                             {
                                 "message": "Strategy stall recovered",
@@ -330,6 +365,8 @@ async def maybe_alert_strategy_stalls(
                                 "last_trade_at": last_trade_at_meta,
                                 "first_seen_at": first_seen_at_meta,
                                 "last_activity_at": last_activity_at_meta,
+                                "last_signal_at": last_signal_at_meta,
+                                "last_stall_at": last_stall_at_meta,
                                 "stall_seconds": stall_seconds,
                                 "activity_grace_seconds": activity_grace_seconds,
                                 "throttle_seconds": throttle_seconds,
@@ -338,7 +375,7 @@ async def maybe_alert_strategy_stalls(
                                 "now_utc": now.isoformat(),
                             }
                         )
-                        episode_fragment = episode_key or "unknown"
+                        stall_fragment = last_stall_at_meta or "unknown"
                         await write_admin_action_throttled(
                             session,
                             action_type="STRATEGY_ALERT",
@@ -349,7 +386,7 @@ async def maybe_alert_strategy_stalls(
                             window_seconds=max(throttle_seconds, 1),
                             dedupe_key=(
                                 f"STRATEGY_ALERT:STALL_RECOVERED:{account_id}:{strategy_id_filter_val}:{symbol_key}:"
-                                f"{episode_fragment}"
+                                f"{stall_fragment}"
                             ),
                         )
                 continue
