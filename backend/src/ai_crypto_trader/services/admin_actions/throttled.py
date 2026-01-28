@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.database import AsyncSessionLocal
 from ai_crypto_trader.common.models import AdminAction
-from ai_crypto_trader.services.notifications.outbox import enqueue_outbox_for_admin_action
 from ai_crypto_trader.utils.json_safe import json_safe
 
 logger = logging.getLogger(__name__)
@@ -39,6 +38,7 @@ async def write_admin_action_throttled(
     payload: dict[str, Any],
     window_seconds: int = 120,
     dedupe_key: Optional[str] = None,
+    now_utc: datetime | None = None,
 ) -> bool:
     """
     Insert an AdminAction unless a recent matching row exists for the dedupe key.
@@ -81,7 +81,6 @@ async def write_admin_action_throttled(
                 )
                 db_session.add(admin_action)
                 await db_session.flush()
-                await enqueue_outbox_for_admin_action(db_session, admin_action)
                 await db_session.commit()
                 return True
             except Exception:

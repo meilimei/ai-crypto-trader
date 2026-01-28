@@ -486,22 +486,21 @@ class AdminAction(Base):
 class NotificationOutbox(Base):
     __tablename__ = "notifications_outbox"
     __table_args__ = (
-        UniqueConstraint("admin_action_id", name="uq_notifications_outbox_admin_action_id"),
+        UniqueConstraint("channel", "dedupe_key", name="uq_notifications_outbox_channel_dedupe_key"),
         Index("ix_notifications_outbox_status_next_attempt", "status", "next_attempt_at"),
-        Index("ix_notifications_outbox_dedupe_key", "dedupe_key"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
     )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, onupdate=utc_now
     )
-    status: Mapped[str] = mapped_column(String(32), default="pending", server_default=text("'pending'"))
-    channel: Mapped[str] = mapped_column(String(32), default="noop", server_default=text("'noop'"))
+    status: Mapped[str] = mapped_column(Text, default="pending", server_default=text("'pending'"))
+    channel: Mapped[str] = mapped_column(Text)
     admin_action_id: Mapped[int] = mapped_column(ForeignKey("admin_actions.id", ondelete="CASCADE"))
-    dedupe_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    dedupe_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     next_attempt_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now

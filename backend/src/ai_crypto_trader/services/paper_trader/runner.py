@@ -31,6 +31,7 @@ from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.policies_effective import get_effective_risk_policy
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
+from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -54,6 +55,7 @@ class PaperTraderRunner:
         self.last_error: Optional[str] = None
         self._reconcile_task: Optional[asyncio.Task[None]] = None
         self._stall_monitor_task: Optional[asyncio.Task[None]] = None
+        self._outbox_task: Optional[asyncio.Task[None]] = None
         self.last_reconcile_at: Optional[datetime] = None
         self.reconcile_tick_count: int = 0
         self.reconcile_interval_seconds: int = 0
@@ -103,6 +105,7 @@ class PaperTraderRunner:
             self._reconcile_task = asyncio.create_task(self._reconcile_loop(auto_apply=auto_reconcile), name="paper_reconcile")
             self._reconcile_task.add_done_callback(self._reconcile_done)
         self._stall_monitor_task = asyncio.create_task(self._stall_monitor_loop(), name="paper_stall_monitor")
+        self._outbox_task = asyncio.create_task(self._outbox_loop(), name="notifications_outbox")
         self._task = asyncio.create_task(_run(), name="paper-trader")
 
     async def stop(self) -> None:
@@ -124,6 +127,13 @@ class PaperTraderRunner:
             except asyncio.CancelledError:
                 pass
         self._reconcile_task = None
+        if self._outbox_task:
+            self._outbox_task.cancel()
+            try:
+                await self._outbox_task
+            except asyncio.CancelledError:
+                pass
+        self._outbox_task = None
         if self._stall_monitor_task:
             self._stall_monitor_task.cancel()
             try:
@@ -425,6 +435,17 @@ class PaperTraderRunner:
             except Exception:
                 logger.exception("Strategy stall monitor failed")
             await asyncio.sleep(1)
+
+    async def _outbox_loop(self) -> None:
+        poll_seconds = int(os.getenv("NOTIFICATIONS_OUTBOX_POLL_SECONDS", "5"))
+        while self.is_running:
+            try:
+                now_utc = datetime.now(timezone.utc)
+                async with AsyncSessionLocal() as session:
+                    await dispatch_outbox(session, now_utc=now_utc, limit=50)
+            except Exception:
+                logger.exception("Notifications outbox dispatcher failed")
+            await asyncio.sleep(max(poll_seconds, 1))
 
 
 async def reset_paper_data(session: AsyncSession) -> Dict[str, object]:

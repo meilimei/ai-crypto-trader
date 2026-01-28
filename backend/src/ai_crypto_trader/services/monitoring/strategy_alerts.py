@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_crypto_trader.common.database import AsyncSessionLocal
 from ai_crypto_trader.common.models import AdminAction
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
+from ai_crypto_trader.services.notifications.outbox import enqueue_outbox_notification
 from ai_crypto_trader.utils.json_safe import json_safe
 
 logger = logging.getLogger(__name__)
@@ -226,7 +227,7 @@ async def maybe_alert_strategy_reject_burst(
         return
 
     symbol_key = symbol or ""
-    await write_admin_action_throttled(
+    inserted = await write_admin_action_throttled(
         None,
         action_type="STRATEGY_ALERT",
         account_id=account_id,
@@ -246,4 +247,32 @@ async def maybe_alert_strategy_reject_burst(
         },
         window_seconds=max(120, window_seconds),
         dedupe_key=f"STRATEGY_ALERT:REJECT_BURST:{account_id}:{strategy_id}:{symbol_key}",
+        now_utc=now_utc,
     )
+    if inserted:
+        admin_action = await session.scalar(
+            select(AdminAction)
+            .where(
+                AdminAction.dedupe_key == f"STRATEGY_ALERT:REJECT_BURST:{account_id}:{strategy_id}:{symbol_key}"
+            )
+            .order_by(AdminAction.created_at.desc())
+            .limit(1)
+        )
+        if admin_action:
+            await enqueue_outbox_notification(
+                session,
+                channel=None,
+                admin_action_id=admin_action.id,
+                dedupe_key=admin_action.dedupe_key,
+                payload={
+                    "action": admin_action.action,
+                    "status": admin_action.status,
+                    "message": admin_action.message,
+                    "meta": admin_action.meta,
+                    "created_at": admin_action.created_at.isoformat() if admin_action.created_at else None,
+                    "account_id": account_id,
+                    "strategy_id": str(strategy_id),
+                    "symbol": symbol,
+                },
+                now_utc=now_utc,
+            )

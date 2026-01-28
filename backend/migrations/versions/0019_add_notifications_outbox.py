@@ -38,12 +38,7 @@ def upgrade() -> None:
             server_default=sa.text("'pending'"),
             nullable=False,
         ),
-        sa.Column(
-            "channel",
-            sa.Text(),
-            server_default=sa.text("'noop'"),
-            nullable=False,
-        ),
+        sa.Column("channel", sa.Text(), nullable=False),
         sa.Column(
             "admin_action_id",
             sa.BigInteger(),
@@ -70,21 +65,22 @@ def upgrade() -> None:
             server_default=sa.text("'{}'::jsonb"),
             nullable=False,
         ),
-        sa.UniqueConstraint("admin_action_id", name="uq_notifications_outbox_admin_action_id"),
     )
     op.create_index(
-        "ix_notifications_outbox_status_next_attempt",
+        "ix_notifications_outbox_status_created_at",
         "notifications_outbox",
-        ["status", "next_attempt_at"],
+        ["status", sa.text("created_at DESC")],
     )
     op.create_index(
-        "ix_notifications_outbox_dedupe_key",
+        "ux_notifications_outbox_channel_dedupe_key",
         "notifications_outbox",
-        ["dedupe_key"],
+        ["channel", "dedupe_key"],
+        unique=True,
+        postgresql_where=sa.text("dedupe_key IS NOT NULL AND dedupe_key <> ''"),
     )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_notifications_outbox_dedupe_key", table_name="notifications_outbox")
-    op.drop_index("ix_notifications_outbox_status_next_attempt", table_name="notifications_outbox")
+    op.drop_index("ux_notifications_outbox_channel_dedupe_key", table_name="notifications_outbox")
+    op.drop_index("ix_notifications_outbox_status_created_at", table_name="notifications_outbox")
     op.drop_table("notifications_outbox")
