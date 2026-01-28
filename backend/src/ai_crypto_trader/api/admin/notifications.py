@@ -16,6 +16,7 @@ router = APIRouter(prefix="/admin/notifications", tags=["admin"], dependencies=[
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+OUTBOX_STATUSES = {"pending", "sent", "failed"}
 
 
 def _bounded_limit(value: int) -> int:
@@ -31,14 +32,18 @@ def _bounded_limit(value: int) -> int:
 @router.get("/outbox")
 async def get_outbox(
     limit: int = Query(DEFAULT_LIMIT, description="Number of rows to return (max 200)"),
-    status: str | None = Query(default=None, description="Filter by outbox status"),
+    status: str | None = Query(
+        default=None,
+        description="Filter by outbox status (pending/sent/failed)",
+    ),
     since_minutes: int | None = Query(default=None, description="Only rows created in the last N minutes"),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     bounded_limit = _bounded_limit(limit)
     filters = []
     if status:
-        filters.append(NotificationOutbox.status == status.strip())
+        status_key = status.strip().lower()
+        filters.append(NotificationOutbox.status == status_key)
     if since_minutes is not None:
         since = datetime.now(timezone.utc) - timedelta(minutes=max(since_minutes, 0))
         filters.append(NotificationOutbox.created_at >= since)

@@ -18,6 +18,15 @@ def _next_backoff_seconds(attempt_count: int) -> int:
     return min(300, 2 ** base)
 
 
+def _resolve_channel(row: NotificationOutbox) -> str:
+    raw = (row.channel or "").strip()
+    if raw:
+        return raw
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    payload_channel = payload.get("channel") if isinstance(payload, dict) else None
+    return str(payload_channel or "").strip()
+
+
 async def _fetch_due_outbox(
     session: AsyncSession,
     *,
@@ -54,7 +63,8 @@ async def dispatch_outbox(
         row.attempt_count = (row.attempt_count or 0) + 1
         row.updated_at = now
         try:
-            channel = (row.channel or "").strip().lower()
+            resolved_channel = _resolve_channel(row)
+            channel = resolved_channel.lower()
             if channel in {"noop", "log"}:
                 logger.info(
                     "outbox dispatch noop/log",
@@ -84,7 +94,7 @@ async def dispatch_outbox(
                 delivered += 1
             else:
                 row.status = "failed"
-                row.last_error = f"Unsupported channel: {row.channel}"
+                row.last_error = f"Unsupported channel: {resolved_channel}"
                 row.next_attempt_at = None
         except Exception as exc:
             row.last_error = str(exc)
