@@ -31,7 +31,7 @@ from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.policies_effective import get_effective_risk_policy
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
-from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox, dispatch_outbox_once
+from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox_once
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -414,36 +414,9 @@ class PaperTraderRunner:
                 logger.exception("Auto reconcile loop error")
             try:
                 now_utc = datetime.now(timezone.utc)
-                outbox_stats = None
                 async with AsyncSessionLocal() as session:
                     session.info["reconcile_tick_count"] = self.reconcile_tick_count
                     await maybe_alert_strategy_stalls(session, now_utc=now_utc)
-                    try:
-                        outbox_stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
-                    except Exception:
-                        logger.exception("Notifications outbox dispatcher failed")
-                    if outbox_stats:
-                        try:
-                            await write_admin_action_throttled(
-                                session,
-                                action_type="NOTIFICATIONS_OUTBOX_TICK",
-                                account_id=0,
-                                symbol=None,
-                                status="ok",
-                                payload={
-                                    "now_utc": now_utc.isoformat(),
-                                    "due_count": outbox_stats.due_count,
-                                    "processed_count": outbox_stats.processed_count,
-                                    "sent_count": outbox_stats.sent_count,
-                                    "failed_count": outbox_stats.failed_count,
-                                    "pending_remaining": outbox_stats.pending_remaining,
-                                },
-                                window_seconds=60,
-                                dedupe_key="NOTIFICATIONS_OUTBOX_TICK:global",
-                                now_utc=now_utc,
-                            )
-                        except Exception:
-                            logger.exception("Notifications outbox tick heartbeat write failed")
                 logger.info("strategy_stalls wired tick executed")
             except Exception:
                 logger.exception("Strategy stalls wired tick failed")
@@ -464,14 +437,53 @@ class PaperTraderRunner:
             await asyncio.sleep(1)
 
     async def _outbox_loop(self) -> None:
-        poll_seconds = int(os.getenv("NOTIFICATIONS_OUTBOX_POLL_SECONDS", "5"))
+        poll_seconds = int(os.getenv("NOTIFICATIONS_OUTBOX_POLL_SECONDS", "10"))
         while self.is_running:
+            started_at = datetime.now(timezone.utc)
             try:
-                now_utc = datetime.now(timezone.utc)
+                now_utc = started_at
                 async with AsyncSessionLocal() as session:
-                    await dispatch_outbox(session, now_utc=now_utc, limit=50)
+                    stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
+                    duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+                    session.add(
+                        AdminAction(
+                            action="NOTIFICATIONS_OUTBOX_TICK",
+                            status="ok",
+                            message="Outbox dispatcher tick",
+                            meta={
+                                "now_utc": now_utc.isoformat(),
+                                "picked_count": stats["picked"],
+                                "sent_count": stats["sent"],
+                                "failed_count": stats["failed"],
+                                "pending_due_count": stats["pending_due"],
+                                "duration_ms": duration_ms,
+                            },
+                        )
+                    )
+                    await session.commit()
             except Exception:
                 logger.exception("Notifications outbox dispatcher failed")
+                try:
+                    async with AsyncSessionLocal() as session:
+                        duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+                        session.add(
+                            AdminAction(
+                                action="NOTIFICATIONS_OUTBOX_TICK",
+                                status="error",
+                                message="Outbox dispatcher failed",
+                                meta={
+                                    "now_utc": started_at.isoformat(),
+                                    "picked_count": 0,
+                                    "sent_count": 0,
+                                    "failed_count": 0,
+                                    "pending_due_count": 0,
+                                    "duration_ms": duration_ms,
+                                },
+                            )
+                        )
+                        await session.commit()
+                except Exception:
+                    logger.exception("Notifications outbox tick heartbeat write failed")
             await asyncio.sleep(max(poll_seconds, 1))
 
 

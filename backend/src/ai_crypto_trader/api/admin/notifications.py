@@ -82,9 +82,9 @@ async def dispatch_outbox_once_endpoint(
     stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
     return {
         "ok": True,
-        "due": stats.due_count,
-        "processed": stats.processed_count,
-        "sent": stats.sent_count,
-        "failed": stats.failed_count,
-        "pending_remaining": stats.pending_remaining,
+        "due": stats["pending_due"],
+        "processed": stats["picked"],
+        "sent": stats["sent"],
+        "failed": stats["failed"],
+        "pending_remaining": stats["pending_remaining"],
     }

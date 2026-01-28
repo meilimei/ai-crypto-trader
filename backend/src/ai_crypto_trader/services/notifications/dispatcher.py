@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import AdminAction, NotificationOutbox, utc_now
@@ -20,12 +19,7 @@ def _next_backoff_seconds(attempt_count: int) -> int:
 
 
 def _resolve_channel(row: NotificationOutbox) -> str:
-    raw = (row.channel or "").strip()
-    if raw:
-        return raw
-    payload = row.payload if isinstance(row.payload, dict) else {}
-    payload_channel = payload.get("channel") if isinstance(payload, dict) else None
-    return str(payload_channel or "").strip()
+    return (row.channel or "").strip().lower()
 
 
 async def _fetch_due_outbox(
@@ -38,7 +32,7 @@ async def _fetch_due_outbox(
         select(NotificationOutbox)
         .where(
             NotificationOutbox.status == "pending",
-            or_(NotificationOutbox.next_attempt_at.is_(None), NotificationOutbox.next_attempt_at <= now_utc),
+            NotificationOutbox.next_attempt_at <= now_utc,
         )
         .order_by(NotificationOutbox.created_at.asc())
         .limit(limit)
@@ -46,15 +40,6 @@ async def _fetch_due_outbox(
     )
     result = await session.execute(stmt)
     return result.scalars().all()
-
-
-@dataclass(frozen=True)
-class OutboxDispatchStats:
-    due_count: int
-    processed_count: int
-    sent_count: int
-    failed_count: int
-    pending_remaining: int
 
 
 async def _count_pending(session: AsyncSession) -> int:
@@ -67,12 +52,20 @@ async def dispatch_outbox_once(
     *,
     now_utc: datetime | None = None,
     limit: int = 50,
-) -> OutboxDispatchStats:
+) -> dict[str, int]:
     now = now_utc or utc_now()
     sent = 0
     failed = 0
+    due_total_result = await session.execute(
+        select(func.count())
+        .select_from(NotificationOutbox)
+        .where(
+            NotificationOutbox.status == "pending",
+            NotificationOutbox.next_attempt_at <= now,
+        )
+    )
+    due_count = int(due_total_result.scalar() or 0)
     rows = await _fetch_due_outbox(session, now_utc=now, limit=limit)
-    due_count = len(rows)
     processed = 0
 
     for row in rows:
@@ -122,13 +115,13 @@ async def dispatch_outbox_once(
 
     await session.commit()
     pending_remaining = await _count_pending(session)
-    return OutboxDispatchStats(
-        due_count=due_count,
-        processed_count=processed,
-        sent_count=sent,
-        failed_count=failed,
-        pending_remaining=pending_remaining,
-    )
+    return {
+        "picked": processed,
+        "sent": sent,
+        "failed": failed,
+        "pending_due": due_count,
+        "pending_remaining": pending_remaining,
+    }
 
 
 async def dispatch_outbox(
@@ -138,4 +131,4 @@ async def dispatch_outbox(
     limit: int = 50,
 ) -> int:
     stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=limit)
-    return stats.sent_count
+    return stats["sent"]
