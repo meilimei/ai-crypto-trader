@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_crypto_trader.api.admin_paper_trader import require_admin_token
 from ai_crypto_trader.common.database import get_db_session
 from ai_crypto_trader.common.models import NotificationOutbox
+from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox_once
 from ai_crypto_trader.utils.json_safe import json_safe
 
 router = APIRouter(prefix="/admin/notifications", tags=["admin"], dependencies=[Depends(require_admin_token)])
@@ -71,3 +72,19 @@ async def get_outbox(
         for row in rows
     ]
     return {"ok": True, "items": items}
+
+
+@router.post("/dispatch-once")
+async def dispatch_outbox_once_endpoint(
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    now_utc = datetime.now(timezone.utc)
+    stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
+    return {
+        "ok": True,
+        "due": stats.due_count,
+        "processed": stats.processed_count,
+        "sent": stats.sent_count,
+        "failed": stats.failed_count,
+        "pending_remaining": stats.pending_remaining,
+    }
