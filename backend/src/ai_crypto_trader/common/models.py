@@ -7,6 +7,7 @@ from sqlalchemy import (
     JSON,
     TIMESTAMP,
     Boolean,
+    BigInteger,
     ForeignKey,
     Index,
     Integer,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import Uuid
 
@@ -53,7 +55,7 @@ class Exchange(Base):
     __tablename__ = "exchanges"
     __table_args__ = {"sqlite_autoincrement": True}
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), unique=True)
     slug: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), default=utc_now)
@@ -479,3 +481,30 @@ class AdminAction(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
     )
+
+
+class NotificationOutbox(Base):
+    __tablename__ = "notifications_outbox"
+    __table_args__ = (
+        UniqueConstraint("admin_action_id", name="uq_notifications_outbox_admin_action_id"),
+        Index("ix_notifications_outbox_status_next_attempt", "status", "next_attempt_at"),
+        Index("ix_notifications_outbox_dedupe_key", "dedupe_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, onupdate=utc_now
+    )
+    status: Mapped[str] = mapped_column(String(32), default="pending", server_default=text("'pending'"))
+    channel: Mapped[str] = mapped_column(String(32), default="noop", server_default=text("'noop'"))
+    admin_action_id: Mapped[int] = mapped_column(ForeignKey("admin_actions.id", ondelete="CASCADE"))
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payload: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))

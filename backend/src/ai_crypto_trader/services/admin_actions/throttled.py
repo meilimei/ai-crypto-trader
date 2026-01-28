@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.database import AsyncSessionLocal
 from ai_crypto_trader.common.models import AdminAction
+from ai_crypto_trader.services.notifications.outbox import enqueue_outbox_for_admin_action
 from ai_crypto_trader.utils.json_safe import json_safe
 
 logger = logging.getLogger(__name__)
@@ -71,15 +72,16 @@ async def write_admin_action_throttled(
                         message = reject.get("reason") or payload_safe.get("message")
                     else:
                         message = payload_safe.get("message")
-                db_session.add(
-                    AdminAction(
-                        action=action_type,
-                        status=status_norm,
-                        message=message,
-                        meta=payload_safe,
-                        dedupe_key=dedupe,
-                    )
+                admin_action = AdminAction(
+                    action=action_type,
+                    status=status_norm,
+                    message=message,
+                    meta=payload_safe,
+                    dedupe_key=dedupe,
                 )
+                db_session.add(admin_action)
+                await db_session.flush()
+                await enqueue_outbox_for_admin_action(db_session, admin_action)
                 await db_session.commit()
                 return True
             except Exception:

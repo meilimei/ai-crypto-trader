@@ -14,9 +14,22 @@ from ai_crypto_trader.utils.json_safe import json_safe
 
 logger = logging.getLogger(__name__)
 
-STALL_SECONDS = 900
-ACTIVITY_GRACE_SECONDS = 300
-ALERT_THROTTLE_SECONDS = 1800
+def _parse_int(value: str | None, default: int) -> int:
+    if not value:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int_default(key: str, default: int) -> int:
+    return _parse_int(os.getenv(key), default)
+
+
+STALL_SECONDS = _env_int_default("STRATEGY_STALL_SECONDS", 900)
+ACTIVITY_GRACE_SECONDS = _env_int_default("STRATEGY_ACTIVITY_GRACE_SECONDS", 300)
+ALERT_THROTTLE_SECONDS = _env_int_default("STRATEGY_STALL_ALERT_THROTTLE_SECONDS", 1800)
 
 ACTIVITY_ACTIONS: tuple[str, ...] = (
     "SMOKE_TRADE",
@@ -60,15 +73,6 @@ def _to_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _parse_int(value: str | None, default: int) -> int:
-    if not value:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _seconds_since(now: datetime, prior: datetime) -> int:
     delta = (now - prior).total_seconds()
     if delta < 0:
@@ -87,7 +91,7 @@ def _env_int(primary_key: str, fallback_key: str, default: int) -> int:
     Primary keys are STRATEGY_STALL_*; PAPER_* are supported as a fallback.
 
     Fast dev test:
-      STRATEGY_STALL_SECONDS=20 STRATEGY_STALL_ACTIVITY_GRACE_SECONDS=5
+      STRATEGY_STALL_SECONDS=20 STRATEGY_ACTIVITY_GRACE_SECONDS=5
     """
     primary_val = os.getenv(primary_key)
     if primary_val:
@@ -166,12 +170,12 @@ async def maybe_alert_strategy_stalls(
     now = _to_utc(now_utc)
     stall_seconds = _env_int("STRATEGY_STALL_SECONDS", "PAPER_STALL_SECONDS", stall_seconds)
     activity_grace_seconds = _env_int(
-        "STRATEGY_STALL_ACTIVITY_GRACE_SECONDS",
+        "STRATEGY_ACTIVITY_GRACE_SECONDS",
         "PAPER_ACTIVITY_GRACE_SECONDS",
         activity_grace_seconds,
     )
     throttle_seconds = _env_int(
-        "STRATEGY_STALL_THROTTLE_SECONDS",
+        "STRATEGY_STALL_ALERT_THROTTLE_SECONDS",
         "PAPER_STALL_THROTTLE_SECONDS",
         throttle_seconds,
     )

@@ -37,26 +37,46 @@ STRATEGY_HEALTH_SQL = text(
     """
 WITH base AS (
   SELECT DISTINCT
-    (meta->>'account_id')::bigint AS account_id,
-    NULLIF(meta->>'strategy_id','') AS strategy_id,
-    upper(coalesce(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in')) AS symbol
+    (jsonb_extract_path_text(meta, 'account_id'))::bigint AS account_id,
+    NULLIF(jsonb_extract_path_text(meta, 'strategy_id'), '') AS strategy_id,
+    upper(
+      coalesce(
+        jsonb_extract_path_text(meta, 'symbol'),
+        jsonb_extract_path_text(meta, 'symbol_normalized'),
+        jsonb_extract_path_text(meta, 'symbol_in')
+      )
+    ) AS symbol
   FROM admin_actions
   WHERE meta ? 'account_id'
-    AND NULLIF(coalesce(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in'), '') IS NOT NULL
-    AND (:account_id IS NULL OR (meta->>'account_id')::bigint = :account_id)
-    AND (:strategy_id IS NULL OR NULLIF(meta->>'strategy_id','') = :strategy_id)
-    AND (:symbol IS NULL OR upper(coalesce(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in')) = :symbol)
+    AND NULLIF(
+      coalesce(
+        jsonb_extract_path_text(meta, 'symbol'),
+        jsonb_extract_path_text(meta, 'symbol_normalized'),
+        jsonb_extract_path_text(meta, 'symbol_in')
+      ),
+      ''
+    ) IS NOT NULL
+    AND (:account_id IS NULL OR (jsonb_extract_path_text(meta, 'account_id'))::bigint = :account_id)
+    AND (:strategy_id IS NULL OR NULLIF(jsonb_extract_path_text(meta, 'strategy_id'), '') = :strategy_id)
+    AND (
+      :symbol IS NULL
+      OR upper(
+        coalesce(
+          jsonb_extract_path_text(meta, 'symbol'),
+          jsonb_extract_path_text(meta, 'symbol_normalized'),
+          jsonb_extract_path_text(meta, 'symbol_in')
+        )
+      ) = :symbol
+    )
 ),
 last_trade AS (
   SELECT b.account_id, b.strategy_id, b.symbol, a.created_at AS last_trade_at
   FROM base b
   LEFT JOIN LATERAL (
     SELECT created_at
-    FROM admin_actions
-    WHERE action='SMOKE_TRADE' AND status='ok'
-      AND (meta->>'account_id')::bigint = b.account_id
-      AND NULLIF(meta->>'strategy_id','') IS NOT DISTINCT FROM b.strategy_id
-      AND upper(coalesce(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in')) = b.symbol
+    FROM paper_trades
+    WHERE account_id = b.account_id
+      AND upper(symbol) = b.symbol
     ORDER BY created_at DESC
     LIMIT 1
   ) a ON true
@@ -67,10 +87,16 @@ last_order_event AS (
   LEFT JOIN LATERAL (
     SELECT created_at
     FROM admin_actions
-    WHERE action IN ('ORDER_REJECTED','ORDER_SKIPPED')
-      AND (meta->>'account_id')::bigint = b.account_id
-      AND NULLIF(meta->>'strategy_id','') IS NOT DISTINCT FROM b.strategy_id
-      AND upper(coalesce(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in')) = b.symbol
+    WHERE action IN ('ORDER_REJECTED','ORDER_SKIPPED','SMOKE_TRADE','STRATEGY_TRADE_EVENT')
+      AND (jsonb_extract_path_text(meta, 'account_id'))::bigint = b.account_id
+      AND NULLIF(jsonb_extract_path_text(meta, 'strategy_id'), '') IS NOT DISTINCT FROM b.strategy_id
+      AND upper(
+        coalesce(
+          jsonb_extract_path_text(meta, 'symbol'),
+          jsonb_extract_path_text(meta, 'symbol_normalized'),
+          jsonb_extract_path_text(meta, 'symbol_in')
+        )
+      ) = b.symbol
     ORDER BY created_at DESC
     LIMIT 1
   ) a ON true
@@ -86,9 +112,15 @@ last_alert AS (
     SELECT created_at, status, message, meta
     FROM admin_actions
     WHERE action='STRATEGY_ALERT'
-      AND (meta->>'account_id')::bigint = b.account_id
-      AND NULLIF(meta->>'strategy_id','') IS NOT DISTINCT FROM b.strategy_id
-      AND upper(coalesce(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in')) = b.symbol
+      AND (jsonb_extract_path_text(meta, 'account_id'))::bigint = b.account_id
+      AND NULLIF(jsonb_extract_path_text(meta, 'strategy_id'), '') IS NOT DISTINCT FROM b.strategy_id
+      AND upper(
+        coalesce(
+          jsonb_extract_path_text(meta, 'symbol'),
+          jsonb_extract_path_text(meta, 'symbol_normalized'),
+          jsonb_extract_path_text(meta, 'symbol_in')
+        )
+      ) = b.symbol
     ORDER BY created_at DESC
     LIMIT 1
   ) a ON true
@@ -102,15 +134,21 @@ reject_counter AS (
     SELECT created_at, meta
     FROM admin_actions
     WHERE action='STRATEGY_REJECT_COUNTER'
-      AND (meta->>'account_id')::bigint = b.account_id
-      AND NULLIF(meta->>'strategy_id','') IS NOT DISTINCT FROM b.strategy_id
-      AND upper(coalesce(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in')) = b.symbol
+      AND (jsonb_extract_path_text(meta, 'account_id'))::bigint = b.account_id
+      AND NULLIF(jsonb_extract_path_text(meta, 'strategy_id'), '') IS NOT DISTINCT FROM b.strategy_id
+      AND upper(
+        coalesce(
+          jsonb_extract_path_text(meta, 'symbol'),
+          jsonb_extract_path_text(meta, 'symbol_normalized'),
+          jsonb_extract_path_text(meta, 'symbol_in')
+        )
+      ) = b.symbol
     ORDER BY created_at DESC
     LIMIT 1
   ) a ON true
 ),
 equity_state AS (
-  SELECT (meta->>'account_id')::bigint AS account_id, created_at, status, meta
+  SELECT (jsonb_extract_path_text(meta, 'account_id'))::bigint AS account_id, created_at, status, meta
   FROM admin_actions
   WHERE action='EQUITY_RISK_STATE' AND meta ? 'account_id'
 ),
