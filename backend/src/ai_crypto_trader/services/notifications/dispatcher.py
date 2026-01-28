@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import AdminAction, NotificationOutbox, utc_now
@@ -47,19 +48,35 @@ async def _fetch_due_outbox(
     return result.scalars().all()
 
 
-async def dispatch_outbox(
+@dataclass(frozen=True)
+class OutboxDispatchStats:
+    due_count: int
+    processed_count: int
+    sent_count: int
+    failed_count: int
+    pending_remaining: int
+
+
+async def _count_pending(session: AsyncSession) -> int:
+    result = await session.execute(select(func.count()).select_from(NotificationOutbox).where(NotificationOutbox.status == "pending"))
+    return int(result.scalar() or 0)
+
+
+async def dispatch_outbox_once(
     session: AsyncSession,
     *,
     now_utc: datetime | None = None,
     limit: int = 50,
-) -> int:
+) -> OutboxDispatchStats:
     now = now_utc or utc_now()
-    delivered = 0
+    sent = 0
+    failed = 0
     rows = await _fetch_due_outbox(session, now_utc=now, limit=limit)
-    if not rows:
-        return 0
+    due_count = len(rows)
+    processed = 0
 
     for row in rows:
+        processed += 1
         row.attempt_count = (row.attempt_count or 0) + 1
         row.updated_at = now
         try:
@@ -71,8 +88,9 @@ async def dispatch_outbox(
                     extra={
                         "outbox_id": row.id,
                         "admin_action_id": row.admin_action_id,
-                        "channel": row.channel,
+                        "channel": resolved_channel,
                         "dedupe_key": row.dedupe_key,
+                        "payload": row.payload,
                     },
                 )
                 row.status = "sent"
@@ -86,20 +104,38 @@ async def dispatch_outbox(
                         meta={
                             "outbox_id": row.id,
                             "admin_action_id": row.admin_action_id,
-                            "channel": row.channel,
+                            "channel": resolved_channel,
                             "dedupe_key": row.dedupe_key,
                         },
                     )
                 )
-                delivered += 1
+                sent += 1
             else:
                 row.status = "failed"
                 row.last_error = f"Unsupported channel: {resolved_channel}"
                 row.next_attempt_at = None
+                failed += 1
         except Exception as exc:
             row.last_error = str(exc)
             row.status = "pending"
             row.next_attempt_at = now + timedelta(seconds=_next_backoff_seconds(row.attempt_count))
 
     await session.commit()
-    return delivered
+    pending_remaining = await _count_pending(session)
+    return OutboxDispatchStats(
+        due_count=due_count,
+        processed_count=processed,
+        sent_count=sent,
+        failed_count=failed,
+        pending_remaining=pending_remaining,
+    )
+
+
+async def dispatch_outbox(
+    session: AsyncSession,
+    *,
+    now_utc: datetime | None = None,
+    limit: int = 50,
+) -> int:
+    stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=limit)
+    return stats.sent_count

@@ -31,7 +31,7 @@ from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.policies_effective import get_effective_risk_policy
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
-from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox
+from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox, dispatch_outbox_once
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -414,9 +414,36 @@ class PaperTraderRunner:
                 logger.exception("Auto reconcile loop error")
             try:
                 now_utc = datetime.now(timezone.utc)
+                outbox_stats = None
                 async with AsyncSessionLocal() as session:
                     session.info["reconcile_tick_count"] = self.reconcile_tick_count
                     await maybe_alert_strategy_stalls(session, now_utc=now_utc)
+                    try:
+                        outbox_stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
+                    except Exception:
+                        logger.exception("Notifications outbox dispatcher failed")
+                    if outbox_stats:
+                        try:
+                            await write_admin_action_throttled(
+                                session,
+                                action_type="NOTIFICATIONS_OUTBOX_TICK",
+                                account_id=0,
+                                symbol=None,
+                                status="ok",
+                                payload={
+                                    "now_utc": now_utc.isoformat(),
+                                    "due_count": outbox_stats.due_count,
+                                    "processed_count": outbox_stats.processed_count,
+                                    "sent_count": outbox_stats.sent_count,
+                                    "failed_count": outbox_stats.failed_count,
+                                    "pending_remaining": outbox_stats.pending_remaining,
+                                },
+                                window_seconds=60,
+                                dedupe_key="NOTIFICATIONS_OUTBOX_TICK:global",
+                                now_utc=now_utc,
+                            )
+                        except Exception:
+                            logger.exception("Notifications outbox tick heartbeat write failed")
                 logger.info("strategy_stalls wired tick executed")
             except Exception:
                 logger.exception("Strategy stalls wired tick failed")
