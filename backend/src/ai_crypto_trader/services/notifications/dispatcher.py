@@ -88,25 +88,31 @@ async def dispatch_outbox_once(
                 )
                 row.status = "sent"
                 row.last_error = None
-                row.next_attempt_at = None
-                session.add(
-                    AdminAction(
-                        action="NOTIFICATION_SENT",
-                        status="ok",
-                        message="Notification dispatched to log channel",
-                        meta={
-                            "outbox_id": row.id,
-                            "admin_action_id": row.admin_action_id,
-                            "channel": resolved_channel,
-                            "dedupe_key": row.dedupe_key,
-                        },
+                row.next_attempt_at = now
+                if channel == "log":
+                    payload_message = None
+                    if isinstance(row.payload, dict):
+                        payload_message = row.payload.get("message")
+                    session.add(
+                        AdminAction(
+                            action="NOTIFICATION_SENT",
+                            status="ok",
+                            message="Notification dispatched to log channel",
+                            dedupe_key=f"NOTIFICATION_SENT:{row.id}",
+                            meta={
+                                "outbox_id": row.id,
+                                "admin_action_id": row.admin_action_id,
+                                "channel": resolved_channel,
+                                "dedupe_key": row.dedupe_key,
+                                "message": payload_message,
+                            },
+                        )
                     )
-                )
                 sent += 1
             else:
                 row.status = "failed"
                 row.last_error = f"Unsupported channel: {resolved_channel}"
-                row.next_attempt_at = None
+                row.next_attempt_at = now
                 failed += 1
         except Exception as exc:
             row.last_error = str(exc)

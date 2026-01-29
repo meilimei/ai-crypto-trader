@@ -440,9 +440,9 @@ class PaperTraderRunner:
         poll_seconds = int(os.getenv("NOTIFICATIONS_OUTBOX_POLL_SECONDS", "10"))
         while self.is_running:
             started_at = datetime.now(timezone.utc)
-            try:
-                now_utc = started_at
-                async with AsyncSessionLocal() as session:
+            now_utc = started_at
+            async with AsyncSessionLocal() as session:
+                try:
                     stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
                     duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
                     session.add(
@@ -461,10 +461,10 @@ class PaperTraderRunner:
                         )
                     )
                     await session.commit()
-            except Exception:
-                logger.exception("Notifications outbox dispatcher failed")
-                try:
-                    async with AsyncSessionLocal() as session:
+                except Exception as exc:
+                    await session.rollback()
+                    logger.exception("Notifications outbox dispatcher failed")
+                    try:
                         duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
                         session.add(
                             AdminAction(
@@ -472,7 +472,8 @@ class PaperTraderRunner:
                                 status="error",
                                 message="Outbox dispatcher failed",
                                 meta={
-                                    "now_utc": started_at.isoformat(),
+                                    "now_utc": now_utc.isoformat(),
+                                    "error": str(exc),
                                     "picked_count": 0,
                                     "sent_count": 0,
                                     "failed_count": 0,
@@ -482,8 +483,8 @@ class PaperTraderRunner:
                             )
                         )
                         await session.commit()
-                except Exception:
-                    logger.exception("Notifications outbox tick heartbeat write failed")
+                    except Exception:
+                        logger.exception("Notifications outbox tick heartbeat write failed")
             await asyncio.sleep(max(poll_seconds, 1))
 
 

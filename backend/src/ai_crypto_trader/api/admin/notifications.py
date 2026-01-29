@@ -76,15 +76,15 @@ async def get_outbox(
 
 @router.post("/dispatch-once")
 async def dispatch_outbox_once_endpoint(
+    limit: int = Query(DEFAULT_LIMIT, description="Number of rows to dispatch (max 200)"),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
+    bounded_limit = _bounded_limit(limit)
     now_utc = datetime.now(timezone.utc)
-    stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
-    return {
-        "ok": True,
-        "due": stats["pending_due"],
-        "processed": stats["picked"],
-        "sent": stats["sent"],
-        "failed": stats["failed"],
-        "pending_remaining": stats["pending_remaining"],
-    }
+    try:
+        stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=bounded_limit)
+        await session.commit()
+        return {"ok": True, "stats": stats}
+    except Exception as exc:
+        await session.rollback()
+        return {"ok": False, "error": str(exc)}
