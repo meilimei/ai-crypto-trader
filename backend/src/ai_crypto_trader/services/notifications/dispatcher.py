@@ -76,23 +76,34 @@ async def dispatch_outbox_once(
             resolved_channel = _resolve_channel(row)
             channel = resolved_channel.lower()
             if channel in {"noop", "log"}:
-                logger.info(
-                    "outbox dispatch noop/log",
-                    extra={
-                        "outbox_id": row.id,
-                        "admin_action_id": row.admin_action_id,
-                        "channel": resolved_channel,
-                        "dedupe_key": row.dedupe_key,
-                        "payload": row.payload,
-                    },
-                )
+                payload_message = None
+                if isinstance(row.payload, dict):
+                    payload_message = row.payload.get("message")
+                if channel == "log":
+                    logger.info(
+                        "outbox dispatch log",
+                        extra={
+                            "outbox_id": row.id,
+                            "admin_action_id": row.admin_action_id,
+                            "channel": resolved_channel,
+                            "dedupe_key": row.dedupe_key,
+                            "message": payload_message,
+                        },
+                    )
+                else:
+                    logger.info(
+                        "outbox dispatch noop",
+                        extra={
+                            "outbox_id": row.id,
+                            "admin_action_id": row.admin_action_id,
+                            "channel": resolved_channel,
+                            "dedupe_key": row.dedupe_key,
+                        },
+                    )
                 row.status = "sent"
                 row.last_error = None
                 row.next_attempt_at = now
                 if channel == "log":
-                    payload_message = None
-                    if isinstance(row.payload, dict):
-                        payload_message = row.payload.get("message")
                     session.add(
                         AdminAction(
                             action="NOTIFICATION_SENT",
