@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 async def enqueue_outbox_notification(
     session: AsyncSession,
     *,
-    channel: str | None,
+    channel: str | None = None,
     admin_action_id: int,
     dedupe_key: str | None,
     payload: dict[str, Any],
@@ -28,32 +28,47 @@ async def enqueue_outbox_notification(
     clean_dedupe = dedupe_key.strip() if isinstance(dedupe_key, str) else None
     if clean_dedupe == "":
         clean_dedupe = None
-    stmt = insert(NotificationOutbox).values(
-        status="pending",
-        channel=channel_value,
-        admin_action_id=admin_action_id,
-        dedupe_key=clean_dedupe,
-        payload=payload_safe if isinstance(payload_safe, dict) else {"meta": payload_safe},
-        attempt_count=0,
-        next_attempt_at=now_utc,
+    stmt = (
+        insert(NotificationOutbox)
+        .values(
+            status="pending",
+            channel=channel_value,
+            admin_action_id=admin_action_id,
+            dedupe_key=clean_dedupe,
+            payload=payload_safe if isinstance(payload_safe, dict) else {"meta": payload_safe},
+            attempt_count=0,
+            next_attempt_at=now_utc,
+        )
+        .on_conflict_do_nothing(constraint="uq_notifications_outbox_admin_action_id")
+        .returning(NotificationOutbox.id)
     )
-    stmt = stmt.on_conflict_do_nothing(index_elements=["admin_action_id"]).returning(NotificationOutbox.id)
-    result = await session.execute(stmt)
-    outbox_id = result.scalar()
-    if outbox_id is not None:
-        logger.info(
-            "outbox enqueue created",
+    try:
+        result = await session.execute(stmt)
+    except Exception:
+        logger.exception(
+            "outbox enqueue failed",
             extra={
                 "admin_action_id": admin_action_id,
                 "channel": channel_value,
                 "dedupe_key": clean_dedupe,
+            },
+        )
+        raise
+    outbox_id = result.scalar()
+    if outbox_id is not None:
+        logger.info(
+            "outbox enqueued",
+            extra={
+                "admin_action_id": admin_action_id,
                 "outbox_id": outbox_id,
+                "channel": channel_value,
+                "dedupe_key": clean_dedupe,
             },
         )
         return True
 
     logger.info(
-        "outbox enqueue skipped",
+        "outbox deduped",
         extra={
             "admin_action_id": admin_action_id,
             "channel": channel_value,
