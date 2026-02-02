@@ -263,7 +263,7 @@ async def maybe_alert_strategy_reject_burst(
                 await enqueue_outbox_notification(
                     session,
                     channel=None,
-                    admin_action_id=admin_action.id,
+                    admin_action=admin_action,
                     dedupe_key=admin_action.dedupe_key,
                     payload={
                         "action": admin_action.action,
