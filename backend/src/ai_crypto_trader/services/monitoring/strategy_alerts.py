@@ -259,20 +259,32 @@ async def maybe_alert_strategy_reject_burst(
             .limit(1)
         )
         if admin_action:
-            await enqueue_outbox_notification(
-                session,
-                channel=None,
-                admin_action_id=admin_action.id,
-                dedupe_key=admin_action.dedupe_key,
-                payload={
-                    "action": admin_action.action,
-                    "status": admin_action.status,
-                    "message": admin_action.message,
-                    "meta": admin_action.meta,
-                    "created_at": admin_action.created_at.isoformat() if admin_action.created_at else None,
-                    "account_id": account_id,
-                    "strategy_id": str(strategy_id),
-                    "symbol": symbol,
-                },
-                now_utc=now_utc,
-            )
+            try:
+                await enqueue_outbox_notification(
+                    session,
+                    channel=None,
+                    admin_action_id=admin_action.id,
+                    dedupe_key=admin_action.dedupe_key,
+                    payload={
+                        "action": admin_action.action,
+                        "status": admin_action.status,
+                        "message": admin_action.message,
+                        "meta": admin_action.meta,
+                        "created_at": admin_action.created_at.isoformat() if admin_action.created_at else None,
+                        "account_id": account_id,
+                        "strategy_id": str(strategy_id),
+                        "symbol": symbol,
+                    },
+                    now_utc=now_utc,
+                )
+            except Exception:
+                logger.exception(
+                    "outbox enqueue failed",
+                    extra={
+                        "admin_action_id": admin_action.id,
+                        "status": admin_action.status,
+                        "account_id": account_id,
+                        "strategy_id": str(strategy_id),
+                        "symbol": symbol,
+                    },
+                )

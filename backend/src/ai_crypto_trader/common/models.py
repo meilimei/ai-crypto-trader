@@ -502,8 +502,8 @@ class NotificationOutbox(Base):
     admin_action_id: Mapped[int] = mapped_column(ForeignKey("admin_actions.id", ondelete="CASCADE"))
     dedupe_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
-    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
-        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, nullable=True
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
     )
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     payload: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))

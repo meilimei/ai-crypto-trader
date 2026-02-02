@@ -421,25 +421,37 @@ async def maybe_alert_strategy_stalls(
                         .limit(1)
                     )
                     if admin_action:
-                        await enqueue_outbox_notification(
-                            session,
-                            channel=None,
-                            admin_action_id=admin_action.id,
-                            dedupe_key=admin_action.dedupe_key,
-                            payload={
-                                "action": admin_action.action,
-                                "status": admin_action.status,
-                                "message": admin_action.message,
-                                "meta": admin_action.meta,
-                                "created_at": admin_action.created_at.isoformat()
-                                if admin_action.created_at
-                                else None,
-                                "account_id": account_id,
-                                "strategy_id": strategy_id_key,
-                                "symbol": symbol_key,
-                            },
-                            now_utc=now,
-                        )
+                        try:
+                            await enqueue_outbox_notification(
+                                session,
+                                channel=None,
+                                admin_action_id=admin_action.id,
+                                dedupe_key=admin_action.dedupe_key,
+                                payload={
+                                    "action": admin_action.action,
+                                    "status": admin_action.status,
+                                    "message": admin_action.message,
+                                    "meta": admin_action.meta,
+                                    "created_at": admin_action.created_at.isoformat()
+                                    if admin_action.created_at
+                                    else None,
+                                    "account_id": account_id,
+                                    "strategy_id": strategy_id_key,
+                                    "symbol": symbol_key,
+                                },
+                                now_utc=now,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "outbox enqueue failed",
+                                extra={
+                                    "admin_action_id": admin_action.id,
+                                    "status": admin_action.status,
+                                    "account_id": account_id,
+                                    "strategy_id": strategy_id_key,
+                                    "symbol": symbol_key,
+                                },
+                            )
                 logger.info(
                     "strategy_stall alert fired",
                     extra={
@@ -502,25 +514,37 @@ async def maybe_alert_strategy_stalls(
                     .limit(1)
                 )
                 if admin_action:
-                    await enqueue_outbox_notification(
-                        session,
-                        channel=None,
-                        admin_action_id=admin_action.id,
-                        dedupe_key=admin_action.dedupe_key,
-                        payload={
-                            "action": admin_action.action,
-                            "status": admin_action.status,
-                            "message": admin_action.message,
-                            "meta": admin_action.meta,
-                            "created_at": admin_action.created_at.isoformat()
-                            if admin_action.created_at
-                            else None,
-                            "account_id": account_id,
-                            "strategy_id": strategy_id_key,
-                            "symbol": symbol_key,
-                        },
-                        now_utc=now,
-                    )
+                    try:
+                        await enqueue_outbox_notification(
+                            session,
+                            channel=None,
+                            admin_action_id=admin_action.id,
+                            dedupe_key=admin_action.dedupe_key,
+                            payload={
+                                "action": admin_action.action,
+                                "status": admin_action.status,
+                                "message": admin_action.message,
+                                "meta": admin_action.meta,
+                                "created_at": admin_action.created_at.isoformat()
+                                if admin_action.created_at
+                                else None,
+                                "account_id": account_id,
+                                "strategy_id": strategy_id_key,
+                                "symbol": symbol_key,
+                            },
+                            now_utc=now,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "outbox enqueue failed",
+                            extra={
+                                "admin_action_id": admin_action.id,
+                                "status": admin_action.status,
+                                "account_id": account_id,
+                                "strategy_id": strategy_id_key,
+                                "symbol": symbol_key,
+                            },
+                        )
         except Exception:
             logger.exception(
                 "strategy_stall check failed",

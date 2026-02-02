@@ -4,7 +4,6 @@ import logging
 from typing import Any
 
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import os
@@ -23,7 +22,7 @@ async def enqueue_outbox_notification(
     dedupe_key: str | None,
     payload: dict[str, Any],
     now_utc,
-) -> int | None:
+) -> bool:
     channel_value = (channel or os.getenv("NOTIFICATIONS_DEFAULT_CHANNEL") or "log").strip() or "log"
     payload_safe = json_safe(payload or {})
     clean_dedupe = dedupe_key.strip() if isinstance(dedupe_key, str) else None
@@ -38,11 +37,10 @@ async def enqueue_outbox_notification(
         attempt_count=0,
         next_attempt_at=now_utc,
     )
-    stmt = stmt.on_conflict_do_nothing(index_elements=["admin_action_id"])
+    stmt = stmt.on_conflict_do_nothing(index_elements=["admin_action_id"]).returning(NotificationOutbox.id)
     result = await session.execute(stmt)
-    rowcount = int(getattr(result, "rowcount", 0) or 0)
-    if rowcount:
-        outbox_id = result.inserted_primary_key[0] if result.inserted_primary_key else None
+    outbox_id = result.scalar()
+    if outbox_id is not None:
         logger.info(
             "outbox enqueue created",
             extra={
@@ -52,21 +50,17 @@ async def enqueue_outbox_notification(
                 "outbox_id": outbox_id,
             },
         )
-        return outbox_id
+        return True
 
-    existing_id = await session.scalar(
-        select(NotificationOutbox.id).where(NotificationOutbox.admin_action_id == admin_action_id)
-    )
     logger.info(
         "outbox enqueue skipped",
         extra={
             "admin_action_id": admin_action_id,
             "channel": channel_value,
             "dedupe_key": clean_dedupe,
-            "outbox_id": existing_id,
         },
     )
-    return existing_id
+    return False
 
 
 # Smoke verification:
