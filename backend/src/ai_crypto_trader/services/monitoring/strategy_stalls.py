@@ -9,7 +9,7 @@ from sqlalchemy import BigInteger, Integer, and_, cast, func, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import AdminAction
-from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
+from ai_crypto_trader.services.admin_actions.throttled import normalize_status, write_admin_action_throttled
 from ai_crypto_trader.services.notifications.outbox import enqueue_outbox_notification
 from ai_crypto_trader.utils.json_safe import json_safe
 
@@ -113,6 +113,40 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
     except ValueError:
         return None
     return _to_utc(parsed)
+
+
+async def _insert_admin_action_throttled(
+    session: AsyncSession,
+    *,
+    action_type: str,
+    status: str,
+    payload: dict[str, object],
+    dedupe_key: str,
+    window_seconds: int,
+    now_utc: datetime,
+) -> AdminAction | None:
+    window_start = now_utc - timedelta(seconds=window_seconds)
+    existing = await session.scalar(
+        select(AdminAction.id)
+        .where(AdminAction.dedupe_key == dedupe_key, AdminAction.created_at >= window_start)
+        .order_by(AdminAction.created_at.desc())
+        .limit(1)
+    )
+    if existing:
+        return None
+    payload_safe = json_safe(payload or {})
+    status_norm = normalize_status(status)
+    message = payload_safe.get("message") if isinstance(payload_safe, dict) else None
+    admin_action = AdminAction(
+        action=action_type,
+        status=status_norm,
+        message=message,
+        meta=payload_safe,
+        dedupe_key=dedupe_key,
+    )
+    session.add(admin_action)
+    await session.flush()
+    return admin_action
 
 
 async def _latest_strategy_alert(
@@ -399,69 +433,61 @@ async def maybe_alert_strategy_stalls(
                     }
                 )
 
-                inserted = await write_admin_action_throttled(
+                payload_dict = payload if isinstance(payload, dict) else {"meta": payload}
+                dedupe_key = f"STRATEGY_ALERT:NO_TRADE_STALL:{account_id}:{strategy_id_filter_val}:{symbol_key}"
+                admin_action = await _insert_admin_action_throttled(
                     session,
                     action_type="STRATEGY_ALERT",
-                    account_id=account_id,
-                    symbol=None,
                     status="NO_TRADE_STALL",
-                    payload=payload if isinstance(payload, dict) else {"meta": payload},
+                    payload=payload_dict,
+                    dedupe_key=dedupe_key,
                     window_seconds=max(throttle_seconds, 1),
-                    dedupe_key=f"STRATEGY_ALERT:NO_TRADE_STALL:{account_id}:{strategy_id_filter_val}:{symbol_key}",
                     now_utc=now,
                 )
-                if inserted:
-                    admin_action = await session.scalar(
-                        select(AdminAction)
-                        .where(
-                            AdminAction.dedupe_key
-                            == f"STRATEGY_ALERT:NO_TRADE_STALL:{account_id}:{strategy_id_filter_val}:{symbol_key}"
+                if admin_action:
+                    try:
+                        await enqueue_outbox_notification(
+                            session,
+                            channel=None,
+                            admin_action=admin_action,
+                            dedupe_key=admin_action.dedupe_key,
+                            payload={
+                                "action": admin_action.action,
+                                "status": admin_action.status,
+                                "message": admin_action.message,
+                                "meta": admin_action.meta,
+                                "created_at": admin_action.created_at.isoformat()
+                                if admin_action.created_at
+                                else None,
+                                "account_id": account_id,
+                                "strategy_id": strategy_id_key,
+                                "symbol": symbol_key,
+                            },
+                            now_utc=now,
                         )
-                        .order_by(AdminAction.created_at.desc())
-                        .limit(1)
-                    )
-                    if admin_action:
-                        try:
-                            await enqueue_outbox_notification(
-                                session,
-                                channel=None,
-                                admin_action=admin_action,
-                                dedupe_key=admin_action.dedupe_key,
-                                payload={
-                                    "action": admin_action.action,
-                                    "status": admin_action.status,
-                                    "message": admin_action.message,
-                                    "meta": admin_action.meta,
-                                    "created_at": admin_action.created_at.isoformat()
-                                    if admin_action.created_at
-                                    else None,
-                                    "account_id": account_id,
-                                    "strategy_id": strategy_id_key,
-                                    "symbol": symbol_key,
-                                },
-                                now_utc=now,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "outbox enqueue failed",
-                                extra={
-                                    "admin_action_id": admin_action.id,
-                                    "status": admin_action.status,
-                                    "account_id": account_id,
-                                    "strategy_id": strategy_id_key,
-                                    "symbol": symbol_key,
-                                },
-                            )
-                logger.info(
-                    "strategy_stall alert fired",
-                    extra={
-                        "account_id": account_id,
-                        "strategy_id": strategy_id_key,
-                        "symbol": symbol_key,
-                        "seconds_since_trade": seconds_since_trade,
-                        "seconds_since_activity": seconds_since_activity,
-                    },
-                )
+                        await session.commit()
+                        logger.info(
+                            "strategy_stall alert fired",
+                            extra={
+                                "account_id": account_id,
+                                "strategy_id": strategy_id_key,
+                                "symbol": symbol_key,
+                                "seconds_since_trade": seconds_since_trade,
+                                "seconds_since_activity": seconds_since_activity,
+                            },
+                        )
+                    except Exception:
+                        await session.rollback()
+                        logger.exception(
+                            "strategy stall alert enqueue failed",
+                            extra={
+                                "admin_action_id": admin_action.id,
+                                "dedupe_key": admin_action.dedupe_key,
+                                "account_id": account_id,
+                                "strategy_id": strategy_id_key,
+                                "symbol": symbol_key,
+                            },
+                        )
                 continue
 
             if last_alert_status != "NO_TRADE_STALL":
@@ -492,59 +518,55 @@ async def maybe_alert_strategy_stalls(
                     "now_utc": now.isoformat(),
                 }
             )
-            inserted = await write_admin_action_throttled(
+            recovery_payload_dict = (
+                recovery_payload if isinstance(recovery_payload, dict) else {"meta": recovery_payload}
+            )
+            recovery_dedupe_key = (
+                f"STRATEGY_ALERT:STALL_RECOVERED:{account_id}:{strategy_id_filter_val}:{symbol_key}"
+            )
+            admin_action = await _insert_admin_action_throttled(
                 session,
                 action_type="STRATEGY_ALERT",
-                account_id=account_id,
-                symbol=None,
                 status="STALL_RECOVERED",
-                payload=recovery_payload if isinstance(recovery_payload, dict) else {"meta": recovery_payload},
+                payload=recovery_payload_dict,
+                dedupe_key=recovery_dedupe_key,
                 window_seconds=max(throttle_seconds, 1),
-                dedupe_key=f"STRATEGY_ALERT:STALL_RECOVERED:{account_id}:{strategy_id_filter_val}:{symbol_key}",
                 now_utc=now,
             )
-            if inserted:
-                admin_action = await session.scalar(
-                    select(AdminAction)
-                    .where(
-                        AdminAction.dedupe_key
-                        == f"STRATEGY_ALERT:STALL_RECOVERED:{account_id}:{strategy_id_filter_val}:{symbol_key}"
+            if admin_action:
+                try:
+                    await enqueue_outbox_notification(
+                        session,
+                        channel=None,
+                        admin_action=admin_action,
+                        dedupe_key=admin_action.dedupe_key,
+                        payload={
+                            "action": admin_action.action,
+                            "status": admin_action.status,
+                            "message": admin_action.message,
+                            "meta": admin_action.meta,
+                            "created_at": admin_action.created_at.isoformat()
+                            if admin_action.created_at
+                            else None,
+                            "account_id": account_id,
+                            "strategy_id": strategy_id_key,
+                            "symbol": symbol_key,
+                        },
+                        now_utc=now,
                     )
-                    .order_by(AdminAction.created_at.desc())
-                    .limit(1)
-                )
-                if admin_action:
-                    try:
-                        await enqueue_outbox_notification(
-                            session,
-                            channel=None,
-                            admin_action=admin_action,
-                            dedupe_key=admin_action.dedupe_key,
-                            payload={
-                                "action": admin_action.action,
-                                "status": admin_action.status,
-                                "message": admin_action.message,
-                                "meta": admin_action.meta,
-                                "created_at": admin_action.created_at.isoformat()
-                                if admin_action.created_at
-                                else None,
-                                "account_id": account_id,
-                                "strategy_id": strategy_id_key,
-                                "symbol": symbol_key,
-                            },
-                            now_utc=now,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "outbox enqueue failed",
-                            extra={
-                                "admin_action_id": admin_action.id,
-                                "status": admin_action.status,
-                                "account_id": account_id,
-                                "strategy_id": strategy_id_key,
-                                "symbol": symbol_key,
-                            },
-                        )
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    logger.exception(
+                        "strategy stall alert enqueue failed",
+                        extra={
+                            "admin_action_id": admin_action.id,
+                            "dedupe_key": admin_action.dedupe_key,
+                            "account_id": account_id,
+                            "strategy_id": strategy_id_key,
+                            "symbol": symbol_key,
+                        },
+                    )
         except Exception:
             logger.exception(
                 "strategy_stall check failed",

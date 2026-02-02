@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +24,7 @@ async def enqueue_outbox_notification(
     dedupe_key: str | None,
     payload: dict[str, Any],
     now_utc,
-) -> bool:
+) -> int | None:
     channel_value = (channel or os.getenv("NOTIFICATIONS_DEFAULT_CHANNEL") or "log").strip() or "log"
     if admin_action_id is None and admin_action is not None:
         if admin_action.id is None:
@@ -37,11 +38,19 @@ async def enqueue_outbox_notification(
                 "dedupe_key": dedupe_key,
             },
         )
-        return False
+        return None
     payload_safe = json_safe(payload or {})
     clean_dedupe = dedupe_key.strip() if isinstance(dedupe_key, str) else None
     if clean_dedupe == "":
         clean_dedupe = None
+    logger.info(
+        "outbox enqueue",
+        extra={
+            "admin_action_id": admin_action_id,
+            "channel": channel_value,
+            "dedupe_key": clean_dedupe,
+        },
+    )
     stmt = (
         insert(NotificationOutbox)
         .values(
@@ -79,17 +88,21 @@ async def enqueue_outbox_notification(
                 "dedupe_key": clean_dedupe,
             },
         )
-        return True
+        return outbox_id
 
+    existing_id = await session.scalar(
+        select(NotificationOutbox.id).where(NotificationOutbox.admin_action_id == admin_action_id)
+    )
     logger.info(
         "outbox deduped",
         extra={
             "admin_action_id": admin_action_id,
+            "outbox_id": existing_id,
             "channel": channel_value,
             "dedupe_key": clean_dedupe,
         },
     )
-    return False
+    return existing_id
 
 
 # Smoke verification:
