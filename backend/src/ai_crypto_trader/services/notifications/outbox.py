@@ -38,7 +38,7 @@ async def enqueue_outbox_notification(
         attempt_count=0,
         next_attempt_at=now_utc,
     )
-    stmt = stmt.on_conflict_do_nothing(constraint="uq_notifications_outbox_admin_action_id")
+    stmt = stmt.on_conflict_do_nothing(index_elements=["admin_action_id"])
     result = await session.execute(stmt)
     rowcount = int(getattr(result, "rowcount", 0) or 0)
     if rowcount:

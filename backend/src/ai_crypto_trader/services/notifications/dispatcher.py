@@ -79,6 +79,10 @@ async def dispatch_outbox_once(
                 payload_message = None
                 if isinstance(row.payload, dict):
                     payload_message = row.payload.get("message")
+                    if payload_message is None:
+                        meta_message = row.payload.get("meta")
+                        if isinstance(meta_message, dict):
+                            payload_message = meta_message.get("message")
                 if channel == "log":
                     logger.info(
                         "outbox dispatch log",
