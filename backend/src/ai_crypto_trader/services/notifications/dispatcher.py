@@ -171,20 +171,19 @@ async def dispatch_outbox_once(
                             error = None
                         except Exception as exc:
                             response = None
-                            error = str(exc)
+                            error = f"{type(exc).__name__}: {exc}"
                         if response is not None and 200 <= response.status_code < 300:
                             row.status = "sent"
                             row.last_error = None
                             row.next_attempt_at = now
                             sent += 1
                             logger.info(
-                                "outbox dispatch webhook ok",
+                                "outbox dispatch webhook sent",
                                 extra={
                                     "outbox_id": row.id,
                                     "admin_action_id": row.admin_action_id,
                                     "dedupe_key": row.dedupe_key,
                                     "url": webhook_url,
-                                    "message": payload_message,
                                     "status_code": response.status_code,
                                 },
                             )
@@ -195,13 +194,12 @@ async def dispatch_outbox_once(
                             row.status = "pending"
                             row.next_attempt_at = now + timedelta(seconds=retry_seconds)
                             logger.info(
-                                "outbox dispatch webhook failed",
+                                "outbox dispatch webhook retry",
                                 extra={
                                     "outbox_id": row.id,
                                     "admin_action_id": row.admin_action_id,
                                     "dedupe_key": row.dedupe_key,
                                     "url": webhook_url,
-                                    "message": payload_message,
                                     "error": row.last_error,
                                     "attempt_count": row.attempt_count,
                                     "next_attempt_at": row.next_attempt_at.isoformat(),
