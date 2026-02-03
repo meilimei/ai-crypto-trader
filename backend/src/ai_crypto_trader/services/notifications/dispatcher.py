@@ -14,22 +14,6 @@ from ai_crypto_trader.common.models import AdminAction, NotificationOutbox, utc_
 logger = logging.getLogger(__name__)
 
 
-def _next_backoff_seconds(attempt_count: int, base_seconds: int = 30, max_seconds: int = 3600) -> int:
-    # Exponential backoff with a reasonable cap.
-    base = max(attempt_count, 1)
-    return min(max_seconds, base_seconds * (2 ** (base - 1)))
-
-
-def _env_int(key: str, default: int) -> int:
-    raw = os.getenv(key)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
 def _env_float(key: str, default: float) -> float:
     raw = os.getenv(key)
     if raw is None or raw == "":
@@ -78,8 +62,7 @@ async def dispatch_outbox_once(
     now = now_utc or utc_now()
     webhook_url = (os.getenv("NOTIFICATIONS_WEBHOOK_URL") or "").strip()
     webhook_timeout = _env_float("NOTIFICATIONS_WEBHOOK_TIMEOUT_SECONDS", 5.0)
-    max_attempts = _env_int("NOTIFICATIONS_MAX_ATTEMPTS", 10)
-    retry_base_seconds = _env_int("NOTIFICATIONS_RETRY_BASE_SECONDS", 30)
+    retry_seconds = 60
     sent = 0
     failed = 0
     due_total_result = await session.execute(
@@ -97,7 +80,8 @@ async def dispatch_outbox_once(
     client: httpx.AsyncClient | None = None
     if webhook_url:
         try:
-            client = httpx.AsyncClient(timeout=webhook_timeout)
+            timeout = httpx.Timeout(webhook_timeout, connect=webhook_timeout, read=webhook_timeout)
+            client = httpx.AsyncClient(timeout=timeout)
         except Exception:
             logger.exception("outbox webhook client init failed")
             webhook_url = ""
@@ -109,14 +93,14 @@ async def dispatch_outbox_once(
             try:
                 resolved_channel = _resolve_channel(row)
                 channel = resolved_channel.lower()
+                payload_message = None
+                if isinstance(row.payload, dict):
+                    payload_message = row.payload.get("message")
+                    if payload_message is None:
+                        meta_message = row.payload.get("meta")
+                        if isinstance(meta_message, dict):
+                            payload_message = meta_message.get("message")
                 if channel in {"noop", "log"}:
-                    payload_message = None
-                    if isinstance(row.payload, dict):
-                        payload_message = row.payload.get("message")
-                        if payload_message is None:
-                            meta_message = row.payload.get("meta")
-                            if isinstance(meta_message, dict):
-                                payload_message = meta_message.get("message")
                     if channel == "log":
                         logger.info(
                             "outbox dispatch log",
@@ -161,14 +145,17 @@ async def dispatch_outbox_once(
                 elif channel == "webhook":
                     if not webhook_url:
                         row.status = "failed"
-                        row.last_error = "Webhook URL not configured"
-                        row.next_attempt_at = now
+                        row.last_error = "Missing NOTIFICATIONS_WEBHOOK_URL"
+                        row.next_attempt_at = now + timedelta(seconds=retry_seconds)
                         failed += 1
                         logger.info(
                             "outbox dispatch webhook failed",
                             extra={
                                 "outbox_id": row.id,
                                 "admin_action_id": row.admin_action_id,
+                                "dedupe_key": row.dedupe_key,
+                                "url": webhook_url,
+                                "message": payload_message,
                                 "error": row.last_error,
                                 "attempt_count": row.attempt_count,
                                 "next_attempt_at": row.next_attempt_at.isoformat(),
@@ -176,8 +163,16 @@ async def dispatch_outbox_once(
                         )
                     else:
                         payload_data = row.payload if isinstance(row.payload, dict) else {}
+                        webhook_body = {
+                            "outbox_id": row.id,
+                            "admin_action_id": row.admin_action_id,
+                            "dedupe_key": row.dedupe_key,
+                            "channel": resolved_channel,
+                            "status": row.status,
+                            "payload": payload_data,
+                        }
                         try:
-                            response = await client.post(webhook_url, json=payload_data) if client else None
+                            response = await client.post(webhook_url, json=webhook_body) if client else None
                             error = None
                         except Exception as exc:
                             response = None
@@ -190,33 +185,33 @@ async def dispatch_outbox_once(
                             logger.info(
                                 "outbox dispatch webhook ok",
                                 extra={
-                                    "outbox_id": row.id,
-                                    "admin_action_id": row.admin_action_id,
-                                    "status_code": response.status_code,
-                                },
-                            )
-                        else:
-                            if error is None and response is not None:
-                                error = f"HTTP {response.status_code}"
-                            row.last_error = error or "Webhook dispatch failed"
-                            if row.attempt_count >= max_attempts:
-                                row.status = "failed"
-                                failed += 1
-                            else:
-                                row.status = "pending"
-                            row.next_attempt_at = now + timedelta(
-                                seconds=_next_backoff_seconds(row.attempt_count, retry_base_seconds)
-                            )
-                            logger.info(
-                                "outbox dispatch webhook failed",
-                                extra={
-                                    "outbox_id": row.id,
-                                    "admin_action_id": row.admin_action_id,
-                                    "error": row.last_error,
-                                    "attempt_count": row.attempt_count,
-                                    "next_attempt_at": row.next_attempt_at.isoformat(),
-                                },
-                            )
+                                "outbox_id": row.id,
+                                "admin_action_id": row.admin_action_id,
+                                "dedupe_key": row.dedupe_key,
+                                "url": webhook_url,
+                                "message": payload_message,
+                                "status_code": response.status_code,
+                            },
+                        )
+                    else:
+                        if error is None and response is not None:
+                            error = f"HTTP {response.status_code}"
+                        row.last_error = error or "Webhook dispatch failed"
+                        row.status = "pending"
+                        row.next_attempt_at = now + timedelta(seconds=retry_seconds)
+                        logger.info(
+                            "outbox dispatch webhook failed",
+                            extra={
+                                "outbox_id": row.id,
+                                "admin_action_id": row.admin_action_id,
+                                "dedupe_key": row.dedupe_key,
+                                "url": webhook_url,
+                                "message": payload_message,
+                                "error": row.last_error,
+                                "attempt_count": row.attempt_count,
+                                "next_attempt_at": row.next_attempt_at.isoformat(),
+                            },
+                        )
                 else:
                     row.status = "failed"
                     row.last_error = f"Unsupported channel: {resolved_channel}"
@@ -225,9 +220,7 @@ async def dispatch_outbox_once(
             except Exception as exc:
                 row.last_error = str(exc)
                 row.status = "pending"
-                row.next_attempt_at = now + timedelta(
-                    seconds=_next_backoff_seconds(row.attempt_count, retry_base_seconds)
-                )
+                row.next_attempt_at = now + timedelta(seconds=retry_seconds)
     finally:
         if client is not None:
             await client.aclose()
