@@ -474,7 +474,6 @@ class PaperTraderRunner:
                         "pending_due_count": _stat_any(stats, ("pending_due_count", "pending_due")),
                         "pending_remaining": _stat_any(stats, ("pending_remaining",)),
                         "retried_count": _stat_any(stats, ("retried_count",), 0),
-                        "pending_remaining": _stat_any(stats, ("pending_remaining",)),
                         "duration_ms": duration_ms,
                         "limit": 50,
                     }
@@ -524,6 +523,7 @@ class PaperTraderRunner:
                             "failed_count": 0,
                             "retried_count": 0,
                             "pending_due_count": 0,
+                            "pending_remaining": 0,
                             "duration_ms": duration_ms,
                             "limit": 50,
                         }
