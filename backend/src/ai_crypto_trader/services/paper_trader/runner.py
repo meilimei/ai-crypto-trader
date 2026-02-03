@@ -5,7 +5,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import (
@@ -452,26 +452,40 @@ class PaperTraderRunner:
                         .where(AdminAction.dedupe_key == tick_dedupe_key)
                         .limit(1)
                     )
-                    if not existing_tick:
+                    def _stat(stats_obj, key, default=0):  # type: ignore[no-untyped-def]
+                        if hasattr(stats_obj, key):
+                            return getattr(stats_obj, key, default)
+                        if isinstance(stats_obj, dict):
+                            return stats_obj.get(key, default)
+                        return default
+
+                    meta = {
+                        "now_utc": now_utc.isoformat(),
+                        "picked_count": _stat(stats, "picked"),
+                        "sent_count": _stat(stats, "sent"),
+                        "failed_count": _stat(stats, "failed"),
+                        "pending_due_count": _stat(stats, "pending_due"),
+                        "pending_remaining": _stat(stats, "pending_remaining"),
+                        "duration_ms": duration_ms,
+                        "limit": 50,
+                    }
+                    if existing_tick:
+                        await session.execute(
+                            update(AdminAction)
+                            .where(AdminAction.id == existing_tick)
+                            .values(status="ok", message="Outbox dispatcher tick", meta=meta)
+                        )
+                    else:
                         session.add(
                             AdminAction(
                                 action="NOTIFICATIONS_OUTBOX_TICK",
                                 status="ok",
                                 message="Outbox dispatcher tick",
                                 dedupe_key=tick_dedupe_key,
-                                meta={
-                                    "now_utc": now_utc.isoformat(),
-                                    "picked_count": stats["picked"],
-                                    "sent_count": stats["sent"],
-                                    "failed_count": stats["failed"],
-                                    "pending_due_count": stats["pending_due"],
-                                    "pending_remaining": stats["pending_remaining"],
-                                    "duration_ms": duration_ms,
-                                    "limit": 50,
-                                },
+                                meta=meta,
                             )
                         )
-                        await session.commit()
+                    await session.commit()
                 except Exception as exc:
                     await session.rollback()
                     logger.exception("Notifications outbox dispatcher failed")
@@ -482,26 +496,33 @@ class PaperTraderRunner:
                             .where(AdminAction.dedupe_key == tick_dedupe_key)
                             .limit(1)
                         )
-                        if not existing_tick:
+                        error_meta = {
+                            "now_utc": now_utc.isoformat(),
+                            "error": str(exc),
+                            "picked_count": 0,
+                            "sent_count": 0,
+                            "failed_count": 0,
+                            "pending_due_count": 0,
+                            "duration_ms": duration_ms,
+                            "limit": 50,
+                        }
+                        if existing_tick:
+                            await session.execute(
+                                update(AdminAction)
+                                .where(AdminAction.id == existing_tick)
+                                .values(status="error", message="Outbox dispatcher failed", meta=error_meta)
+                            )
+                        else:
                             session.add(
                                 AdminAction(
                                     action="NOTIFICATIONS_OUTBOX_TICK",
                                     status="error",
                                     message="Outbox dispatcher failed",
                                     dedupe_key=tick_dedupe_key,
-                                    meta={
-                                        "now_utc": now_utc.isoformat(),
-                                        "error": str(exc),
-                                        "picked_count": 0,
-                                        "sent_count": 0,
-                                        "failed_count": 0,
-                                        "pending_due_count": 0,
-                                        "duration_ms": duration_ms,
-                                        "limit": 50,
-                                    },
+                                    meta=error_meta,
                                 )
                             )
-                            await session.commit()
+                        await session.commit()
                     except Exception:
                         logger.exception("Notifications outbox tick heartbeat write failed")
             await asyncio.sleep(max(poll_seconds, 1))
