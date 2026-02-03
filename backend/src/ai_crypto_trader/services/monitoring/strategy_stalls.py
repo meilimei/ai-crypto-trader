@@ -31,6 +31,7 @@ def _env_int_default(key: str, default: int) -> int:
 STALL_SECONDS = _env_int_default("STRATEGY_STALL_SECONDS", 900)
 ACTIVITY_GRACE_SECONDS = _env_int_default("STRATEGY_ACTIVITY_GRACE_SECONDS", 300)
 ALERT_THROTTLE_SECONDS = _env_int_default("STRATEGY_STALL_ALERT_THROTTLE_SECONDS", 1800)
+STRATEGY_ALERT_OUTBOX_CHANNEL = os.getenv("STRATEGY_ALERT_OUTBOX_CHANNEL", "log").strip() or "log"
 
 ACTIVITY_ACTIONS: tuple[str, ...] = (
     "SMOKE_TRADE",
@@ -446,9 +447,17 @@ async def maybe_alert_strategy_stalls(
                 )
                 if admin_action:
                     try:
+                        logger.info(
+                            "strategy alert enqueue outbox",
+                            extra={
+                                "admin_action_id": admin_action.id,
+                                "dedupe_key": admin_action.dedupe_key,
+                                "channel": STRATEGY_ALERT_OUTBOX_CHANNEL,
+                            },
+                        )
                         await enqueue_outbox_notification(
                             session,
-                            channel=None,
+                            channel=STRATEGY_ALERT_OUTBOX_CHANNEL,
                             admin_action=admin_action,
                             dedupe_key=admin_action.dedupe_key,
                             payload={
@@ -535,9 +544,17 @@ async def maybe_alert_strategy_stalls(
             )
             if admin_action:
                 try:
+                    logger.info(
+                        "strategy alert enqueue outbox",
+                        extra={
+                            "admin_action_id": admin_action.id,
+                            "dedupe_key": admin_action.dedupe_key,
+                            "channel": STRATEGY_ALERT_OUTBOX_CHANNEL,
+                        },
+                    )
                     await enqueue_outbox_notification(
                         session,
-                        channel=None,
+                        channel=STRATEGY_ALERT_OUTBOX_CHANNEL,
                         admin_action=admin_action,
                         dedupe_key=admin_action.dedupe_key,
                         payload={
