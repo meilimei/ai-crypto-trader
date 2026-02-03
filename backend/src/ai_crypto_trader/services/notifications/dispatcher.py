@@ -144,20 +144,15 @@ async def dispatch_outbox_once(
                     sent += 1
                 elif channel == "webhook":
                     if not webhook_url:
-                        row.status = "failed"
+                        row.status = "pending"
                         row.last_error = "Missing NOTIFICATIONS_WEBHOOK_URL"
                         row.next_attempt_at = now + timedelta(seconds=retry_seconds)
-                        failed += 1
                         logger.info(
-                            "outbox dispatch webhook failed",
+                            "outbox dispatch webhook missing url",
                             extra={
                                 "outbox_id": row.id,
                                 "admin_action_id": row.admin_action_id,
                                 "dedupe_key": row.dedupe_key,
-                                "url": webhook_url,
-                                "message": payload_message,
-                                "error": row.last_error,
-                                "attempt_count": row.attempt_count,
                                 "next_attempt_at": row.next_attempt_at.isoformat(),
                             },
                         )
@@ -185,33 +180,33 @@ async def dispatch_outbox_once(
                             logger.info(
                                 "outbox dispatch webhook ok",
                                 extra={
-                                "outbox_id": row.id,
-                                "admin_action_id": row.admin_action_id,
-                                "dedupe_key": row.dedupe_key,
-                                "url": webhook_url,
-                                "message": payload_message,
-                                "status_code": response.status_code,
-                            },
-                        )
-                    else:
-                        if error is None and response is not None:
-                            error = f"HTTP {response.status_code}"
-                        row.last_error = error or "Webhook dispatch failed"
-                        row.status = "pending"
-                        row.next_attempt_at = now + timedelta(seconds=retry_seconds)
-                        logger.info(
-                            "outbox dispatch webhook failed",
-                            extra={
-                                "outbox_id": row.id,
-                                "admin_action_id": row.admin_action_id,
-                                "dedupe_key": row.dedupe_key,
-                                "url": webhook_url,
-                                "message": payload_message,
-                                "error": row.last_error,
-                                "attempt_count": row.attempt_count,
-                                "next_attempt_at": row.next_attempt_at.isoformat(),
-                            },
-                        )
+                                    "outbox_id": row.id,
+                                    "admin_action_id": row.admin_action_id,
+                                    "dedupe_key": row.dedupe_key,
+                                    "url": webhook_url,
+                                    "message": payload_message,
+                                    "status_code": response.status_code,
+                                },
+                            )
+                        else:
+                            if error is None and response is not None:
+                                error = f"HTTP {response.status_code}"
+                            row.last_error = error or "Webhook dispatch failed"
+                            row.status = "pending"
+                            row.next_attempt_at = now + timedelta(seconds=retry_seconds)
+                            logger.info(
+                                "outbox dispatch webhook failed",
+                                extra={
+                                    "outbox_id": row.id,
+                                    "admin_action_id": row.admin_action_id,
+                                    "dedupe_key": row.dedupe_key,
+                                    "url": webhook_url,
+                                    "message": payload_message,
+                                    "error": row.last_error,
+                                    "attempt_count": row.attempt_count,
+                                    "next_attempt_at": row.next_attempt_at.isoformat(),
+                                },
+                            )
                 else:
                     row.status = "failed"
                     row.last_error = f"Unsupported channel: {resolved_channel}"
