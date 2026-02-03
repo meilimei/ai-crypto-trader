@@ -5,7 +5,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import (
@@ -448,7 +448,7 @@ class PaperTraderRunner:
                     stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
                     duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
                     existing_tick = await session.scalar(
-                        select(AdminAction.id)
+                        select(AdminAction)
                         .where(AdminAction.dedupe_key == tick_dedupe_key)
                         .limit(1)
                     )
@@ -470,11 +470,21 @@ class PaperTraderRunner:
                         "limit": 50,
                     }
                     if existing_tick:
-                        await session.execute(
-                            update(AdminAction)
-                            .where(AdminAction.id == existing_tick)
-                            .values(status="ok", message="Outbox dispatcher tick", meta=meta)
+                        existing_meta = existing_tick.meta if isinstance(existing_tick.meta, dict) else {}
+                        meta["picked_count"] += int(existing_meta.get("picked_count", 0) or 0)
+                        meta["sent_count"] += int(existing_meta.get("sent_count", 0) or 0)
+                        meta["failed_count"] += int(existing_meta.get("failed_count", 0) or 0)
+                        meta["pending_due_count"] = max(
+                            meta["pending_due_count"],
+                            int(existing_meta.get("pending_due_count", 0) or 0),
                         )
+                        meta["pending_remaining"] = max(
+                            meta["pending_remaining"],
+                            int(existing_meta.get("pending_remaining", 0) or 0),
+                        )
+                        existing_tick.status = "ok"
+                        existing_tick.message = "Outbox dispatcher tick"
+                        existing_tick.meta = meta
                     else:
                         session.add(
                             AdminAction(
@@ -492,7 +502,7 @@ class PaperTraderRunner:
                     try:
                         duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
                         existing_tick = await session.scalar(
-                            select(AdminAction.id)
+                            select(AdminAction)
                             .where(AdminAction.dedupe_key == tick_dedupe_key)
                             .limit(1)
                         )
@@ -507,11 +517,13 @@ class PaperTraderRunner:
                             "limit": 50,
                         }
                         if existing_tick:
-                            await session.execute(
-                                update(AdminAction)
-                                .where(AdminAction.id == existing_tick)
-                                .values(status="error", message="Outbox dispatcher failed", meta=error_meta)
-                            )
+                            existing_meta = existing_tick.meta if isinstance(existing_tick.meta, dict) else {}
+                            for key in ("picked_count", "sent_count", "failed_count", "pending_due_count"):
+                                error_meta[key] = int(existing_meta.get(key, 0) or 0)
+                            error_meta["pending_remaining"] = int(existing_meta.get("pending_remaining", 0) or 0)
+                            existing_tick.status = "error"
+                            existing_tick.message = "Outbox dispatcher failed"
+                            existing_tick.meta = error_meta
                         else:
                             session.add(
                                 AdminAction(
