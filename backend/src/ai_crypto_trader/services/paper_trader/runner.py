@@ -459,13 +459,22 @@ class PaperTraderRunner:
                             return stats_obj.get(key, default)
                         return default
 
+                    def _stat_any(stats_obj, keys, default=0):  # type: ignore[no-untyped-def]
+                        for key in keys:
+                            value = _stat(stats_obj, key, None)
+                            if value is not None:
+                                return value
+                        return default
+
                     meta = {
                         "now_utc": now_utc.isoformat(),
-                        "picked_count": _stat(stats, "picked"),
-                        "sent_count": _stat(stats, "sent"),
-                        "failed_count": _stat(stats, "failed"),
-                        "pending_due_count": _stat(stats, "pending_due"),
-                        "pending_remaining": _stat(stats, "pending_remaining"),
+                        "picked_count": _stat_any(stats, ("picked_count", "picked")),
+                        "sent_count": _stat_any(stats, ("sent_count", "sent")),
+                        "failed_count": _stat_any(stats, ("failed_count", "failed")),
+                        "pending_due_count": _stat_any(stats, ("pending_due_count", "pending_due")),
+                        "pending_remaining": _stat_any(stats, ("pending_remaining",)),
+                        "retried_count": _stat_any(stats, ("retried_count",), 0),
+                        "pending_remaining": _stat_any(stats, ("pending_remaining",)),
                         "duration_ms": duration_ms,
                         "limit": 50,
                     }
@@ -474,6 +483,7 @@ class PaperTraderRunner:
                         meta["picked_count"] += int(existing_meta.get("picked_count", 0) or 0)
                         meta["sent_count"] += int(existing_meta.get("sent_count", 0) or 0)
                         meta["failed_count"] += int(existing_meta.get("failed_count", 0) or 0)
+                        meta["retried_count"] += int(existing_meta.get("retried_count", 0) or 0)
                         meta["pending_due_count"] = max(
                             meta["pending_due_count"],
                             int(existing_meta.get("pending_due_count", 0) or 0),
@@ -512,13 +522,14 @@ class PaperTraderRunner:
                             "picked_count": 0,
                             "sent_count": 0,
                             "failed_count": 0,
+                            "retried_count": 0,
                             "pending_due_count": 0,
                             "duration_ms": duration_ms,
                             "limit": 50,
                         }
                         if existing_tick:
                             existing_meta = existing_tick.meta if isinstance(existing_tick.meta, dict) else {}
-                            for key in ("picked_count", "sent_count", "failed_count", "pending_due_count"):
+                            for key in ("picked_count", "sent_count", "failed_count", "retried_count", "pending_due_count"):
                                 error_meta[key] = int(existing_meta.get(key, 0) or 0)
                             error_meta["pending_remaining"] = int(existing_meta.get("pending_remaining", 0) or 0)
                             existing_tick.status = "error"
