@@ -441,48 +441,67 @@ class PaperTraderRunner:
         while self.is_running:
             started_at = datetime.now(timezone.utc)
             now_utc = started_at
+            tick_bucket = now_utc.strftime("%Y%m%d%H%M")
+            tick_dedupe_key = f"NOTIFICATIONS_OUTBOX_TICK:{tick_bucket}"
             async with AsyncSessionLocal() as session:
                 try:
                     stats = await dispatch_outbox_once(session, now_utc=now_utc, limit=50)
                     duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
-                    session.add(
-                        AdminAction(
-                            action="NOTIFICATIONS_OUTBOX_TICK",
-                            status="ok",
-                            message="Outbox dispatcher tick",
-                            meta={
-                                "now_utc": now_utc.isoformat(),
-                                "picked_count": stats["picked"],
-                                "sent_count": stats["sent"],
-                                "failed_count": stats["failed"],
-                                "pending_due_count": stats["pending_due"],
-                                "duration_ms": duration_ms,
-                            },
-                        )
+                    existing_tick = await session.scalar(
+                        select(AdminAction.id)
+                        .where(AdminAction.dedupe_key == tick_dedupe_key)
+                        .limit(1)
                     )
-                    await session.commit()
+                    if not existing_tick:
+                        session.add(
+                            AdminAction(
+                                action="NOTIFICATIONS_OUTBOX_TICK",
+                                status="ok",
+                                message="Outbox dispatcher tick",
+                                dedupe_key=tick_dedupe_key,
+                                meta={
+                                    "now_utc": now_utc.isoformat(),
+                                    "picked_count": stats["picked"],
+                                    "sent_count": stats["sent"],
+                                    "failed_count": stats["failed"],
+                                    "pending_due_count": stats["pending_due"],
+                                    "pending_remaining": stats["pending_remaining"],
+                                    "duration_ms": duration_ms,
+                                    "limit": 50,
+                                },
+                            )
+                        )
+                        await session.commit()
                 except Exception as exc:
                     await session.rollback()
                     logger.exception("Notifications outbox dispatcher failed")
                     try:
                         duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
-                        session.add(
-                            AdminAction(
-                                action="NOTIFICATIONS_OUTBOX_TICK",
-                                status="error",
-                                message="Outbox dispatcher failed",
-                                meta={
-                                    "now_utc": now_utc.isoformat(),
-                                    "error": str(exc),
-                                    "picked_count": 0,
-                                    "sent_count": 0,
-                                    "failed_count": 0,
-                                    "pending_due_count": 0,
-                                    "duration_ms": duration_ms,
-                                },
-                            )
+                        existing_tick = await session.scalar(
+                            select(AdminAction.id)
+                            .where(AdminAction.dedupe_key == tick_dedupe_key)
+                            .limit(1)
                         )
-                        await session.commit()
+                        if not existing_tick:
+                            session.add(
+                                AdminAction(
+                                    action="NOTIFICATIONS_OUTBOX_TICK",
+                                    status="error",
+                                    message="Outbox dispatcher failed",
+                                    dedupe_key=tick_dedupe_key,
+                                    meta={
+                                        "now_utc": now_utc.isoformat(),
+                                        "error": str(exc),
+                                        "picked_count": 0,
+                                        "sent_count": 0,
+                                        "failed_count": 0,
+                                        "pending_due_count": 0,
+                                        "duration_ms": duration_ms,
+                                        "limit": 50,
+                                    },
+                                )
+                            )
+                            await session.commit()
                     except Exception:
                         logger.exception("Notifications outbox tick heartbeat write failed")
             await asyncio.sleep(max(poll_seconds, 1))
