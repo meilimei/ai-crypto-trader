@@ -21,18 +21,15 @@ def upgrade() -> None:
         "DROP CONSTRAINT IF EXISTS uq_notifications_outbox_channel_dedupe_key"
     )
     op.execute("DROP INDEX IF EXISTS ux_notifications_outbox_channel_dedupe_key")
-    op.create_index(
-        "ix_notifications_outbox_channel_dedupe_key",
-        "notifications_outbox",
-        ["channel", "dedupe_key"],
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_notifications_outbox_channel_dedupe_key "
+        "ON public.notifications_outbox (channel, dedupe_key)"
     )
-    op.create_index(
-        "ix_notifications_outbox_status_next_attempt",
-        "notifications_outbox",
-        ["status", "next_attempt_at"],
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_notifications_outbox_status_next_attempt "
+        "ON public.notifications_outbox (status, next_attempt_at)"
     )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_notifications_outbox_status_next_attempt", table_name="notifications_outbox")
-    op.drop_index("ix_notifications_outbox_channel_dedupe_key", table_name="notifications_outbox")
+    op.execute("DROP INDEX IF EXISTS public.ix_notifications_outbox_channel_dedupe_key")
