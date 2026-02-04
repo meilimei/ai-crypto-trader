@@ -17,12 +17,14 @@ depends_on = None
 
 def upgrade() -> None:
     op.execute(
-        "ALTER TABLE notifications_outbox DROP CONSTRAINT IF EXISTS uq_notifications_outbox_admin_action_id"
+        "ALTER TABLE notifications_outbox "
+        "DROP CONSTRAINT IF EXISTS uq_notifications_outbox_channel_dedupe_key"
     )
     op.execute("DROP INDEX IF EXISTS ux_notifications_outbox_channel_dedupe_key")
-    op.execute(
-        "ALTER TABLE notifications_outbox "
-        "ADD CONSTRAINT uq_notifications_outbox_channel_dedupe_key UNIQUE (channel, dedupe_key)"
+    op.create_index(
+        "ix_notifications_outbox_channel_dedupe_key",
+        "notifications_outbox",
+        ["channel", "dedupe_key"],
     )
     op.create_index(
         "ix_notifications_outbox_status_next_attempt",
@@ -33,11 +35,4 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index("ix_notifications_outbox_status_next_attempt", table_name="notifications_outbox")
-    op.execute(
-        "ALTER TABLE notifications_outbox "
-        "DROP CONSTRAINT IF EXISTS uq_notifications_outbox_channel_dedupe_key"
-    )
-    op.execute(
-        "ALTER TABLE notifications_outbox "
-        "ADD CONSTRAINT uq_notifications_outbox_admin_action_id UNIQUE (admin_action_id)"
-    )
+    op.drop_index("ix_notifications_outbox_channel_dedupe_key", table_name="notifications_outbox")
