@@ -53,6 +53,7 @@ class EffectiveRiskPolicy:
     min_equity_usdt: Optional[Decimal]
     max_order_notional_usdt: Optional[Decimal]
     max_drawdown_usdt: Optional[Decimal]
+    max_leverage: Optional[Decimal]
     equity_lookback_hours: Optional[int]
     order_rate_limit_max: Optional[int]
     order_rate_limit_window_seconds: Optional[int]
@@ -66,6 +67,8 @@ class EffectivePositionPolicy:
     min_order_notional_usdt: Optional[Decimal]
     max_position_notional_per_symbol_usdt: Optional[Decimal]
     max_total_notional_usdt: Optional[Decimal]
+    max_position_qty: Optional[Decimal]
+    max_position_pct_equity: Optional[Decimal]
     source: str
     strategy_id: Optional[UUID]
 
@@ -84,6 +87,7 @@ async def get_effective_risk_policy(
     min_equity_usdt = _to_decimal(base_risk.min_equity_usdt)
     max_order_notional_usdt = _to_decimal(getattr(base_risk, "max_order_notional_usdt", None))
     max_drawdown_usdt = _to_decimal(getattr(base_risk, "max_drawdown_usdt", None))
+    max_leverage = _to_decimal(getattr(base_risk, "max_leverage", None))
     equity_lookback_hours = _to_int(getattr(base_risk, "equity_lookback_hours", None))
     order_rate_limit_max = _to_int(getattr(base_risk, "order_rate_limit_max", None))
     order_rate_limit_window_seconds = _to_int(getattr(base_risk, "order_rate_limit_window_seconds", None))
@@ -118,6 +122,7 @@ async def get_effective_risk_policy(
         min_equity_usdt=min_equity_usdt,
         max_order_notional_usdt=max_order_notional_usdt,
         max_drawdown_usdt=max_drawdown_usdt,
+        max_leverage=max_leverage,
         equity_lookback_hours=equity_lookback_hours,
         order_rate_limit_max=order_rate_limit_max,
         order_rate_limit_window_seconds=order_rate_limit_window_seconds,
@@ -139,6 +144,8 @@ async def get_effective_position_policy(
     min_order_notional_usdt = _to_decimal(base_pos.min_order_notional_usdt)
     max_position_notional_per_symbol_usdt = _to_decimal(base_pos.max_position_notional_per_symbol_usdt)
     max_total_notional_usdt = _to_decimal(base_pos.max_total_notional_usdt)
+    max_position_qty = _to_decimal(getattr(base_pos, "max_position_qty", None))
+    max_position_pct_equity = _to_decimal(getattr(base_pos, "max_position_pct_equity", None))
 
     if strategy_id_norm is not None:
         override = await session.scalar(
@@ -165,6 +172,8 @@ async def get_effective_position_policy(
         min_order_notional_usdt=min_order_notional_usdt,
         max_position_notional_per_symbol_usdt=max_position_notional_per_symbol_usdt,
         max_total_notional_usdt=max_total_notional_usdt,
+        max_position_qty=max_position_qty,
+        max_position_pct_equity=max_position_pct_equity,
         source=source,
         strategy_id=strategy_id_norm,
     )

@@ -62,9 +62,10 @@ async def check_equity_risk(
 ) -> dict | None:
     max_daily_loss = _to_decimal(getattr(policy, "max_daily_loss_usdt", None))
     max_drawdown = _to_decimal(getattr(policy, "max_drawdown_usdt", None))
+    max_drawdown_pct = _to_decimal(getattr(policy, "max_drawdown_pct", None))
     lookback_hours = _to_int(getattr(policy, "equity_lookback_hours", None)) or 24
 
-    if max_daily_loss is None and max_drawdown is None:
+    if max_daily_loss is None and max_drawdown is None and max_drawdown_pct is None:
         return None if not return_details else {"code": None, "reason": None, "details": None}
 
     try:
@@ -84,7 +85,7 @@ async def check_equity_risk(
         window_start = now - timedelta(hours=lookback_hours)
 
         peak_equity = None
-        if max_drawdown is not None:
+        if max_drawdown is not None or max_drawdown_pct is not None:
             peak = await session.scalar(
                 select(func.max(equity_expr))
                 .where(
@@ -131,6 +132,8 @@ async def check_equity_risk(
             "peak_equity": fmt_decimal(peak_equity),
             "drawdown_usdt": None,
             "max_drawdown_usdt": fmt_decimal(max_drawdown),
+            "drawdown_pct": None,
+            "max_drawdown_pct": fmt_decimal(max_drawdown_pct),
             "sod_equity": fmt_decimal(sod_equity),
             "daily_loss_usdt": None,
             "max_daily_loss_usdt": fmt_decimal(max_daily_loss),
@@ -156,6 +159,17 @@ async def check_equity_risk(
                 return make_reject(
                     "MAX_DRAWDOWN",
                     "Drawdown exceeds maximum",
+                    details,
+                )
+
+        if max_drawdown_pct is not None and peak_equity is not None and peak_equity > 0:
+            pct_limit = max_drawdown_pct / Decimal("100") if max_drawdown_pct > 1 else max_drawdown_pct
+            drawdown_pct = (peak_equity - current_equity) / peak_equity
+            details["drawdown_pct"] = fmt_decimal(drawdown_pct * Decimal("100"))
+            if drawdown_pct > pct_limit:
+                return make_reject(
+                    "MAX_DRAWDOWN_PCT",
+                    "Drawdown exceeds maximum percentage",
                     details,
                 )
 

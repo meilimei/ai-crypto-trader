@@ -414,9 +414,19 @@ class EquitySnapshot(Base):
 
 class RiskPolicy(Base):
     __tablename__ = "risk_policies"
-    __table_args__ = (Index("ix_risk_policies_is_active", "is_active"),)
+    __table_args__ = (
+        Index("ix_risk_policies_is_active", "is_active"),
+        Index("ix_risk_policies_name", "name"),
+        Index("ix_risk_policies_status", "status"),
+        UniqueConstraint("name", "version", name="ux_risk_policies_name_version"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(Text, default="active", server_default=text("'active'"))
+    params: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     max_loss_per_trade_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6))
     max_loss_per_day_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6))
     max_position_usd: Mapped[Decimal] = mapped_column(Numeric(18, 6))
@@ -435,6 +445,53 @@ class RiskPolicy(Base):
     strategies: Mapped[List["StrategyConfig"]] = relationship(
         back_populates="risk_policy", cascade="all, delete-orphan"
     )
+
+
+class PositionPolicyConfig(Base):
+    __tablename__ = "position_policies"
+    __table_args__ = (
+        Index("ix_position_policies_name", "name"),
+        Index("ix_position_policies_status", "status"),
+        UniqueConstraint("name", "version", name="ux_position_policies_name_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(Text, default="active", server_default=text("'active'"))
+    params: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, onupdate=utc_now
+    )
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class StrategyPolicyBinding(Base):
+    __tablename__ = "strategy_policy_bindings"
+    __table_args__ = (
+        Index("ix_strategy_policy_bindings_risk_policy_id", "risk_policy_id"),
+        Index("ix_strategy_policy_bindings_position_policy_id", "position_policy_id"),
+    )
+
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    risk_policy_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("risk_policies.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    position_policy_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("position_policies.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, onupdate=utc_now
+    )
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class StrategyConfig(Base):

@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_crypto_trader.common.models import RiskPolicy, StrategyConfig
+from ai_crypto_trader.common.models import PositionPolicyConfig, RiskPolicy, StrategyConfig
+from ai_crypto_trader.services.paper_trader.policy_bindings import get_bound_policies
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,11 @@ _cache_expiry: float = 0.0
 def _serialize_risk(policy: RiskPolicy) -> Dict[str, Any]:
     return {
         "id": policy.id,
+        "name": getattr(policy, "name", None),
+        "version": getattr(policy, "version", None),
+        "status": getattr(policy, "status", None),
+        "params": getattr(policy, "params", None),
+        "notes": getattr(policy, "notes", None),
         "max_loss_per_trade_usd": str(policy.max_loss_per_trade_usd),
         "max_loss_per_day_usd": str(policy.max_loss_per_day_usd),
         "max_position_usd": str(policy.max_position_usd),
@@ -92,6 +98,19 @@ def _serialize_risk(policy: RiskPolicy) -> Dict[str, Any]:
         "fee_bps": str(policy.fee_bps),
         "slippage_bps": str(policy.slippage_bps),
         "is_active": policy.is_active,
+        "created_at": policy.created_at.isoformat() if policy.created_at else None,
+        "updated_at": policy.updated_at.isoformat() if policy.updated_at else None,
+    }
+
+
+def _serialize_position(policy: PositionPolicyConfig) -> Dict[str, Any]:
+    return {
+        "id": str(policy.id),
+        "name": policy.name,
+        "version": policy.version,
+        "status": policy.status,
+        "params": policy.params,
+        "notes": policy.notes,
         "created_at": policy.created_at.isoformat() if policy.created_at else None,
         "updated_at": policy.updated_at.isoformat() if policy.updated_at else None,
     }
@@ -129,18 +148,31 @@ async def _load_active_bundle(session: AsyncSession) -> Dict[str, Any]:
         raise ActiveConfigMissingError("INVALID_STRATEGY")
     if strategy.min_notional_usd is None or Decimal(str(strategy.min_notional_usd)) <= 0:
         raise ActiveConfigMissingError("INVALID_STRATEGY")
-    if strategy.risk_policy_id is None:
-        raise ActiveConfigMissingError("NO_RISK_POLICY_ID")
+    bound = await get_bound_policies(session, strategy_config_id=strategy.id)
+    risk = None
+    position_policy = None
+    policy_source = "legacy"
+    if bound.risk_policy is not None:
+        risk = bound.risk_policy
+        policy_source = "binding"
+    elif strategy.risk_policy_id is not None:
+        risk = await session.get(RiskPolicy, strategy.risk_policy_id)
+        policy_source = "legacy"
+    if bound.position_policy is not None:
+        position_policy = bound.position_policy
+        if policy_source != "binding":
+            policy_source = "mixed"
 
-    risk = await session.get(RiskPolicy, strategy.risk_policy_id)
-    if not risk:
-        raise ActiveConfigMissingError("RISK_POLICY_NOT_FOUND")
-    if not risk.is_active:
+    if risk is None:
+        raise ActiveConfigMissingError("NO_RISK_POLICY_ID")
+    if getattr(risk, "status", "active") != "active" and not risk.is_active:
         raise ActiveConfigMissingError("RISK_POLICY_INACTIVE")
 
     return {
         "strategy_config": _serialize_strategy(strategy),
         "risk_policy": _serialize_risk(risk),
+        "position_policy": _serialize_position(position_policy) if position_policy else None,
+        "policy_source": policy_source,
     }
 
 

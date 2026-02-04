@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -10,15 +10,17 @@ from uuid import UUID
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_crypto_trader.common.models import Candle, PaperPosition, PaperTrade
+from ai_crypto_trader.common.models import Candle, EquitySnapshot, PaperPosition, PaperTrade
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.execution import ExecutionResult, execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.equity import compute_equity
 from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason, log_reject_throttled, make_reject
 from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
     get_effective_risk_policy,
 )
+from ai_crypto_trader.services.paper_trader.policy_bindings import get_bound_policies
 from ai_crypto_trader.services.monitoring.strategy_alerts import maybe_alert_strategy_reject_burst
 from ai_crypto_trader.services.paper_trader.rate_limit import check_and_record_rate_limit
 from ai_crypto_trader.services.paper_trader.symbol_limits import get_symbol_limit
@@ -52,6 +54,145 @@ def _reject_from_reason(reason: str) -> RejectReason:
     if reason_norm in {"SHORT_NOT_ALLOWED", "INSUFFICIENT_POSITION"}:
         return RejectReason(code=RejectCode.POSITION_LIMIT, reason="Position limits prevent this trade")
     return RejectReason(code=RejectCode.INTERNAL_ERROR, reason=reason or "Rejected")
+
+
+def _to_decimal(value: object | None) -> Optional[Decimal]:
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _to_int(value: object | None) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_strategy_config_id(value: object | None) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_pct(value: Decimal) -> Decimal:
+    return value / Decimal("100") if value > 1 else value
+
+
+async def _load_latest_equity_state(
+    session: AsyncSession,
+    *,
+    account_id: int,
+) -> dict[str, Decimal] | None:
+    row = await session.execute(
+        select(
+            EquitySnapshot.equity_usdt,
+            EquitySnapshot.positions_notional_usdt,
+        )
+        .where(EquitySnapshot.account_id == account_id)
+        .order_by(EquitySnapshot.created_at.desc())
+        .limit(1)
+    )
+    latest = row.first()
+    if latest and latest[0] is not None and latest[1] is not None:
+        return {
+            "equity_usdt": Decimal(str(latest[0])),
+            "positions_notional_usdt": Decimal(str(latest[1])),
+        }
+    data = await compute_equity(session, account_id, price_source="order_entry")
+    return {
+        "equity_usdt": Decimal(str(data.get("equity_usdt", "0"))),
+        "positions_notional_usdt": Decimal(str(data.get("positions_notional_usdt", "0"))),
+    }
+
+
+def _apply_risk_params(policy, params: dict) -> object:
+    if not params:
+        return policy
+    lookback_minutes = _to_int(params.get("lookback_minutes"))
+    lookback_hours = _to_int(params.get("equity_lookback_hours"))
+    if lookback_minutes is not None and lookback_minutes > 0:
+        lookback_hours = max(1, int(lookback_minutes / 60))
+    return replace(
+        policy,
+        max_drawdown_pct=_to_decimal(params.get("max_drawdown_pct", policy.max_drawdown_pct)),
+        max_daily_loss_usdt=_to_decimal(params.get("max_daily_loss_usdt", policy.max_daily_loss_usdt)),
+        max_order_notional_usdt=_to_decimal(
+            params.get("max_order_notional_usdt", policy.max_order_notional_usdt)
+        ),
+        max_drawdown_usdt=_to_decimal(params.get("max_drawdown_usdt", policy.max_drawdown_usdt)),
+        equity_lookback_hours=lookback_hours or policy.equity_lookback_hours,
+        max_leverage=_to_decimal(params.get("max_leverage", getattr(policy, "max_leverage", None))),
+    )
+
+
+def _resolve_position_params(
+    *,
+    params: dict,
+    symbol: str,
+) -> dict:
+    if not params:
+        return {}
+    default_params = params.get("default")
+    per_symbol = params.get("per_symbol")
+    merged: dict = {}
+    if isinstance(default_params, dict):
+        merged.update(default_params)
+    if isinstance(per_symbol, dict):
+        symbol_norm = normalize_symbol(symbol)
+        symbol_params = per_symbol.get(symbol_norm)
+        if symbol_params is None:
+            symbol_params = per_symbol.get(symbol_norm.upper())
+        if symbol_params is None and symbol:
+            symbol_params = per_symbol.get(symbol)
+        if isinstance(symbol_params, dict):
+            merged.update(symbol_params)
+    return merged
+
+
+def _apply_position_params(policy, params: dict, symbol: str) -> tuple[object, dict]:
+    if not params:
+        return policy, {}
+    merged = _resolve_position_params(params=params, symbol=symbol)
+    if not merged:
+        return policy, {}
+    return (
+        replace(
+            policy,
+            min_qty=_to_decimal(merged.get("min_qty", policy.min_qty)),
+            min_order_notional_usdt=_to_decimal(
+                merged.get("min_order_notional_usdt", policy.min_order_notional_usdt)
+            ),
+            max_position_notional_per_symbol_usdt=_to_decimal(
+                merged.get(
+                    "max_position_notional_usdt",
+                    policy.max_position_notional_per_symbol_usdt,
+                )
+            ),
+            max_total_notional_usdt=_to_decimal(
+                merged.get("max_total_notional_usdt", policy.max_total_notional_usdt)
+            ),
+            max_position_qty=_to_decimal(
+                merged.get("max_position_qty", getattr(policy, "max_position_qty", None))
+            ),
+            max_position_pct_equity=_to_decimal(
+                merged.get("max_position_pct_equity", getattr(policy, "max_position_pct_equity", None))
+            ),
+        ),
+        merged,
+    )
 
 
 async def _latest_price(session: AsyncSession, symbol: str) -> Optional[Decimal]:
@@ -122,6 +263,8 @@ async def place_order_unified(
     policy_source = "account_default"
     strategy_id_norm = strategy_id
     symbol_limit = None
+    bound_policy_meta: dict | None = None
+    position_params_overrides: dict = {}
 
     async def _log_reject(
         reject: RejectReason,
@@ -143,6 +286,12 @@ async def place_order_unified(
                     "max_position_notional_per_symbol_usdt": str(position_policy.max_position_notional_per_symbol_usdt)
                     if position_policy.max_position_notional_per_symbol_usdt is not None
                     else None,
+                    "max_position_qty": str(position_policy.max_position_qty)
+                    if getattr(position_policy, "max_position_qty", None) is not None
+                    else None,
+                    "max_position_pct_equity": str(position_policy.max_position_pct_equity)
+                    if getattr(position_policy, "max_position_pct_equity", None) is not None
+                    else None,
                     "max_total_notional_usdt": str(position_policy.max_total_notional_usdt)
                     if position_policy.max_total_notional_usdt is not None
                     else None,
@@ -159,6 +308,12 @@ async def place_order_unified(
                     else None,
                     "max_drawdown_usdt": str(risk_policy.max_drawdown_usdt)
                     if getattr(risk_policy, "max_drawdown_usdt", None) is not None
+                    else None,
+                    "max_drawdown_pct": str(risk_policy.max_drawdown_pct)
+                    if getattr(risk_policy, "max_drawdown_pct", None) is not None
+                    else None,
+                    "max_leverage": str(risk_policy.max_leverage)
+                    if getattr(risk_policy, "max_leverage", None) is not None
                     else None,
                     "equity_lookback_hours": str(risk_policy.equity_lookback_hours)
                     if getattr(risk_policy, "equity_lookback_hours", None) is not None
@@ -197,6 +352,8 @@ async def place_order_unified(
             "price_source": price_source or market_price_source,
             "notional": str(notional) if notional is not None else None,
             "policies": policy_snapshot,
+            "policy_binding": bound_policy_meta,
+            "position_policy_overrides": position_params_overrides if position_params_overrides else None,
             "policy_source": policy_source_local,
             "strategy_id": str(strategy_id_norm) if strategy_id_norm is not None else None,
             "symbol_limit_source": symbol_limit_source,
@@ -294,8 +451,37 @@ async def place_order_unified(
         await _log_reject(reject)
         return reject
 
+    strategy_config_id = _normalize_strategy_config_id(strategy_id)
     risk_policy = await get_effective_risk_policy(session, account_id, strategy_id_norm)
     position_policy = await get_effective_position_policy(session, account_id, strategy_id_norm)
+    bound_policy_meta = None
+    position_params_overrides = {}
+    if strategy_config_id is not None:
+        bound = await get_bound_policies(session, strategy_config_id=strategy_config_id)
+        if bound.risk_policy is not None:
+            risk_policy = _apply_risk_params(risk_policy, bound.risk_policy.params or {})
+            policy_source = "strategy_binding"
+        if bound.position_policy is not None:
+            position_policy, position_params_overrides = _apply_position_params(
+                position_policy,
+                bound.position_policy.params or {},
+                prepared.symbol,
+            )
+            policy_source = "strategy_binding"
+        if bound.risk_policy is not None or bound.position_policy is not None:
+            bound_policy_meta = {
+                "strategy_config_id": strategy_config_id,
+                "risk_policy": {
+                    "id": bound.risk_policy.id if bound.risk_policy else None,
+                    "name": bound.risk_policy.name if bound.risk_policy else None,
+                    "version": bound.risk_policy.version if bound.risk_policy else None,
+                },
+                "position_policy": {
+                    "id": str(bound.position_policy.id) if bound.position_policy else None,
+                    "name": bound.position_policy.name if bound.position_policy else None,
+                    "version": bound.position_policy.version if bound.position_policy else None,
+                },
+            }
     strategy_id_norm = (
         getattr(risk_policy, "strategy_id", None)
         or getattr(position_policy, "strategy_id", None)
@@ -467,6 +653,9 @@ async def place_order_unified(
     if (
         position_policy.max_position_notional_per_symbol_usdt is not None
         or position_policy.max_total_notional_usdt is not None
+        or getattr(position_policy, "max_position_qty", None) is not None
+        or getattr(position_policy, "max_position_pct_equity", None) is not None
+        or getattr(risk_policy, "max_leverage", None) is not None
         or (symbol_limit is not None and (symbol_limit.max_position_qty is not None or symbol_limit.max_position_notional_usdt is not None))
     ):
         current_qty = await session.scalar(
@@ -477,6 +666,9 @@ async def place_order_unified(
         current_qty_dec = Decimal(str(current_qty)) if current_qty is not None else Decimal("0")
         delta_qty = prepared.qty if side_norm == "buy" else -prepared.qty
         next_qty = current_qty_dec + delta_qty
+        next_notional = next_qty.copy_abs() * prepared.price
+    else:
+        next_notional = None
 
     if symbol_limit is not None and symbol_limit.max_position_qty is not None:
         max_pos_qty = Decimal(str(symbol_limit.max_position_qty))
@@ -500,10 +692,32 @@ async def place_order_unified(
             )
             return reject
 
+    policy_max_position_qty = getattr(position_policy, "max_position_qty", None)
+    if policy_max_position_qty is not None and next_qty is not None:
+        max_pos_qty = Decimal(str(policy_max_position_qty))
+        if max_pos_qty > 0 and next_qty.copy_abs() > max_pos_qty:
+            reject = RejectReason(
+                code=RejectCode.MAX_POSITION_QTY,
+                reason="Position quantity exceeds policy max",
+                details={
+                    "max_position_qty": str(max_pos_qty),
+                    "current_qty": str(current_qty_dec),
+                    "next_qty": str(next_qty),
+                    "qty": str(prepared.qty),
+                    "symbol": prepared.symbol,
+                },
+            )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
+
     if symbol_limit is not None and symbol_limit.max_position_notional_usdt is not None:
         limit_notional = Decimal(str(symbol_limit.max_position_notional_usdt))
-        if next_qty is not None:
-            next_notional = next_qty.copy_abs() * prepared.price
+        if next_notional is not None:
             if next_notional > limit_notional:
                 reject = RejectReason(
                     code=RejectCode.SYMBOL_MAX_POSITION_NOTIONAL,
@@ -528,8 +742,7 @@ async def place_order_unified(
 
     if position_policy.max_position_notional_per_symbol_usdt is not None:
         limit = Decimal(str(position_policy.max_position_notional_per_symbol_usdt))
-        next_notional = next_qty.copy_abs() * prepared.price
-        if next_notional > limit:
+        if next_notional is not None and next_notional > limit:
             reject = RejectReason(
                 code=RejectCode.MAX_POSITION_NOTIONAL,
                 reason="Position notional above maximum",
@@ -551,8 +764,48 @@ async def place_order_unified(
             )
             return reject
 
-    if position_policy.max_total_notional_usdt is not None:
-        limit = Decimal(str(position_policy.max_total_notional_usdt))
+    max_position_pct_equity = getattr(position_policy, "max_position_pct_equity", None)
+    max_leverage = getattr(risk_policy, "max_leverage", None)
+    equity_state = None
+    equity_usdt = None
+    if (max_position_pct_equity is not None or max_leverage is not None) and next_notional is not None:
+        equity_state = await _load_latest_equity_state(session, account_id=account_id)
+        if equity_state is not None:
+            equity_usdt = equity_state.get("equity_usdt")
+
+    if max_position_pct_equity is not None and next_notional is not None:
+        pct_raw = Decimal(str(max_position_pct_equity))
+        pct = _normalize_pct(pct_raw)
+        if equity_usdt is not None and equity_usdt > 0 and pct > 0:
+            cap = equity_usdt * pct
+            if next_notional > cap:
+                reject = RejectReason(
+                    code=RejectCode.MAX_POSITION_PCT_EQUITY,
+                    reason="Position exceeds equity percentage cap",
+                    details={
+                        "max_position_pct_equity": str(pct_raw),
+                        "equity_usdt": str(equity_usdt),
+                        "max_position_notional_usdt": str(cap),
+                        "next_notional": str(next_notional),
+                        "current_qty": str(current_qty_dec),
+                        "next_qty": str(next_qty),
+                        "qty": str(prepared.qty),
+                        "market_price": str(prepared.price),
+                    },
+                )
+                await _log_reject(
+                    reject,
+                    prepared=prepared,
+                    notional=next_notional,
+                    risk_policy=risk_policy,
+                    position_policy=position_policy,
+                )
+                return reject
+
+    if position_policy.max_total_notional_usdt is not None or max_leverage is not None:
+        limit = None
+        if position_policy.max_total_notional_usdt is not None:
+            limit = Decimal(str(position_policy.max_total_notional_usdt))
         positions = await session.execute(
             select(PaperPosition.symbol, PaperPosition.qty, PaperPosition.avg_entry_price)
             .where(PaperPosition.account_id == account_id)
@@ -567,7 +820,7 @@ async def place_order_unified(
                 qty_for_total = Decimal(str(qty_val or 0))
                 price_for_total = Decimal(str(avg_price or 0))
             total_notional += qty_for_total.copy_abs() * price_for_total
-        if total_notional > limit:
+        if limit is not None and total_notional > limit:
             reject = RejectReason(
                 code=RejectCode.POSITION_LIMIT,
                 reason="Account notional above maximum",
@@ -586,6 +839,33 @@ async def place_order_unified(
                 position_policy=position_policy,
             )
             return reject
+
+        if max_leverage is not None:
+            max_leverage_dec = Decimal(str(max_leverage))
+            if equity_usdt is None:
+                equity_state = equity_state or await _load_latest_equity_state(session, account_id=account_id)
+                equity_usdt = equity_state.get("equity_usdt") if equity_state else None
+            if equity_usdt is not None and equity_usdt > 0 and max_leverage_dec > 0:
+                if total_notional > equity_usdt * max_leverage_dec:
+                    reject = RejectReason(
+                        code=RejectCode.MAX_LEVERAGE,
+                        reason="Account leverage exceeds maximum",
+                        details={
+                            "max_leverage": str(max_leverage_dec),
+                            "equity_usdt": str(equity_usdt),
+                            "total_notional": str(total_notional),
+                            "qty": str(prepared.qty),
+                            "market_price": str(prepared.price),
+                        },
+                    )
+                    await _log_reject(
+                        reject,
+                        prepared=prepared,
+                        notional=total_notional,
+                        risk_policy=risk_policy,
+                        position_policy=position_policy,
+                    )
+                    return reject
 
     try:
         execution = await execute_market_order_with_costs(

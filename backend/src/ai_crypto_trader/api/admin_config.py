@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field, validator
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.api.admin_paper_trader import require_admin_token
@@ -21,6 +21,11 @@ def _dec(value: Decimal | float | int) -> Decimal:
 def serialize_risk_policy(policy: RiskPolicy) -> Dict[str, Any]:
     return {
         "id": policy.id,
+        "name": getattr(policy, "name", None),
+        "version": getattr(policy, "version", None),
+        "status": getattr(policy, "status", None),
+        "params": getattr(policy, "params", None),
+        "notes": getattr(policy, "notes", None),
         "max_loss_per_trade_usd": str(policy.max_loss_per_trade_usd),
         "max_loss_per_day_usd": str(policy.max_loss_per_day_usd),
         "max_position_usd": str(policy.max_position_usd),
@@ -98,7 +103,16 @@ async def get_active_config(session: AsyncSession = Depends(get_db_session)) -> 
 
 @router.post("/risk-policies")
 async def create_risk_policy(payload: RiskPolicyCreate, session: AsyncSession = Depends(get_db_session)) -> dict:
+    name = "legacy"
+    max_version = await session.scalar(select(func.max(RiskPolicy.version)).where(RiskPolicy.name == name))
+    version = int(max_version or 0) + 1
+    status = "active" if payload.is_active else "draft"
     policy = RiskPolicy(
+        name=name,
+        version=version,
+        status=status,
+        params={},
+        notes=None,
         max_loss_per_trade_usd=_dec(payload.max_loss_per_trade_usd),
         max_loss_per_day_usd=_dec(payload.max_loss_per_day_usd),
         max_position_usd=_dec(payload.max_position_usd),
@@ -168,6 +182,8 @@ async def activate_risk_policy(
 
     await session.execute(update(RiskPolicy).values(is_active=False))
     policy.is_active = True
+    if getattr(policy, "status", None):
+        policy.status = "active"
     await session.commit()
     await session.refresh(policy)
 
