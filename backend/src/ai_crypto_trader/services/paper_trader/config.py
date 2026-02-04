@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_crypto_trader.common.models import PositionPolicyConfig, RiskPolicy, StrategyConfig
-from ai_crypto_trader.services.paper_trader.policy_bindings import get_bound_policies
+from ai_crypto_trader.common.models import PositionPolicyConfig, RiskPolicy, StrategyConfig, StrategyPolicyBinding
+from ai_crypto_trader.services.policies.loader import load_position_policy, load_risk_policy
 
 
 logger = logging.getLogger(__name__)
@@ -133,14 +133,20 @@ def _serialize_strategy(strategy: StrategyConfig) -> Dict[str, Any]:
 
 
 async def _load_active_bundle(session: AsyncSession) -> Dict[str, Any]:
-    strategy = await session.scalar(
-        select(StrategyConfig)
-            .where(StrategyConfig.is_active.is_(True))
-            .order_by(StrategyConfig.updated_at.desc(), StrategyConfig.id.desc())
-            .limit(1)
+    row = await session.execute(
+        select(StrategyConfig, StrategyPolicyBinding)
+        .outerjoin(
+            StrategyPolicyBinding,
+            StrategyPolicyBinding.strategy_config_id == StrategyConfig.id,
+        )
+        .where(StrategyConfig.is_active.is_(True))
+        .order_by(StrategyConfig.updated_at.desc(), StrategyConfig.id.desc())
+        .limit(1)
     )
-    if not strategy:
+    record = row.first()
+    if not record:
         raise ActiveConfigMissingError("NO_ACTIVE_STRATEGY")
+    strategy, binding = record
 
     if not strategy.symbols:
         raise ActiveConfigMissingError("INVALID_STRATEGY")
@@ -148,20 +154,31 @@ async def _load_active_bundle(session: AsyncSession) -> Dict[str, Any]:
         raise ActiveConfigMissingError("INVALID_STRATEGY")
     if strategy.min_notional_usd is None or Decimal(str(strategy.min_notional_usd)) <= 0:
         raise ActiveConfigMissingError("INVALID_STRATEGY")
-    bound = await get_bound_policies(session, strategy_config_id=strategy.id)
     risk = None
     position_policy = None
     policy_source = "legacy"
-    if bound.risk_policy is not None:
-        risk = bound.risk_policy
+    bound_risk_policy_id = binding.risk_policy_id if binding else None
+    bound_position_policy_id = binding.position_policy_id if binding else None
+    effective_risk_policy_id = bound_risk_policy_id or strategy.risk_policy_id
+    if effective_risk_policy_id is not None:
+        risk = await load_risk_policy(session, policy_id=effective_risk_policy_id)
+    if bound_position_policy_id is not None:
+        position_policy = await load_position_policy(session, policy_id=bound_position_policy_id)
+    if bound_risk_policy_id is not None or bound_position_policy_id is not None:
         policy_source = "binding"
-    elif strategy.risk_policy_id is not None:
-        risk = await session.get(RiskPolicy, strategy.risk_policy_id)
-        policy_source = "legacy"
-    if bound.position_policy is not None:
-        position_policy = bound.position_policy
-        if policy_source != "binding":
+        if bound_risk_policy_id is None and bound_position_policy_id is not None:
             policy_source = "mixed"
+
+    logger.info(
+        "POLICY_RESOLVED",
+        extra={
+            "strategy_config_id": strategy.id,
+            "legacy_risk_policy_id": strategy.risk_policy_id,
+            "bound_risk_policy_id": bound_risk_policy_id,
+            "effective_risk_policy_id": effective_risk_policy_id,
+            "position_policy_id": str(bound_position_policy_id) if bound_position_policy_id else None,
+        },
+    )
 
     if risk is None:
         raise ActiveConfigMissingError("NO_RISK_POLICY_ID")

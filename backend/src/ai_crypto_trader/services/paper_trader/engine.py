@@ -15,6 +15,7 @@ from ai_crypto_trader.common.models import (
     PaperBalance,
     PaperPosition,
     EquitySnapshot,
+    StrategyConfig,
 )
 from ai_crypto_trader.services.llm_agent.config import LLMConfig
 from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceResponse, MarketSummary as AdviceMarketSummary, PerformanceSummary
@@ -83,9 +84,27 @@ class PaperTradingEngine:
             if self.peak_equity is None or equity > self.peak_equity:
                 self.peak_equity = equity
 
-            for symbol in self.config.symbols:
+            strategy_config = await session.scalar(
+                select(StrategyConfig)
+                .where(StrategyConfig.is_active.is_(True))
+                .order_by(StrategyConfig.updated_at.desc(), StrategyConfig.id.desc())
+                .limit(1)
+            )
+            strategy_config_id = strategy_config.id if strategy_config else None
+            symbols_for_cycle = (
+                strategy_config.symbols if strategy_config and strategy_config.symbols else self.config.symbols
+            )
+
+            for symbol in symbols_for_cycle:
                 try:
-                    await self._process_symbol(session, account.id, balance, equity, symbol)
+                    await self._process_symbol(
+                        session,
+                        account.id,
+                        balance,
+                        equity,
+                        symbol,
+                        strategy_config_id=strategy_config_id,
+                    )
                 except MissingGreenlet as exc:
                     await self._log_engine_error(session, account_id=account.id, symbol=symbol, exc=exc)
                     continue
@@ -129,6 +148,7 @@ class PaperTradingEngine:
         balance: PaperBalance,
         equity: Decimal,
         symbol: str,
+        strategy_config_id: int | None = None,
     ) -> None:
         summary_builder = MarketSummaryBuilder(session, self.config.exchange_name, self.config.timeframe)
         summary = await summary_builder.build(symbol)
@@ -213,6 +233,7 @@ class PaperTradingEngine:
                 symbol=symbol,
                 side=side,
                 qty=qty_dec,
+                strategy_id=strategy_config_id,
                 market_price=summary.last_close,
                 market_price_source="engine",
                 fee_bps=self.config.fee_bps,

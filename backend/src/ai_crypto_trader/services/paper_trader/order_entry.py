@@ -20,7 +20,11 @@ from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
     get_effective_risk_policy,
 )
-from ai_crypto_trader.services.paper_trader.policy_bindings import get_bound_policies
+from ai_crypto_trader.services.policies.loader import (
+    get_effective_policy_ids,
+    load_position_policy,
+    load_risk_policy,
+)
 from ai_crypto_trader.services.monitoring.strategy_alerts import maybe_alert_strategy_reject_burst
 from ai_crypto_trader.services.paper_trader.rate_limit import check_and_record_rate_limit
 from ai_crypto_trader.services.paper_trader.symbol_limits import get_symbol_limit
@@ -262,9 +266,36 @@ async def place_order_unified(
     price_source: Optional[str] = None
     policy_source = "account_default"
     strategy_id_norm = strategy_id
+    strategy_config_id = _normalize_strategy_config_id(strategy_id)
+    strategy_id_for_meta = (
+        str(strategy_config_id)
+        if strategy_config_id is not None
+        else (str(strategy_id_norm) if strategy_id_norm is not None else None)
+    )
     symbol_limit = None
     bound_policy_meta: dict | None = None
     position_params_overrides: dict = {}
+    policy_ids = None
+
+    if strategy_config_id is not None:
+        policy_ids = await get_effective_policy_ids(session, strategy_config_id=strategy_config_id)
+        if policy_ids is not None:
+            bound_policy_meta = {
+                "strategy_config_id": strategy_config_id,
+                "legacy_risk_policy_id": policy_ids.legacy_risk_policy_id,
+                "bound_risk_policy_id": policy_ids.bound_risk_policy_id,
+                "effective_risk_policy_id": policy_ids.effective_risk_policy_id,
+                "bound_position_policy_id": str(policy_ids.position_policy_id)
+                if policy_ids.position_policy_id
+                else None,
+                "effective_position_policy_id": str(policy_ids.position_policy_id)
+                if policy_ids.position_policy_id
+                else None,
+            }
+            if policy_ids.bound_risk_policy_id is not None or policy_ids.position_policy_id is not None:
+                policy_source = "binding"
+            elif policy_ids.effective_risk_policy_id is not None:
+                policy_source = "strategy_legacy"
 
     async def _log_reject(
         reject: RejectReason,
@@ -346,7 +377,8 @@ async def place_order_unified(
                 "side": side_norm,
                 "qty": str(qty),
                 "price_override": str(price_override) if price_override is not None else None,
-                "strategy_id": str(strategy_id_norm) if strategy_id_norm is not None else None,
+                "strategy_id": strategy_id_for_meta,
+                "strategy_config_id": strategy_config_id,
             },
             "market_price": str(prepared.price) if prepared is not None else str(market_price) if market_price is not None else None,
             "price_source": price_source or market_price_source,
@@ -355,7 +387,8 @@ async def place_order_unified(
             "policy_binding": bound_policy_meta,
             "position_policy_overrides": position_params_overrides if position_params_overrides else None,
             "policy_source": policy_source_local,
-            "strategy_id": str(strategy_id_norm) if strategy_id_norm is not None else None,
+            "strategy_id": strategy_id_for_meta,
+            "strategy_config_id": strategy_config_id,
             "symbol_limit_source": symbol_limit_source,
             "symbol_limits": {
                 "max_order_qty": str(symbol_limit.max_order_qty) if symbol_limit and symbol_limit.max_order_qty is not None else None,
@@ -393,6 +426,21 @@ async def place_order_unified(
         reject = RejectReason(code=RejectCode.SYMBOL_DISABLED, reason="Symbol not supported")
         await _log_reject(reject)
         return reject
+    if policy_ids is not None and policy_ids.strategy_symbols:
+        allowed = {normalize_symbol(sym) for sym in policy_ids.strategy_symbols if sym}
+        if allowed and symbol_norm not in allowed:
+            reject = RejectReason(
+                code=RejectCode.SYMBOL_DISABLED,
+                reason="Symbol not enabled for strategy",
+                details={
+                    "strategy_config_id": strategy_config_id,
+                    "symbol": symbol_norm,
+                    "allowlist_count": len(allowed),
+                    "allowlist_missing": True,
+                },
+            )
+            await _log_reject(reject)
+            return reject
     if side_norm not in {"buy", "sell"}:
         reject = RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
         await _log_reject(reject)
@@ -451,37 +499,27 @@ async def place_order_unified(
         await _log_reject(reject)
         return reject
 
-    strategy_config_id = _normalize_strategy_config_id(strategy_id)
     risk_policy = await get_effective_risk_policy(session, account_id, strategy_id_norm)
     position_policy = await get_effective_position_policy(session, account_id, strategy_id_norm)
-    bound_policy_meta = None
-    position_params_overrides = {}
-    if strategy_config_id is not None:
-        bound = await get_bound_policies(session, strategy_config_id=strategy_config_id)
-        if bound.risk_policy is not None:
-            risk_policy = _apply_risk_params(risk_policy, bound.risk_policy.params or {})
-            policy_source = "strategy_binding"
-        if bound.position_policy is not None:
-            position_policy, position_params_overrides = _apply_position_params(
-                position_policy,
-                bound.position_policy.params or {},
-                prepared.symbol,
+    if policy_ids is not None:
+        if policy_ids.effective_risk_policy_id is not None:
+            risk_policy_row = await load_risk_policy(
+                session,
+                policy_id=policy_ids.effective_risk_policy_id,
             )
-            policy_source = "strategy_binding"
-        if bound.risk_policy is not None or bound.position_policy is not None:
-            bound_policy_meta = {
-                "strategy_config_id": strategy_config_id,
-                "risk_policy": {
-                    "id": bound.risk_policy.id if bound.risk_policy else None,
-                    "name": bound.risk_policy.name if bound.risk_policy else None,
-                    "version": bound.risk_policy.version if bound.risk_policy else None,
-                },
-                "position_policy": {
-                    "id": str(bound.position_policy.id) if bound.position_policy else None,
-                    "name": bound.position_policy.name if bound.position_policy else None,
-                    "version": bound.position_policy.version if bound.position_policy else None,
-                },
-            }
+            if risk_policy_row is not None:
+                risk_policy = _apply_risk_params(risk_policy, risk_policy_row.params or {})
+        if policy_ids.position_policy_id is not None:
+            position_policy_row = await load_position_policy(
+                session,
+                policy_id=policy_ids.position_policy_id,
+            )
+            if position_policy_row is not None:
+                position_policy, position_params_overrides = _apply_position_params(
+                    position_policy,
+                    position_policy_row.params or {},
+                    prepared.symbol,
+                )
     strategy_id_norm = (
         getattr(risk_policy, "strategy_id", None)
         or getattr(position_policy, "strategy_id", None)
@@ -895,5 +933,5 @@ async def place_order_unified(
         prepared=prepared,
         price_source=price_source,
         policy_source=policy_source,
-        strategy_id=str(strategy_id_norm) if strategy_id_norm is not None else None,
+        strategy_id=strategy_id_for_meta,
     )
