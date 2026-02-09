@@ -781,6 +781,7 @@ async def place_order_unified(
 
     current_qty_dec = None
     next_qty = None
+    delta_qty = None
     if (
         position_policy_limits.get("max_position_notional_usdt") is not None
         or position_policy.max_total_notional_usdt is not None
@@ -834,6 +835,7 @@ async def place_order_unified(
                     "max_position_qty": str(max_pos_qty),
                     "limit": str(max_pos_qty),
                     "current_qty": str(current_qty_dec),
+                    "delta_qty": str(delta_qty) if delta_qty is not None else None,
                     "next_qty": str(next_qty),
                     "qty": str(prepared.qty),
                     "symbol": prepared.symbol,
@@ -886,6 +888,7 @@ async def place_order_unified(
                     "limit": str(limit),
                     "next_notional": str(next_notional),
                     "current_qty": str(current_qty_dec),
+                    "delta_qty": str(delta_qty) if delta_qty is not None else None,
                     "next_qty": str(next_qty),
                     "qty": str(prepared.qty),
                     "market_price": str(prepared.price),
@@ -927,6 +930,7 @@ async def place_order_unified(
                         "max_position_notional_usdt": str(cap),
                         "next_notional": str(next_notional),
                         "current_qty": str(current_qty_dec),
+                        "delta_qty": str(delta_qty) if delta_qty is not None else None,
                         "next_qty": str(next_qty),
                         "qty": str(prepared.qty),
                         "market_price": str(prepared.price),
@@ -1003,6 +1007,115 @@ async def place_order_unified(
                         reject,
                         prepared=prepared,
                         notional=total_notional,
+                        risk_policy=risk_policy,
+                        position_policy=position_policy,
+                    )
+                    return reject
+
+    # Final hard guard immediately before order creation to ensure position-policy
+    # limits cannot be bypassed by earlier path variance.
+    if (
+        position_policy_limits.get("max_position_notional_usdt") is not None
+        or position_policy_limits.get("max_position_qty") is not None
+        or position_policy_limits.get("max_position_pct_equity") is not None
+    ):
+        if current_qty_dec is None or next_qty is None or next_notional is None:
+            current_qty = await session.scalar(
+                select(PaperPosition.qty)
+                .where(PaperPosition.account_id == account_id, PaperPosition.symbol == prepared.symbol)
+                .limit(1)
+            )
+            current_qty_dec = Decimal(str(current_qty)) if current_qty is not None else Decimal("0")
+            delta_qty = prepared.qty if side_norm == "buy" else -prepared.qty
+            next_qty = current_qty_dec + delta_qty
+            next_notional = next_qty.copy_abs() * prepared.price
+
+        limit_qty = position_policy_limits.get("max_position_qty")
+        if limit_qty is not None and Decimal(str(limit_qty)) > 0 and next_qty.copy_abs() > Decimal(str(limit_qty)):
+            reject = RejectReason(
+                code=RejectCode.MAX_POSITION_QTY,
+                reason="Position quantity exceeds policy max",
+                details={
+                    "max_position_qty": str(limit_qty),
+                    "limit": str(limit_qty),
+                    "current_qty": str(current_qty_dec),
+                    "delta_qty": str(delta_qty),
+                    "next_qty": str(next_qty),
+                    "qty": str(prepared.qty),
+                    "symbol": prepared.symbol,
+                    "market_price": str(prepared.price),
+                    "next_notional": str(next_notional),
+                    "symbol_limit_source": position_policy_limit_source,
+                    "policy_binding": bound_policy_meta,
+                },
+            )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                notional=next_notional,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
+
+        limit_notional = position_policy_limits.get("max_position_notional_usdt")
+        if limit_notional is not None and Decimal(str(limit_notional)) > 0 and next_notional > Decimal(str(limit_notional)):
+            reject = RejectReason(
+                code=RejectCode.MAX_POSITION_NOTIONAL,
+                reason="Position notional above maximum",
+                details={
+                    "max_position_notional_usdt": str(limit_notional),
+                    "limit": str(limit_notional),
+                    "current_qty": str(current_qty_dec),
+                    "delta_qty": str(delta_qty),
+                    "next_qty": str(next_qty),
+                    "qty": str(prepared.qty),
+                    "market_price": str(prepared.price),
+                    "next_notional": str(next_notional),
+                    "symbol_limit_source": position_policy_limit_source,
+                    "policy_binding": bound_policy_meta,
+                },
+            )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                notional=next_notional,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
+
+        pct_limit = position_policy_limits.get("max_position_pct_equity")
+        if pct_limit is not None:
+            pct_raw = Decimal(str(pct_limit))
+            pct = _normalize_pct(pct_raw)
+            if equity_usdt is None:
+                equity_state = equity_state or await _load_latest_equity_state(session, account_id=account_id)
+                equity_usdt = equity_state.get("equity_usdt") if equity_state else None
+            if equity_usdt is not None and equity_usdt > 0 and pct > 0:
+                cap = equity_usdt * pct
+                if next_notional > cap:
+                    reject = RejectReason(
+                        code=RejectCode.MAX_POSITION_PCT_EQUITY,
+                        reason="Position exceeds equity percentage cap",
+                        details={
+                            "max_position_pct_equity": str(pct_raw),
+                            "limit": str(cap),
+                            "equity_usdt": str(equity_usdt),
+                            "current_qty": str(current_qty_dec),
+                            "delta_qty": str(delta_qty),
+                            "next_qty": str(next_qty),
+                            "qty": str(prepared.qty),
+                            "market_price": str(prepared.price),
+                            "next_notional": str(next_notional),
+                            "symbol_limit_source": position_policy_limit_source,
+                            "policy_binding": bound_policy_meta,
+                        },
+                    )
+                    await _log_reject(
+                        reject,
+                        prepared=prepared,
+                        notional=next_notional,
                         risk_policy=risk_policy,
                         position_policy=position_policy,
                     )
