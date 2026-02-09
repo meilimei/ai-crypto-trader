@@ -832,10 +832,13 @@ async def place_order_unified(
                 reason="Position quantity exceeds policy max",
                 details={
                     "max_position_qty": str(max_pos_qty),
+                    "limit": str(max_pos_qty),
                     "current_qty": str(current_qty_dec),
                     "next_qty": str(next_qty),
                     "qty": str(prepared.qty),
                     "symbol": prepared.symbol,
+                    "symbol_limit_source": position_policy_limit_source,
+                    "policy_binding": bound_policy_meta,
                 },
             )
             await _log_reject(
@@ -880,11 +883,14 @@ async def place_order_unified(
                 reason="Position notional above maximum",
                 details={
                     "max_position_notional_usdt": str(limit),
+                    "limit": str(limit),
                     "next_notional": str(next_notional),
                     "current_qty": str(current_qty_dec),
                     "next_qty": str(next_qty),
                     "qty": str(prepared.qty),
                     "market_price": str(prepared.price),
+                    "symbol_limit_source": position_policy_limit_source,
+                    "policy_binding": bound_policy_meta,
                 },
             )
             await _log_reject(
@@ -916,6 +922,7 @@ async def place_order_unified(
                     reason="Position exceeds equity percentage cap",
                     details={
                         "max_position_pct_equity": str(pct_raw),
+                        "limit": str(cap),
                         "equity_usdt": str(equity_usdt),
                         "max_position_notional_usdt": str(cap),
                         "next_notional": str(next_notional),
@@ -923,6 +930,8 @@ async def place_order_unified(
                         "next_qty": str(next_qty),
                         "qty": str(prepared.qty),
                         "market_price": str(prepared.price),
+                        "symbol_limit_source": position_policy_limit_source,
+                        "policy_binding": bound_policy_meta,
                     },
                 )
                 await _log_reject(
