@@ -331,6 +331,7 @@ class TestOrderRequest(BaseModel):
     side: str
     qty: Decimal | str
     price_override: Decimal | str | None = None
+    execute: bool = False
 
 
 class PaperAccountCreateRequest(BaseModel):
@@ -633,20 +634,6 @@ async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(
                 position_policy_overrides,
             ) = get_effective_position_limits(position_policy_row.params or {}, symbol_norm)
 
-    config = PaperTraderConfig.from_env()
-    result = await place_order_unified(
-        session,
-        account_id=payload.account_id,
-        symbol=payload.symbol,
-        side=payload.side,
-        qty=payload.qty,
-        strategy_id=payload.strategy_config_id,
-        price_override=payload.price_override,
-        fee_bps=config.fee_bps,
-        slippage_bps=config.slippage_bps,
-        meta={"origin": "admin_test_order"},
-    )
-
     policy_binding = {
         "strategy_config_id": payload.strategy_config_id,
         "legacy_risk_policy_id": policy_ids.legacy_risk_policy_id if policy_ids else None,
@@ -676,22 +663,316 @@ async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(
         "position_policy_overrides": position_policy_overrides,
     }
 
+    side_norm = (payload.side or "").strip().lower()
+    if side_norm not in {"buy", "sell"}:
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "error",
+            "test-order rejected",
+            meta={
+                "request": {
+                    "account_id": payload.account_id,
+                    "strategy_config_id": payload.strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": payload.side,
+                    "qty": str(payload.qty),
+                    "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                    "execute": bool(payload.execute),
+                },
+                "reject": reject.dict(),
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+                "dry_run": not bool(payload.execute),
+            },
+        )
+        return {"ok": False, "reject": reject.dict(), "policy_source": policy_source, "policy_binding": policy_binding, "computed_limits": computed_limits, "dry_run": not bool(payload.execute)}
+
+    try:
+        qty_dec = Decimal(str(payload.qty))
+    except Exception:
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="qty must be a valid decimal")
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "error",
+            "test-order rejected",
+            meta={
+                "request": {
+                    "account_id": payload.account_id,
+                    "strategy_config_id": payload.strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": payload.side,
+                    "qty": str(payload.qty),
+                    "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                    "execute": bool(payload.execute),
+                },
+                "reject": reject.dict(),
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+                "dry_run": not bool(payload.execute),
+            },
+        )
+        return {"ok": False, "reject": reject.dict(), "policy_source": policy_source, "policy_binding": policy_binding, "computed_limits": computed_limits, "dry_run": not bool(payload.execute)}
+    if qty_dec <= 0:
+        reject = RejectReason(code=RejectCode.QTY_ZERO, reason="qty must be positive")
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "error",
+            "test-order rejected",
+            meta={
+                "request": {
+                    "account_id": payload.account_id,
+                    "strategy_config_id": payload.strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": payload.side,
+                    "qty": str(payload.qty),
+                    "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                    "execute": bool(payload.execute),
+                },
+                "reject": reject.dict(),
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+                "dry_run": not bool(payload.execute),
+            },
+        )
+        return {"ok": False, "reject": reject.dict(), "policy_source": policy_source, "policy_binding": policy_binding, "computed_limits": computed_limits, "dry_run": not bool(payload.execute)}
+
+    if payload.price_override is not None:
+        try:
+            market_price = Decimal(str(payload.price_override))
+        except (InvalidOperation, TypeError, ValueError):
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price_override must be a valid decimal")
+            await _record_action(
+                session,
+                "ORDER_REJECTED",
+                "error",
+                "test-order rejected",
+                meta={
+                    "request": {
+                        "account_id": payload.account_id,
+                        "strategy_config_id": payload.strategy_config_id,
+                        "symbol": symbol_norm,
+                        "side": payload.side,
+                        "qty": str(payload.qty),
+                        "price_override": str(payload.price_override),
+                        "execute": bool(payload.execute),
+                    },
+                    "reject": reject.dict(),
+                    "policy_source": policy_source,
+                    "policy_binding": policy_binding,
+                    "computed_limits": computed_limits,
+                    "dry_run": not bool(payload.execute),
+                },
+            )
+            return {"ok": False, "reject": reject.dict(), "policy_source": policy_source, "policy_binding": policy_binding, "computed_limits": computed_limits, "dry_run": not bool(payload.execute)}
+    else:
+        market_price = await _latest_price(session, symbol_norm)
+    if market_price is None:
+        reject = RejectReason(code=RejectCode.SYMBOL_DISABLED, reason=f"No price data for symbol {symbol_norm}")
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "error",
+            "test-order rejected",
+            meta={
+                "request": {
+                    "account_id": payload.account_id,
+                    "strategy_config_id": payload.strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": payload.side,
+                    "qty": str(payload.qty),
+                    "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                    "execute": bool(payload.execute),
+                },
+                "reject": reject.dict(),
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+                "dry_run": not bool(payload.execute),
+            },
+        )
+        return {"ok": False, "reject": reject.dict(), "policy_source": policy_source, "policy_binding": policy_binding, "computed_limits": computed_limits, "dry_run": not bool(payload.execute)}
+    market_price = Decimal(str(market_price))
+
+    current_qty_val = await session.scalar(
+        select(PaperPosition.qty)
+        .where(PaperPosition.account_id == payload.account_id, PaperPosition.symbol == symbol_norm)
+        .limit(1)
+    )
+    current_qty = Decimal(str(current_qty_val)) if current_qty_val is not None else Decimal("0")
+    delta_qty = qty_dec if side_norm == "buy" else -qty_dec
+    next_qty = current_qty + delta_qty
+    next_notional = next_qty.copy_abs() * market_price
+
+    limit_notional = position_limits.get("max_position_notional_usdt")
+    if limit_notional is not None and Decimal(str(limit_notional)) > 0 and next_notional > Decimal(str(limit_notional)):
+        reject = RejectReason(
+            code=RejectCode.MAX_POSITION_NOTIONAL,
+            reason="Position notional above maximum",
+            details={
+                "current_qty": str(current_qty),
+                "delta_qty": str(delta_qty),
+                "next_qty": str(next_qty),
+                "market_price": str(market_price),
+                "next_notional": str(next_notional),
+                "limit": str(limit_notional),
+                "symbol_limit_source": position_limits_source,
+                "policy_binding": policy_binding,
+            },
+        )
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "error",
+            "test-order rejected",
+            meta={
+                "request": {
+                    "account_id": payload.account_id,
+                    "strategy_config_id": payload.strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": payload.side,
+                    "qty": str(payload.qty),
+                    "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                    "execute": bool(payload.execute),
+                },
+                "reject": reject.dict(),
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+                "dry_run": not bool(payload.execute),
+            },
+        )
+        return {"ok": False, "reject": reject.dict(), "policy_source": policy_source, "policy_binding": policy_binding, "computed_limits": computed_limits, "dry_run": not bool(payload.execute)}
+
+    config = PaperTraderConfig.from_env()
+    if not payload.execute:
+        await _record_action(
+            session,
+            "ORDER_SIMULATED",
+            "ok",
+            "test-order simulated",
+            meta={
+                "request": {
+                    "account_id": payload.account_id,
+                    "strategy_config_id": payload.strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": payload.side,
+                    "qty": str(payload.qty),
+                    "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                    "execute": False,
+                },
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+                "simulation": {
+                    "current_qty": str(current_qty),
+                    "delta_qty": str(delta_qty),
+                    "next_qty": str(next_qty),
+                    "market_price": str(market_price),
+                    "next_notional": str(next_notional),
+                },
+                "dry_run": True,
+            },
+        )
+        return {
+            "ok": True,
+            "policy_source": policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+            "dry_run": True,
+            "execution": None,
+        }
+
+    result = await place_order_unified(
+        session,
+        account_id=payload.account_id,
+        symbol=payload.symbol,
+        side=payload.side,
+        qty=payload.qty,
+        strategy_id=payload.strategy_config_id,
+        price_override=payload.price_override,
+        fee_bps=config.fee_bps,
+        slippage_bps=config.slippage_bps,
+        meta={"origin": "admin_test_order"},
+    )
+
     if isinstance(result, RejectReason):
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "error",
+            "test-order rejected",
+            meta={
+                "request": {
+                    "account_id": payload.account_id,
+                    "strategy_config_id": payload.strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": payload.side,
+                    "qty": str(payload.qty),
+                    "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                    "execute": True,
+                },
+                "reject": result.dict(),
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+                "dry_run": False,
+            },
+        )
         return {
             "ok": False,
             "reject": result.dict(),
             "policy_source": policy_source,
             "policy_binding": policy_binding,
             "computed_limits": computed_limits,
+            "dry_run": False,
         }
 
     execution = result.execution
     prepared = result.prepared
+    await session.commit()
+    await _record_action(
+        session,
+        "ORDER_SIMULATED",
+        "ok",
+        "test-order executed",
+        meta={
+            "request": {
+                "account_id": payload.account_id,
+                "strategy_config_id": payload.strategy_config_id,
+                "symbol": symbol_norm,
+                "side": payload.side,
+                "qty": str(payload.qty),
+                "price_override": str(payload.price_override) if payload.price_override is not None else None,
+                "execute": True,
+            },
+            "policy_source": result.policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+            "execution": {
+                "order_id": execution.order.id,
+                "trade_id": execution.trade.id,
+                "symbol": prepared.symbol,
+                "side": execution.order.side,
+                "qty": str(prepared.qty),
+                "price": str(prepared.price),
+                "price_source": result.price_source,
+            },
+            "dry_run": False,
+        },
+    )
     return {
         "ok": True,
         "policy_source": result.policy_source,
         "policy_binding": policy_binding,
         "computed_limits": computed_limits,
+        "dry_run": False,
         "execution": {
             "order_id": execution.order.id,
             "trade_id": execution.trade.id,
