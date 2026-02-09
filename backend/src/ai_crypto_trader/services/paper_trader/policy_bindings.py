@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_crypto_trader.common.models import PositionPolicyConfig, RiskPolicy, StrategyPolicyBinding
+from ai_crypto_trader.common.models import PositionPolicyConfig, RiskPolicy, StrategyConfig, StrategyPolicyBinding
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ async def create_risk_policy_version(
     name: str,
     params: dict | None = None,
     notes: str | None = None,
-    status: str = "active",
+    status: str = "draft",
 ) -> RiskPolicy:
     max_version = await session.scalar(
         select(func.max(RiskPolicy.version)).where(RiskPolicy.name == name)
@@ -71,7 +71,7 @@ async def create_position_policy_version(
     name: str,
     params: dict | None = None,
     notes: str | None = None,
-    status: str = "active",
+    status: str = "draft",
 ) -> PositionPolicyConfig:
     max_version = await session.scalar(
         select(func.max(PositionPolicyConfig.version)).where(PositionPolicyConfig.name == name)
@@ -144,6 +144,114 @@ async def bind_strategy_policy(
         "position_policy_id": binding.position_policy_id,
     }
     return binding, {"old": old_meta, "new": new_meta}
+
+
+async def activate_risk_policy_version(
+    session: AsyncSession,
+    *,
+    policy_id: int,
+) -> tuple[RiskPolicy, RiskPolicy | None]:
+    policy = await session.get(RiskPolicy, policy_id)
+    if policy is None:
+        raise ValueError("risk_policy_not_found")
+
+    previous_active = await session.scalar(
+        select(RiskPolicy)
+        .where(
+            RiskPolicy.name == policy.name,
+            RiskPolicy.is_active.is_(True),
+            RiskPolicy.id != policy.id,
+        )
+        .order_by(RiskPolicy.version.desc())
+        .limit(1)
+    )
+
+    await session.execute(
+        update(RiskPolicy)
+        .where(RiskPolicy.name == policy.name)
+        .values(is_active=False)
+    )
+    policy.is_active = True
+    policy.status = "active"
+    await session.flush()
+    return policy, previous_active
+
+
+async def activate_position_policy_version(
+    session: AsyncSession,
+    *,
+    policy_id: object,
+) -> tuple[PositionPolicyConfig, PositionPolicyConfig | None]:
+    policy = await session.get(PositionPolicyConfig, policy_id)
+    if policy is None:
+        raise ValueError("position_policy_not_found")
+
+    previous_active = await session.scalar(
+        select(PositionPolicyConfig)
+        .where(
+            PositionPolicyConfig.name == policy.name,
+            PositionPolicyConfig.status == "active",
+            PositionPolicyConfig.id != policy.id,
+        )
+        .order_by(PositionPolicyConfig.version.desc())
+        .limit(1)
+    )
+    await session.execute(
+        update(PositionPolicyConfig)
+        .where(
+            PositionPolicyConfig.name == policy.name,
+            PositionPolicyConfig.id != policy.id,
+            PositionPolicyConfig.status == "active",
+        )
+        .values(status="archived")
+    )
+    policy.status = "active"
+    await session.flush()
+    return policy, previous_active
+
+
+async def get_risk_policy_by_name_version(
+    session: AsyncSession,
+    *,
+    name: str,
+    version: int,
+) -> RiskPolicy | None:
+    return await session.scalar(
+        select(RiskPolicy)
+        .where(
+            RiskPolicy.name == name,
+            RiskPolicy.version == version,
+        )
+        .limit(1)
+    )
+
+
+async def get_position_policy_by_name_version(
+    session: AsyncSession,
+    *,
+    name: str,
+    version: int,
+) -> PositionPolicyConfig | None:
+    return await session.scalar(
+        select(PositionPolicyConfig)
+        .where(
+            PositionPolicyConfig.name == name,
+            PositionPolicyConfig.version == version,
+        )
+        .limit(1)
+    )
+
+
+async def get_effective_binding_context(
+    session: AsyncSession,
+    *,
+    strategy_config_id: int,
+) -> tuple[StrategyConfig | None, StrategyPolicyBinding | None]:
+    strategy = await session.get(StrategyConfig, strategy_config_id)
+    if strategy is None:
+        return None, None
+    binding = await session.get(StrategyPolicyBinding, strategy_config_id)
+    return strategy, binding
 
 
 async def get_bound_policies(

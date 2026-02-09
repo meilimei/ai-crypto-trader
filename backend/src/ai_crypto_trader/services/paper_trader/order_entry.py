@@ -142,32 +142,62 @@ def _apply_risk_params(policy, params: dict) -> object:
     )
 
 
+def merge_policy_params(
+    params: dict | None,
+    symbol: str,
+) -> tuple[dict, str | None, dict | None]:
+    if not isinstance(params, dict) or not params:
+        return {}, None, None
+
+    default_params = params.get("default")
+    per_symbol = params.get("per_symbol")
+    has_structured = isinstance(default_params, dict) or isinstance(per_symbol, dict)
+
+    merged: dict = {}
+    source: str | None = None
+    symbol_override: dict | None = None
+
+    if has_structured:
+        inline_defaults = {
+            key: value
+            for key, value in params.items()
+            if key not in {"default", "per_symbol"}
+        }
+        if inline_defaults:
+            merged.update(inline_defaults)
+            source = "default"
+        if isinstance(default_params, dict):
+            merged.update(default_params)
+            source = "default"
+
+        if isinstance(per_symbol, dict):
+            symbol_norm = normalize_symbol(symbol)
+            symbol_params = per_symbol.get(symbol_norm)
+            if symbol_params is None:
+                symbol_params = per_symbol.get(symbol_norm.upper())
+            if symbol_params is None and symbol:
+                symbol_params = per_symbol.get(symbol)
+            if isinstance(symbol_params, dict):
+                merged.update(symbol_params)
+                symbol_override = dict(symbol_params)
+                source = "per_symbol"
+        return merged, source, symbol_override
+
+    # Backward-compatible flat policy params: treat as default.
+    return dict(params), "default", None
+
+
 def _resolve_position_params(
     *,
     params: dict,
     symbol: str,
 ) -> tuple[dict, str | None, dict | None]:
-    if not params:
-        return {}, None, None
-    default_params = params.get("default")
-    per_symbol = params.get("per_symbol")
-    merged: dict = {}
-    source: str | None = None
-    symbol_override: dict | None = None
-    if isinstance(default_params, dict):
-        merged.update(default_params)
+    merged, raw_source, symbol_override = merge_policy_params(params, symbol)
+    source = None
+    if raw_source == "default":
         source = "position_policy.default"
-    if isinstance(per_symbol, dict):
-        symbol_norm = normalize_symbol(symbol)
-        symbol_params = per_symbol.get(symbol_norm)
-        if symbol_params is None:
-            symbol_params = per_symbol.get(symbol_norm.upper())
-        if symbol_params is None and symbol:
-            symbol_params = per_symbol.get(symbol)
-        if isinstance(symbol_params, dict):
-            merged.update(symbol_params)
-            symbol_override = dict(symbol_params)
-            source = "position_policy.per_symbol"
+    elif raw_source == "per_symbol":
+        source = "position_policy.per_symbol"
     return merged, source, symbol_override
 
 
@@ -314,6 +344,8 @@ async def place_order_unified(
     }
     position_policy_limit_source: str | None = None
     position_policy_symbol_override: dict | None = None
+    risk_policy_limit_source: str | None = None
+    risk_policy_symbol_override: dict | None = None
 
     if strategy_config_id is not None:
         policy_ids = await get_effective_policy_ids(session, strategy_config_id=strategy_config_id)
@@ -460,6 +492,8 @@ async def place_order_unified(
             "policies": policy_snapshot,
             "policy_binding": bound_policy_meta,
             "position_policy_overrides": position_policy_symbol_override,
+            "risk_policy_source": risk_policy_limit_source,
+            "risk_policy_overrides": risk_policy_symbol_override,
             "policy_source": policy_source_local,
             "strategy_id": strategy_id_for_meta,
             "strategy_config_id": strategy_config_id,
@@ -576,7 +610,16 @@ async def place_order_unified(
                 policy_id=policy_ids.effective_risk_policy_id,
             )
             if risk_policy_row is not None:
-                risk_policy = _apply_risk_params(risk_policy, risk_policy_row.params or {})
+                risk_params, risk_source_raw, risk_symbol_override = merge_policy_params(
+                    risk_policy_row.params or {},
+                    prepared.symbol,
+                )
+                if risk_source_raw == "default":
+                    risk_policy_limit_source = "risk_policy.default"
+                elif risk_source_raw == "per_symbol":
+                    risk_policy_limit_source = "risk_policy.per_symbol"
+                risk_policy_symbol_override = risk_symbol_override
+                risk_policy = _apply_risk_params(risk_policy, risk_params)
         if policy_ids.position_policy_id is not None:
             if bound_position_policy_row is None:
                 bound_position_policy_row = await load_position_policy(
@@ -685,10 +728,17 @@ async def place_order_unified(
         now_utc=datetime.now(timezone.utc),
     )
     if equity_reject:
+        details = equity_reject.get("details") or {}
+        if not isinstance(details, dict):
+            details = {"raw_details": str(details)}
+        details = dict(details)
+        details["policy_binding"] = bound_policy_meta
+        details["risk_policy_source"] = risk_policy_limit_source
+        details["risk_policy_overrides"] = risk_policy_symbol_override
         reject = RejectReason(
             code=RejectCode(equity_reject.get("code")),
             reason=equity_reject.get("reason", "Equity risk limit exceeded"),
-            details=equity_reject.get("details"),
+            details=details,
         )
         await _log_reject(
             reject,
@@ -992,6 +1042,9 @@ async def place_order_unified(
                 equity_usdt = equity_state.get("equity_usdt") if equity_state else None
             if equity_usdt is not None and equity_usdt > 0 and max_leverage_dec > 0:
                 if total_notional > equity_usdt * max_leverage_dec:
+                    leverage = (
+                        (total_notional / equity_usdt) if equity_usdt and equity_usdt > 0 else None
+                    )
                     reject = RejectReason(
                         code=RejectCode.MAX_LEVERAGE,
                         reason="Account leverage exceeds maximum",
@@ -999,8 +1052,12 @@ async def place_order_unified(
                             "max_leverage": str(max_leverage_dec),
                             "equity_usdt": str(equity_usdt),
                             "total_notional": str(total_notional),
+                            "leverage": str(leverage) if leverage is not None else None,
                             "qty": str(prepared.qty),
                             "market_price": str(prepared.price),
+                            "policy_binding": bound_policy_meta,
+                            "risk_policy_source": risk_policy_limit_source,
+                            "risk_policy_overrides": risk_policy_symbol_override,
                         },
                     )
                     await _log_reject(
