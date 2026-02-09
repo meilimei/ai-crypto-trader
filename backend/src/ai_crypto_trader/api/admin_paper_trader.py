@@ -700,15 +700,38 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
     next_qty = current_qty + delta_qty
     next_notional = next_qty.copy_abs() * market_price
 
+    limit_qty = position_limits.get("max_position_qty")
+    if limit_qty is not None and Decimal(str(limit_qty)) > 0 and next_qty.copy_abs() > Decimal(str(limit_qty)):
+        reject = RejectReason(
+            code=RejectCode.MAX_POSITION_QTY,
+            reason="Position quantity exceeds policy max",
+            details={
+                "current_qty": str(current_qty),
+                "delta_qty": str(delta_qty),
+                "next_qty": str(next_qty),
+                "market_price": str(market_price),
+                "next_notional": str(next_notional),
+                "limit": str(limit_qty),
+                "max_position_qty": str(limit_qty),
+                "symbol_limit_source": position_limits_source,
+                "policy_binding": policy_binding,
+            },
+        )
+        return await _reject_smoke(reject)
+
     limit_notional = position_limits.get("max_position_notional_usdt")
     if limit_notional is not None and Decimal(str(limit_notional)) > 0 and next_notional > Decimal(str(limit_notional)):
         reject = RejectReason(
             code=RejectCode.MAX_POSITION_NOTIONAL,
             reason="Position notional above maximum",
             details={
+                "current_qty": str(current_qty),
+                "delta_qty": str(delta_qty),
+                "next_qty": str(next_qty),
                 "qty": str(qty_dec),
                 "market_price": str(market_price),
                 "next_notional": str(next_notional),
+                "limit": str(limit_notional),
                 "max_position_notional_usdt": str(limit_notional),
                 "symbol_limit_source": position_limits_source,
                 "policy_binding": policy_binding,
