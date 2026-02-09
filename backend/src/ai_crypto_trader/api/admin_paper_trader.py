@@ -36,7 +36,11 @@ from ai_crypto_trader.services.paper_trader.config import get_active_bundle, Act
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
-from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
+from ai_crypto_trader.services.paper_trader.order_entry import (
+    get_effective_position_limits,
+    place_order_unified,
+)
+from ai_crypto_trader.services.policies.loader import get_effective_policy_ids, load_position_policy
 from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
@@ -320,6 +324,15 @@ class SmokeTradeRequest(BaseModel):
     strategy_id: str | None = None
 
 
+class TestOrderRequest(BaseModel):
+    account_id: int
+    strategy_config_id: int
+    symbol: str
+    side: str
+    qty: Decimal | str
+    price_override: Decimal | str | None = None
+
+
 class PaperAccountCreateRequest(BaseModel):
     initial_cash_usd: Decimal | None = None
 
@@ -586,6 +599,108 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         if balance
         else None,
         "reconcile": report,
+    }
+
+
+@router.post("/test-order")
+async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
+    symbol_norm = normalize_symbol(payload.symbol)
+    policy_ids = await get_effective_policy_ids(
+        session,
+        strategy_config_id=payload.strategy_config_id,
+    )
+
+    policy_source = "account_default"
+    if policy_ids is not None:
+        if policy_ids.bound_risk_policy_id is not None or policy_ids.position_policy_id is not None:
+            policy_source = "binding"
+        elif policy_ids.effective_risk_policy_id is not None:
+            policy_source = "strategy_legacy"
+
+    position_limits = {
+        "max_position_qty": None,
+        "max_position_notional_usdt": None,
+        "max_position_pct_equity": None,
+    }
+    position_limits_source = None
+    position_policy_overrides = None
+    if policy_ids is not None and policy_ids.position_policy_id is not None:
+        position_policy_row = await load_position_policy(session, policy_id=policy_ids.position_policy_id)
+        if position_policy_row is not None:
+            (
+                position_limits,
+                position_limits_source,
+                position_policy_overrides,
+            ) = get_effective_position_limits(position_policy_row.params or {}, symbol_norm)
+
+    config = PaperTraderConfig.from_env()
+    result = await place_order_unified(
+        session,
+        account_id=payload.account_id,
+        symbol=payload.symbol,
+        side=payload.side,
+        qty=payload.qty,
+        strategy_id=payload.strategy_config_id,
+        price_override=payload.price_override,
+        fee_bps=config.fee_bps,
+        slippage_bps=config.slippage_bps,
+        meta={"origin": "admin_test_order"},
+    )
+
+    policy_binding = {
+        "strategy_config_id": payload.strategy_config_id,
+        "legacy_risk_policy_id": policy_ids.legacy_risk_policy_id if policy_ids else None,
+        "bound_risk_policy_id": policy_ids.bound_risk_policy_id if policy_ids else None,
+        "effective_risk_policy_id": policy_ids.effective_risk_policy_id if policy_ids else None,
+        "bound_position_policy_id": str(policy_ids.position_policy_id)
+        if policy_ids and policy_ids.position_policy_id
+        else None,
+        "effective_position_policy_id": str(policy_ids.position_policy_id)
+        if policy_ids and policy_ids.position_policy_id
+        else None,
+    }
+    computed_limits = {
+        "symbol_limits": {
+            "max_order_qty": None,
+            "max_position_qty": str(position_limits["max_position_qty"])
+            if position_limits.get("max_position_qty") is not None
+            else None,
+            "max_position_notional_usdt": str(position_limits["max_position_notional_usdt"])
+            if position_limits.get("max_position_notional_usdt") is not None
+            else None,
+            "max_position_pct_equity": str(position_limits["max_position_pct_equity"])
+            if position_limits.get("max_position_pct_equity") is not None
+            else None,
+        },
+        "symbol_limit_source": position_limits_source,
+        "position_policy_overrides": position_policy_overrides,
+    }
+
+    if isinstance(result, RejectReason):
+        return {
+            "ok": False,
+            "reject": result.dict(),
+            "policy_source": policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+        }
+
+    execution = result.execution
+    prepared = result.prepared
+    return {
+        "ok": True,
+        "policy_source": result.policy_source,
+        "policy_binding": policy_binding,
+        "computed_limits": computed_limits,
+        "execution": {
+            "order_id": execution.order.id,
+            "trade_id": execution.trade.id,
+            "symbol": prepared.symbol,
+            "side": execution.order.side,
+            "qty": str(prepared.qty),
+            "price": str(prepared.price),
+            "price_source": result.price_source,
+        },
     }
 
 

@@ -146,14 +146,17 @@ def _resolve_position_params(
     *,
     params: dict,
     symbol: str,
-) -> dict:
+) -> tuple[dict, str | None, dict | None]:
     if not params:
-        return {}
+        return {}, None, None
     default_params = params.get("default")
     per_symbol = params.get("per_symbol")
     merged: dict = {}
+    source: str | None = None
+    symbol_override: dict | None = None
     if isinstance(default_params, dict):
         merged.update(default_params)
+        source = "position_policy.default"
     if isinstance(per_symbol, dict):
         symbol_norm = normalize_symbol(symbol)
         symbol_params = per_symbol.get(symbol_norm)
@@ -163,13 +166,41 @@ def _resolve_position_params(
             symbol_params = per_symbol.get(symbol)
         if isinstance(symbol_params, dict):
             merged.update(symbol_params)
-    return merged
+            symbol_override = dict(symbol_params)
+            source = "position_policy.per_symbol"
+    return merged, source, symbol_override
+
+
+def get_effective_position_limits(
+    position_policy_params: dict | None,
+    symbol_normalized: str,
+) -> tuple[dict[str, Decimal | None], str | None, dict | None]:
+    if not isinstance(position_policy_params, dict):
+        return (
+            {
+                "max_position_qty": None,
+                "max_position_notional_usdt": None,
+                "max_position_pct_equity": None,
+            },
+            None,
+            None,
+        )
+    merged, source, symbol_override = _resolve_position_params(
+        params=position_policy_params,
+        symbol=symbol_normalized,
+    )
+    limits = {
+        "max_position_qty": _to_decimal(merged.get("max_position_qty")),
+        "max_position_notional_usdt": _to_decimal(merged.get("max_position_notional_usdt")),
+        "max_position_pct_equity": _to_decimal(merged.get("max_position_pct_equity")),
+    }
+    return limits, source, symbol_override
 
 
 def _apply_position_params(policy, params: dict, symbol: str) -> tuple[object, dict]:
     if not params:
         return policy, {}
-    merged = _resolve_position_params(params=params, symbol=symbol)
+    merged, _, _ = _resolve_position_params(params=params, symbol=symbol)
     if not merged:
         return policy, {}
     return (
@@ -274,8 +305,15 @@ async def place_order_unified(
     )
     symbol_limit = None
     bound_policy_meta: dict | None = None
-    position_params_overrides: dict = {}
     policy_ids = None
+    bound_position_policy_row = None
+    position_policy_limits = {
+        "max_position_qty": None,
+        "max_position_notional_usdt": None,
+        "max_position_pct_equity": None,
+    }
+    position_policy_limit_source: str | None = None
+    position_policy_symbol_override: dict | None = None
 
     if strategy_config_id is not None:
         policy_ids = await get_effective_policy_ids(session, strategy_config_id=strategy_config_id)
@@ -296,6 +334,20 @@ async def place_order_unified(
                 policy_source = "binding"
             elif policy_ids.effective_risk_policy_id is not None:
                 policy_source = "strategy_legacy"
+            if policy_ids.position_policy_id is not None:
+                bound_position_policy_row = await load_position_policy(
+                    session,
+                    policy_id=policy_ids.position_policy_id,
+                )
+                if bound_position_policy_row is not None:
+                    (
+                        position_policy_limits,
+                        position_policy_limit_source,
+                        position_policy_symbol_override,
+                    ) = get_effective_position_limits(
+                        bound_position_policy_row.params or {},
+                        symbol_norm,
+                    )
 
     async def _log_reject(
         reject: RejectReason,
@@ -364,7 +416,29 @@ async def place_order_unified(
             or getattr(position_policy, "source", None) == "strategy_override"
         ):
             policy_source_local = "strategy_override"
-        symbol_limit_source = getattr(symbol_limit, "source", None)
+        symbol_limit_source = position_policy_limit_source
+        symbol_limits_payload = {
+            "max_order_qty": None,
+            "max_position_qty": None,
+            "max_position_notional_usdt": None,
+            "max_position_pct_equity": None,
+        }
+        if symbol_limit is not None and symbol_limit.max_order_qty is not None:
+            symbol_limits_payload["max_order_qty"] = str(symbol_limit.max_order_qty)
+        if position_policy_limits.get("max_position_qty") is not None:
+            symbol_limits_payload["max_position_qty"] = str(position_policy_limits["max_position_qty"])
+        elif symbol_limit is not None and symbol_limit.max_position_qty is not None:
+            symbol_limits_payload["max_position_qty"] = str(symbol_limit.max_position_qty)
+        if position_policy_limits.get("max_position_notional_usdt") is not None:
+            symbol_limits_payload["max_position_notional_usdt"] = str(
+                position_policy_limits["max_position_notional_usdt"]
+            )
+        elif symbol_limit is not None and symbol_limit.max_position_notional_usdt is not None:
+            symbol_limits_payload["max_position_notional_usdt"] = str(symbol_limit.max_position_notional_usdt)
+        if position_policy_limits.get("max_position_pct_equity") is not None:
+            symbol_limits_payload["max_position_pct_equity"] = str(
+                position_policy_limits["max_position_pct_equity"]
+            )
         payload = {
             "message": "Execution skipped" if reject_action_type == "ORDER_SKIPPED" else "Order rejected",
             "reject": reject_payload,
@@ -385,18 +459,12 @@ async def place_order_unified(
             "notional": str(notional) if notional is not None else None,
             "policies": policy_snapshot,
             "policy_binding": bound_policy_meta,
-            "position_policy_overrides": position_params_overrides if position_params_overrides else None,
+            "position_policy_overrides": position_policy_symbol_override,
             "policy_source": policy_source_local,
             "strategy_id": strategy_id_for_meta,
             "strategy_config_id": strategy_config_id,
             "symbol_limit_source": symbol_limit_source,
-            "symbol_limits": {
-                "max_order_qty": str(symbol_limit.max_order_qty) if symbol_limit and symbol_limit.max_order_qty is not None else None,
-                "max_position_qty": str(symbol_limit.max_position_qty) if symbol_limit and symbol_limit.max_position_qty is not None else None,
-                "max_position_notional_usdt": str(symbol_limit.max_position_notional_usdt)
-                if symbol_limit and symbol_limit.max_position_notional_usdt is not None
-                else None,
-            },
+            "symbol_limits": symbol_limits_payload,
         }
         if extra_meta:
             payload.update(extra_meta)
@@ -510,16 +578,41 @@ async def place_order_unified(
             if risk_policy_row is not None:
                 risk_policy = _apply_risk_params(risk_policy, risk_policy_row.params or {})
         if policy_ids.position_policy_id is not None:
-            position_policy_row = await load_position_policy(
-                session,
-                policy_id=policy_ids.position_policy_id,
-            )
-            if position_policy_row is not None:
-                position_policy, position_params_overrides = _apply_position_params(
+            if bound_position_policy_row is None:
+                bound_position_policy_row = await load_position_policy(
+                    session,
+                    policy_id=policy_ids.position_policy_id,
+                )
+            if bound_position_policy_row is not None:
+                position_policy, _ = _apply_position_params(
                     position_policy,
-                    position_policy_row.params or {},
+                    bound_position_policy_row.params or {},
                     prepared.symbol,
                 )
+                (
+                    position_policy_limits,
+                    position_policy_limit_source,
+                    position_policy_symbol_override,
+                ) = get_effective_position_limits(
+                    bound_position_policy_row.params or {},
+                    prepared.symbol,
+                )
+    if position_policy_limits.get("max_position_qty") is None and getattr(position_policy, "max_position_qty", None) is not None:
+        position_policy_limits["max_position_qty"] = _to_decimal(getattr(position_policy, "max_position_qty", None))
+    if (
+        position_policy_limits.get("max_position_notional_usdt") is None
+        and getattr(position_policy, "max_position_notional_per_symbol_usdt", None) is not None
+    ):
+        position_policy_limits["max_position_notional_usdt"] = _to_decimal(
+            getattr(position_policy, "max_position_notional_per_symbol_usdt", None)
+        )
+    if (
+        position_policy_limits.get("max_position_pct_equity") is None
+        and getattr(position_policy, "max_position_pct_equity", None) is not None
+    ):
+        position_policy_limits["max_position_pct_equity"] = _to_decimal(
+            getattr(position_policy, "max_position_pct_equity", None)
+        )
     strategy_id_norm = (
         getattr(risk_policy, "strategy_id", None)
         or getattr(position_policy, "strategy_id", None)
@@ -689,10 +782,10 @@ async def place_order_unified(
     current_qty_dec = None
     next_qty = None
     if (
-        position_policy.max_position_notional_per_symbol_usdt is not None
+        position_policy_limits.get("max_position_notional_usdt") is not None
         or position_policy.max_total_notional_usdt is not None
-        or getattr(position_policy, "max_position_qty", None) is not None
-        or getattr(position_policy, "max_position_pct_equity", None) is not None
+        or position_policy_limits.get("max_position_qty") is not None
+        or position_policy_limits.get("max_position_pct_equity") is not None
         or getattr(risk_policy, "max_leverage", None) is not None
         or (symbol_limit is not None and (symbol_limit.max_position_qty is not None or symbol_limit.max_position_notional_usdt is not None))
     ):
@@ -730,7 +823,7 @@ async def place_order_unified(
             )
             return reject
 
-    policy_max_position_qty = getattr(position_policy, "max_position_qty", None)
+    policy_max_position_qty = position_policy_limits.get("max_position_qty")
     if policy_max_position_qty is not None and next_qty is not None:
         max_pos_qty = Decimal(str(policy_max_position_qty))
         if max_pos_qty > 0 and next_qty.copy_abs() > max_pos_qty:
@@ -778,8 +871,9 @@ async def place_order_unified(
                 )
                 return reject
 
-    if position_policy.max_position_notional_per_symbol_usdt is not None:
-        limit = Decimal(str(position_policy.max_position_notional_per_symbol_usdt))
+    policy_max_position_notional = position_policy_limits.get("max_position_notional_usdt")
+    if policy_max_position_notional is not None:
+        limit = Decimal(str(policy_max_position_notional))
         if next_notional is not None and next_notional > limit:
             reject = RejectReason(
                 code=RejectCode.MAX_POSITION_NOTIONAL,
@@ -802,7 +896,7 @@ async def place_order_unified(
             )
             return reject
 
-    max_position_pct_equity = getattr(position_policy, "max_position_pct_equity", None)
+    max_position_pct_equity = position_policy_limits.get("max_position_pct_equity")
     max_leverage = getattr(risk_policy, "max_leverage", None)
     equity_state = None
     equity_usdt = None
