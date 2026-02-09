@@ -98,6 +98,23 @@ def _reject_from_reason(reason: str) -> RejectReason:
     return RejectReason(code=RejectCode.INTERNAL_ERROR, reason=reason or "Rejected")
 
 
+def _resolve_strategy_config_id(
+    *,
+    strategy_config_id: int | None,
+    strategy_id: str | None,
+) -> int | None:
+    if strategy_config_id is not None:
+        return int(strategy_config_id)
+    if strategy_id is None:
+        return None
+    text_value = str(strategy_id).strip()
+    if not text_value:
+        return None
+    if text_value.isdigit():
+        return int(text_value)
+    return None
+
+
 router = APIRouter(prefix="/admin/paper-trader", tags=["admin"], dependencies=[Depends(require_admin_token)])
 admin_router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin_token)])
 
@@ -321,7 +338,9 @@ class SmokeTradeRequest(BaseModel):
     side: str = "buy"
     qty: Decimal = Decimal("0.01")
     price: str | None = None
+    price_override: str | None = None
     strategy_id: str | None = None
+    strategy_config_id: int | None = None
 
 
 class TestOrderRequest(BaseModel):
@@ -508,11 +527,194 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
     }
 
 
-async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -> dict:
+async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -> dict | JSONResponse:
     # Self-test: NEW_ID=3 smoke buy 0.01 + sell 0.005 (with price), then verify positions/balances,
     # reconcile?account_id=3 diff_count ok, /status has no InvalidStateError, admin_actions meta serializes.
     symbol_in = (payload.symbol or "ETHUSDT").strip()
+    symbol_norm = normalize_symbol(symbol_in)
     side = (payload.side or "buy").lower().strip()
+    strategy_config_id = _resolve_strategy_config_id(
+        strategy_config_id=payload.strategy_config_id,
+        strategy_id=payload.strategy_id,
+    )
+    price_override_value = payload.price_override if payload.price_override is not None else payload.price
+
+    policy_source = "account_default"
+    policy_binding = {
+        "strategy_config_id": strategy_config_id,
+        "legacy_risk_policy_id": None,
+        "bound_risk_policy_id": None,
+        "effective_risk_policy_id": None,
+        "bound_position_policy_id": None,
+        "effective_position_policy_id": None,
+    }
+    position_limits = {
+        "max_position_qty": None,
+        "max_position_notional_usdt": None,
+        "max_position_pct_equity": None,
+    }
+    position_limits_source = None
+    position_policy_overrides = None
+    computed_limits = {
+        "symbol_limits": {
+            "max_order_qty": None,
+            "max_position_qty": None,
+            "max_position_notional_usdt": None,
+            "max_position_pct_equity": None,
+        },
+        "symbol_limit_source": None,
+        "position_policy_overrides": None,
+    }
+
+    request_meta = {
+        "account_id": payload.account_id,
+        "strategy_id": payload.strategy_id,
+        "strategy_config_id": strategy_config_id,
+        "symbol_in": symbol_in,
+        "symbol_normalized": symbol_norm,
+        "side": side,
+        "qty": str(payload.qty),
+        "price_override": str(price_override_value) if price_override_value is not None else None,
+    }
+
+    async def _reject_smoke(reject: RejectReason, *, status_code: int = 400):
+        await log_order_rejected_throttled(
+            session,
+            account_id=payload.account_id,
+            symbol=symbol_norm,
+            reject_code=str(reject.code),
+            reject_reason=reject.reason,
+            meta={
+                "message": "Smoke trade rejected",
+                "request": request_meta,
+                "reject": reject.dict(),
+                "policy_source": policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+            },
+            window_seconds=120,
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content=jsonable_encoder(
+                {
+                    "ok": False,
+                    "reject": reject.dict(),
+                    "policy_source": policy_source,
+                    "policy_binding": policy_binding,
+                    "computed_limits": computed_limits,
+                }
+            ),
+        )
+
+    if strategy_config_id is None:
+        reject = RejectReason(
+            code=RejectCode.INTERNAL_ERROR,
+            reason="Unable to resolve strategy_config_id",
+            details={
+                "strategy_id": payload.strategy_id,
+                "strategy_config_id": payload.strategy_config_id,
+            },
+        )
+        return await _reject_smoke(reject)
+
+    policy_ids = await get_effective_policy_ids(
+        session,
+        strategy_config_id=strategy_config_id,
+    )
+    if policy_ids is not None:
+        if policy_ids.bound_risk_policy_id is not None or policy_ids.position_policy_id is not None:
+            policy_source = "binding"
+        elif policy_ids.effective_risk_policy_id is not None:
+            policy_source = "strategy_legacy"
+        policy_binding = {
+            "strategy_config_id": strategy_config_id,
+            "legacy_risk_policy_id": policy_ids.legacy_risk_policy_id,
+            "bound_risk_policy_id": policy_ids.bound_risk_policy_id,
+            "effective_risk_policy_id": policy_ids.effective_risk_policy_id,
+            "bound_position_policy_id": str(policy_ids.position_policy_id) if policy_ids.position_policy_id else None,
+            "effective_position_policy_id": str(policy_ids.position_policy_id) if policy_ids.position_policy_id else None,
+        }
+        if policy_ids.position_policy_id is not None:
+            position_policy_row = await load_position_policy(session, policy_id=policy_ids.position_policy_id)
+            if position_policy_row is not None:
+                (
+                    position_limits,
+                    position_limits_source,
+                    position_policy_overrides,
+                ) = get_effective_position_limits(position_policy_row.params or {}, symbol_norm)
+
+    computed_limits = {
+        "symbol_limits": {
+            "max_order_qty": None,
+            "max_position_qty": str(position_limits["max_position_qty"])
+            if position_limits.get("max_position_qty") is not None
+            else None,
+            "max_position_notional_usdt": str(position_limits["max_position_notional_usdt"])
+            if position_limits.get("max_position_notional_usdt") is not None
+            else None,
+            "max_position_pct_equity": str(position_limits["max_position_pct_equity"])
+            if position_limits.get("max_position_pct_equity") is not None
+            else None,
+        },
+        "symbol_limit_source": position_limits_source,
+        "position_policy_overrides": position_policy_overrides,
+    }
+
+    if side not in {"buy", "sell"}:
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
+        return await _reject_smoke(reject)
+
+    try:
+        qty_dec = Decimal(str(payload.qty))
+    except (InvalidOperation, TypeError, ValueError):
+        reject = RejectReason(code=RejectCode.INVALID_QTY, reason="qty must be a valid decimal")
+        return await _reject_smoke(reject)
+    if qty_dec <= 0:
+        reject = RejectReason(code=RejectCode.QTY_ZERO, reason="qty must be positive")
+        return await _reject_smoke(reject)
+
+    if price_override_value is not None:
+        try:
+            market_price = Decimal(str(price_override_value))
+        except (InvalidOperation, TypeError, ValueError):
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price_override must be a valid decimal")
+            return await _reject_smoke(reject)
+        if market_price <= 0:
+            reject = RejectReason(code=RejectCode.INVALID_QTY, reason="price_override must be positive")
+            return await _reject_smoke(reject)
+    else:
+        market_price = await _latest_price(session, symbol_norm)
+        if market_price is None:
+            reject = RejectReason(code=RejectCode.SYMBOL_DISABLED, reason=f"No price data for symbol {symbol_norm}")
+            return await _reject_smoke(reject)
+        market_price = Decimal(str(market_price))
+
+    current_qty_val = await session.scalar(
+        select(PaperPosition.qty)
+        .where(PaperPosition.account_id == payload.account_id, PaperPosition.symbol == symbol_norm)
+        .limit(1)
+    )
+    current_qty = Decimal(str(current_qty_val)) if current_qty_val is not None else Decimal("0")
+    delta_qty = qty_dec if side == "buy" else -qty_dec
+    next_qty = current_qty + delta_qty
+    next_notional = next_qty.copy_abs() * market_price
+
+    limit_notional = position_limits.get("max_position_notional_usdt")
+    if limit_notional is not None and Decimal(str(limit_notional)) > 0 and next_notional > Decimal(str(limit_notional)):
+        reject = RejectReason(
+            code=RejectCode.MAX_POSITION_NOTIONAL,
+            reason="Position notional above maximum",
+            details={
+                "qty": str(qty_dec),
+                "market_price": str(market_price),
+                "next_notional": str(next_notional),
+                "max_position_notional_usdt": str(limit_notional),
+                "symbol_limit_source": position_limits_source,
+                "policy_binding": policy_binding,
+            },
+        )
+        return await _reject_smoke(reject)
 
     config = PaperTraderConfig.from_env()
     result = await place_order_unified(
@@ -521,14 +723,40 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         symbol=symbol_in,
         side=side,
         qty=payload.qty,
-        strategy_id=payload.strategy_id,
-        price_override=payload.price,
+        strategy_id=strategy_config_id,
+        price_override=price_override_value,
         fee_bps=config.fee_bps,
         slippage_bps=config.slippage_bps,
         meta={"origin": "admin_smoke"},
     )
     if isinstance(result, RejectReason):
-        return _reject_response(result, status_code=400)
+        await _record_action(
+            session,
+            "ORDER_REJECTED",
+            "error",
+            "Smoke trade rejected",
+            meta=json_safe(
+                {
+                    "request": request_meta,
+                    "reject": result.dict(),
+                    "policy_source": policy_source,
+                    "policy_binding": policy_binding,
+                    "computed_limits": computed_limits,
+                }
+            ),
+        )
+        return JSONResponse(
+            status_code=400,
+            content=jsonable_encoder(
+                {
+                    "ok": False,
+                    "reject": result.dict(),
+                    "policy_source": policy_source,
+                    "policy_binding": policy_binding,
+                    "computed_limits": computed_limits,
+                }
+            ),
+        )
 
     execution = result.execution
     prepared = result.prepared
@@ -551,7 +779,32 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             "trade_id": execution.trade.id,
             "strategy_id": result.strategy_id,
             "policy_source": result.policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
         }),
+    )
+    await _record_action(
+        session,
+        "SMOKE_TRADE_EXECUTED",
+        "ok",
+        "Smoke trade executed",
+        meta=json_safe(
+            {
+                "account_id": payload.account_id,
+                "symbol_in": symbol_in,
+                "symbol_normalized": symbol_norm,
+                "side": side,
+                "qty": str(prepared.qty),
+                "price": str(prepared.price),
+                "price_source": price_source,
+                "order_id": execution.order.id,
+                "trade_id": execution.trade.id,
+                "strategy_id": result.strategy_id,
+                "policy_source": result.policy_source,
+                "policy_binding": policy_binding,
+                "computed_limits": computed_limits,
+            }
+        ),
     )
 
     positions = (
@@ -573,6 +826,9 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         "symbol_in": symbol_in,
         "symbol_normalized": symbol_norm,
         "price_source": price_source,
+        "policy_source": policy_source,
+        "policy_binding": policy_binding,
+        "computed_limits": computed_limits,
         "trade": {
             "id": execution.trade.id,
             "symbol": execution.trade.symbol,
@@ -987,6 +1243,7 @@ async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(
 
 @router.post("/smoke-trade")
 async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
+    price_override_value = payload.price_override if payload.price_override is not None else payload.price
     if not runner.is_running:
         reject = RejectReason(code=RejectCode.ENGINE_NOT_RUNNING, reason="Paper trader engine is not running")
         engine_status = runner.status()
@@ -1009,7 +1266,9 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
                     "symbol_in": getattr(payload, "symbol", None),
                     "side": getattr(payload, "side", None),
                     "qty": str(getattr(payload, "qty", None)),
-                    "price_override": getattr(payload, "price", None),
+                    "price_override": str(price_override_value) if price_override_value is not None else None,
+                    "strategy_id": getattr(payload, "strategy_id", None),
+                    "strategy_config_id": getattr(payload, "strategy_config_id", None),
                 },
             },
             window_seconds=120,
@@ -1032,7 +1291,7 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
                     "symbol_in": getattr(payload, "symbol", None),
                     "side": getattr(payload, "side", None),
                     "qty": str(getattr(payload, "qty", None)),
-                    "price_override": getattr(payload, "price", None),
+                    "price_override": str(price_override_value) if price_override_value is not None else None,
                     "error": str(exc),
                     "error_type": exc.__class__.__name__,
                 }
