@@ -37,15 +37,9 @@ from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
 from ai_crypto_trader.services.paper_trader.order_entry import (
-    get_effective_risk_limits,
-    get_effective_position_limits,
     place_order_unified,
 )
-from ai_crypto_trader.services.policies.loader import (
-    get_effective_policy_ids,
-    load_position_policy,
-    load_risk_policy,
-)
+from ai_crypto_trader.services.policies.effective import resolve_effective_policy_snapshot
 from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
@@ -120,18 +114,13 @@ def _resolve_strategy_config_id(
     return None
 
 
-def _serialize_limits(limits: dict[str, object] | None) -> dict[str, str | int | None]:
-    payload: dict[str, str | int | None] = {}
-    if not isinstance(limits, dict):
-        return payload
-    for key, value in limits.items():
-        if value is None:
-            payload[key] = None
-        elif isinstance(value, Decimal):
-            payload[key] = str(value)
-        else:
-            payload[key] = value
-    return payload
+def _to_decimal_or_none(value: object | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
 
 
 router = APIRouter(prefix="/admin/paper-trader", tags=["admin"], dependencies=[Depends(require_admin_token)])
@@ -572,22 +561,19 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         "max_position_notional_usdt": None,
         "max_position_pct_equity": None,
     }
-    risk_limits = {
-        "max_order_notional_usdt": None,
-        "min_order_notional_usdt": None,
-        "max_leverage": None,
-        "max_drawdown_pct": None,
-        "max_drawdown_usdt": None,
-        "max_daily_loss_usdt": None,
-        "equity_lookback_hours": None,
-        "lookback_minutes": None,
-    }
-    risk_limits_source = None
-    risk_policy_overrides = None
     position_limits_source = None
     position_policy_overrides = None
     computed_limits = {
-        "risk_limits": _serialize_limits(risk_limits),
+        "risk_limits": {
+            "max_order_notional_usdt": None,
+            "min_order_notional_usdt": None,
+            "max_leverage": None,
+            "max_drawdown_pct": None,
+            "max_drawdown_usdt": None,
+            "max_daily_loss_usdt": None,
+            "equity_lookback_hours": None,
+            "lookback_minutes": None,
+        },
         "risk_limit_source": None,
         "risk_policy_overrides": None,
         "symbol_limits": {
@@ -652,59 +638,32 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         )
         return await _reject_smoke(reject)
 
-    policy_ids = await get_effective_policy_ids(
+    snapshot = await resolve_effective_policy_snapshot(
         session,
         strategy_config_id=strategy_config_id,
+        symbol=symbol_norm,
     )
-    if policy_ids is not None:
-        if policy_ids.bound_risk_policy_id is not None or policy_ids.position_policy_id is not None:
-            policy_source = "binding"
-        elif policy_ids.effective_risk_policy_id is not None:
-            policy_source = "strategy_legacy"
-        policy_binding = {
-            "strategy_config_id": strategy_config_id,
-            "legacy_risk_policy_id": policy_ids.legacy_risk_policy_id,
-            "bound_risk_policy_id": policy_ids.bound_risk_policy_id,
-            "effective_risk_policy_id": policy_ids.effective_risk_policy_id,
-            "bound_position_policy_id": str(policy_ids.position_policy_id) if policy_ids.position_policy_id else None,
-            "effective_position_policy_id": str(policy_ids.position_policy_id) if policy_ids.position_policy_id else None,
-        }
-        if policy_ids.effective_risk_policy_id is not None:
-            risk_policy_row = await load_risk_policy(session, policy_id=policy_ids.effective_risk_policy_id)
-            if risk_policy_row is not None:
-                (
-                    risk_limits,
-                    risk_limits_source,
-                    risk_policy_overrides,
-                ) = get_effective_risk_limits(risk_policy_row.params or {}, symbol_norm)
-        if policy_ids.position_policy_id is not None:
-            position_policy_row = await load_position_policy(session, policy_id=policy_ids.position_policy_id)
-            if position_policy_row is not None:
-                (
-                    position_limits,
-                    position_limits_source,
-                    position_policy_overrides,
-                ) = get_effective_position_limits(position_policy_row.params or {}, symbol_norm)
-
-    computed_limits = {
-        "risk_limits": _serialize_limits(risk_limits),
-        "risk_limit_source": risk_limits_source,
-        "risk_policy_overrides": risk_policy_overrides,
-        "symbol_limits": {
-            "max_order_qty": None,
-            "max_position_qty": str(position_limits["max_position_qty"])
-            if position_limits.get("max_position_qty") is not None
-            else None,
-            "max_position_notional_usdt": str(position_limits["max_position_notional_usdt"])
-            if position_limits.get("max_position_notional_usdt") is not None
-            else None,
-            "max_position_pct_equity": str(position_limits["max_position_pct_equity"])
-            if position_limits.get("max_position_pct_equity") is not None
-            else None,
-        },
-        "symbol_limit_source": position_limits_source,
-        "position_policy_overrides": position_policy_overrides,
-    }
+    if snapshot is not None:
+        policy_source = snapshot.policy_source
+        policy_binding = snapshot.policy_binding
+        computed_limits = snapshot.computed_limits
+        symbol_limits = computed_limits.get("symbol_limits") if isinstance(computed_limits, dict) else None
+        if isinstance(symbol_limits, dict):
+            position_limits = {
+                "max_position_qty": _to_decimal_or_none(symbol_limits.get("max_position_qty")),
+                "max_position_notional_usdt": _to_decimal_or_none(symbol_limits.get("max_position_notional_usdt")),
+                "max_position_pct_equity": _to_decimal_or_none(symbol_limits.get("max_position_pct_equity")),
+            }
+    position_limits_source = (
+        computed_limits.get("symbol_limit_source")
+        if isinstance(computed_limits, dict)
+        else None
+    )
+    position_policy_overrides = (
+        computed_limits.get("position_policy_overrides")
+        if isinstance(computed_limits, dict)
+        else None
+    )
 
     if side not in {"buy", "sell"}:
         reject = RejectReason(code=RejectCode.INVALID_QTY, reason="side must be buy or sell")
@@ -930,85 +889,64 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
 @router.post("/test-order")
 async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
     symbol_norm = normalize_symbol(payload.symbol)
-    policy_ids = await get_effective_policy_ids(
-        session,
-        strategy_config_id=payload.strategy_config_id,
-    )
-
     policy_source = "account_default"
-    if policy_ids is not None:
-        if policy_ids.bound_risk_policy_id is not None or policy_ids.position_policy_id is not None:
-            policy_source = "binding"
-        elif policy_ids.effective_risk_policy_id is not None:
-            policy_source = "strategy_legacy"
-
+    position_limits_source = None
     position_limits = {
         "max_position_qty": None,
         "max_position_notional_usdt": None,
         "max_position_pct_equity": None,
     }
-    risk_limits = {
-        "max_order_notional_usdt": None,
-        "min_order_notional_usdt": None,
-        "max_leverage": None,
-        "max_drawdown_pct": None,
-        "max_drawdown_usdt": None,
-        "max_daily_loss_usdt": None,
-        "equity_lookback_hours": None,
-        "lookback_minutes": None,
-    }
-    risk_limits_source = None
-    risk_policy_overrides = None
-    position_limits_source = None
-    position_policy_overrides = None
-    if policy_ids is not None and policy_ids.effective_risk_policy_id is not None:
-        risk_policy_row = await load_risk_policy(session, policy_id=policy_ids.effective_risk_policy_id)
-        if risk_policy_row is not None:
-            (
-                risk_limits,
-                risk_limits_source,
-                risk_policy_overrides,
-            ) = get_effective_risk_limits(risk_policy_row.params or {}, symbol_norm)
-    if policy_ids is not None and policy_ids.position_policy_id is not None:
-        position_policy_row = await load_position_policy(session, policy_id=policy_ids.position_policy_id)
-        if position_policy_row is not None:
-            (
-                position_limits,
-                position_limits_source,
-                position_policy_overrides,
-            ) = get_effective_position_limits(position_policy_row.params or {}, symbol_norm)
-
+    snapshot = await resolve_effective_policy_snapshot(
+        session,
+        strategy_config_id=payload.strategy_config_id,
+        symbol=symbol_norm,
+    )
     policy_binding = {
         "strategy_config_id": payload.strategy_config_id,
-        "legacy_risk_policy_id": policy_ids.legacy_risk_policy_id if policy_ids else None,
-        "bound_risk_policy_id": policy_ids.bound_risk_policy_id if policy_ids else None,
-        "effective_risk_policy_id": policy_ids.effective_risk_policy_id if policy_ids else None,
-        "bound_position_policy_id": str(policy_ids.position_policy_id)
-        if policy_ids and policy_ids.position_policy_id
-        else None,
-        "effective_position_policy_id": str(policy_ids.position_policy_id)
-        if policy_ids and policy_ids.position_policy_id
-        else None,
+        "legacy_risk_policy_id": None,
+        "bound_risk_policy_id": None,
+        "effective_risk_policy_id": None,
+        "bound_position_policy_id": None,
+        "effective_position_policy_id": None,
     }
     computed_limits = {
-        "risk_limits": _serialize_limits(risk_limits),
-        "risk_limit_source": risk_limits_source,
-        "risk_policy_overrides": risk_policy_overrides,
+        "risk_limits": {
+            "max_order_notional_usdt": None,
+            "min_order_notional_usdt": None,
+            "max_leverage": None,
+            "max_drawdown_pct": None,
+            "max_drawdown_usdt": None,
+            "max_daily_loss_usdt": None,
+            "equity_lookback_hours": None,
+            "lookback_minutes": None,
+        },
+        "risk_limit_source": None,
+        "risk_policy_overrides": None,
         "symbol_limits": {
             "max_order_qty": None,
-            "max_position_qty": str(position_limits["max_position_qty"])
-            if position_limits.get("max_position_qty") is not None
-            else None,
-            "max_position_notional_usdt": str(position_limits["max_position_notional_usdt"])
-            if position_limits.get("max_position_notional_usdt") is not None
-            else None,
-            "max_position_pct_equity": str(position_limits["max_position_pct_equity"])
-            if position_limits.get("max_position_pct_equity") is not None
-            else None,
+            "max_position_qty": None,
+            "max_position_notional_usdt": None,
+            "max_position_pct_equity": None,
         },
-        "symbol_limit_source": position_limits_source,
-        "position_policy_overrides": position_policy_overrides,
+        "symbol_limit_source": None,
+        "position_policy_overrides": None,
     }
+    if snapshot is not None:
+        policy_source = snapshot.policy_source
+        policy_binding = snapshot.policy_binding
+        computed_limits = snapshot.computed_limits
+        symbol_limits = computed_limits.get("symbol_limits") if isinstance(computed_limits, dict) else None
+        if isinstance(symbol_limits, dict):
+            position_limits = {
+                "max_position_qty": _to_decimal_or_none(symbol_limits.get("max_position_qty")),
+                "max_position_notional_usdt": _to_decimal_or_none(symbol_limits.get("max_position_notional_usdt")),
+                "max_position_pct_equity": _to_decimal_or_none(symbol_limits.get("max_position_pct_equity")),
+            }
+        position_limits_source = (
+            computed_limits.get("symbol_limit_source")
+            if isinstance(computed_limits, dict)
+            else None
+        )
 
     side_norm = (payload.side or "").strip().lower()
     if side_norm not in {"buy", "sell"}:

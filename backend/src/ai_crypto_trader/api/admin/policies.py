@@ -17,11 +17,8 @@ from ai_crypto_trader.common.models import (
     StrategyConfig,
     StrategyPolicyBinding,
 )
+from ai_crypto_trader.services.admin.pagination import clamp_limit_offset, fetch_page
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
-from ai_crypto_trader.services.paper_trader.order_entry import (
-    get_effective_position_limits,
-    get_effective_risk_limits,
-)
 from ai_crypto_trader.services.paper_trader.policy_bindings import (
     activate_position_policy_version,
     activate_risk_policy_version,
@@ -33,11 +30,7 @@ from ai_crypto_trader.services.paper_trader.policy_bindings import (
     get_risk_policy_by_name_version,
     get_strategy_policy_binding,
 )
-from ai_crypto_trader.services.policies.loader import (
-    get_effective_policy_ids,
-    load_position_policy,
-    load_risk_policy,
-)
+from ai_crypto_trader.services.policies.effective import resolve_effective_policy_snapshot
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin_token)])
 
@@ -157,18 +150,6 @@ def _merge_symbol_limits(params: dict[str, Any] | None, *, symbol: str, limits: 
     return payload
 
 
-def _serialize_limit_values(limits: dict[str, Any] | None) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    if not isinstance(limits, dict):
-        return payload
-    for key, value in limits.items():
-        if value is None:
-            payload[key] = None
-        else:
-            payload[key] = str(value) if hasattr(value, "as_tuple") else value
-    return payload
-
-
 async def _audit_action(
     session: AsyncSession,
     *,
@@ -229,6 +210,7 @@ async def list_risk_policies(
     order: str = Query("updated_at_desc"),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    limit, offset = clamp_limit_offset(limit=limit, offset=offset)
     conditions = []
     if name:
         conditions.append(RiskPolicy.name == name)
@@ -247,14 +229,22 @@ async def list_risk_policies(
         stmt = stmt.order_by(desc(RiskPolicy.updated_at), desc(RiskPolicy.version), desc(RiskPolicy.id))
     elif order == "updated_at_asc":
         stmt = stmt.order_by(RiskPolicy.updated_at.asc(), RiskPolicy.version.asc(), RiskPolicy.id.asc())
+    elif order == "created_at_desc":
+        stmt = stmt.order_by(desc(RiskPolicy.created_at), desc(RiskPolicy.version), desc(RiskPolicy.id))
+    elif order == "created_at_asc":
+        stmt = stmt.order_by(RiskPolicy.created_at.asc(), RiskPolicy.version.asc(), RiskPolicy.id.asc())
     elif order == "version_desc":
         stmt = stmt.order_by(desc(RiskPolicy.version), desc(RiskPolicy.id))
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
 
-    total = int((await session.execute(count_stmt)).scalar_one() or 0)
-    rows = await session.execute(stmt.limit(limit).offset(offset))
-    items = list(rows.scalars().all())
+    total, items = await fetch_page(
+        session,
+        count_stmt=count_stmt,
+        data_stmt=stmt,
+        limit=limit,
+        offset=offset,
+    )
     return {
         "ok": True,
         "items": [_serialize_risk_policy(p) for p in items],
@@ -410,6 +400,7 @@ async def list_position_policies(
     order: str = Query("updated_at_desc"),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    limit, offset = clamp_limit_offset(limit=limit, offset=offset)
     conditions = []
     if name:
         conditions.append(PositionPolicyConfig.name == name)
@@ -434,14 +425,30 @@ async def list_position_policies(
             PositionPolicyConfig.version.asc(),
             PositionPolicyConfig.id.asc(),
         )
+    elif order == "created_at_desc":
+        stmt = stmt.order_by(
+            desc(PositionPolicyConfig.created_at),
+            desc(PositionPolicyConfig.version),
+            desc(PositionPolicyConfig.id),
+        )
+    elif order == "created_at_asc":
+        stmt = stmt.order_by(
+            PositionPolicyConfig.created_at.asc(),
+            PositionPolicyConfig.version.asc(),
+            PositionPolicyConfig.id.asc(),
+        )
     elif order == "version_desc":
         stmt = stmt.order_by(desc(PositionPolicyConfig.version), desc(PositionPolicyConfig.id))
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
 
-    total = int((await session.execute(count_stmt)).scalar_one() or 0)
-    rows = await session.execute(stmt.limit(limit).offset(offset))
-    items = list(rows.scalars().all())
+    total, items = await fetch_page(
+        session,
+        count_stmt=count_stmt,
+        data_stmt=stmt,
+        limit=limit,
+        offset=offset,
+    )
     return {
         "ok": True,
         "items": [_serialize_position_policy(p) for p in items],
@@ -566,6 +573,7 @@ async def list_strategy_configs(
     order: str = Query("updated_at_desc"),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    limit, offset = clamp_limit_offset(limit=limit, offset=offset)
     conditions = []
     if is_active is not None:
         conditions.append(StrategyConfig.is_active.is_(is_active))
@@ -589,6 +597,10 @@ async def list_strategy_configs(
         stmt = stmt.order_by(desc(StrategyConfig.updated_at), desc(StrategyConfig.id))
     elif order == "updated_at_asc":
         stmt = stmt.order_by(StrategyConfig.updated_at.asc(), StrategyConfig.id.asc())
+    elif order == "created_at_desc":
+        stmt = stmt.order_by(desc(StrategyConfig.created_at), desc(StrategyConfig.id))
+    elif order == "created_at_asc":
+        stmt = stmt.order_by(StrategyConfig.created_at.asc(), StrategyConfig.id.asc())
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
 
@@ -629,6 +641,7 @@ async def list_strategy_policy_bindings(
     order: str = Query("updated_at_desc"),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    limit, offset = clamp_limit_offset(limit=limit, offset=offset)
     conditions = []
     if strategy_config_id is not None:
         conditions.append(StrategyPolicyBinding.strategy_config_id == strategy_config_id)
@@ -648,6 +661,10 @@ async def list_strategy_policy_bindings(
     if order == "updated_at_desc":
         stmt = stmt.order_by(desc(StrategyPolicyBinding.updated_at), desc(StrategyPolicyBinding.strategy_config_id))
     elif order == "updated_at_asc":
+        stmt = stmt.order_by(StrategyPolicyBinding.updated_at.asc(), StrategyPolicyBinding.strategy_config_id.asc())
+    elif order == "created_at_desc":
+        stmt = stmt.order_by(desc(StrategyPolicyBinding.updated_at), desc(StrategyPolicyBinding.strategy_config_id))
+    elif order == "created_at_asc":
         stmt = stmt.order_by(StrategyPolicyBinding.updated_at.asc(), StrategyPolicyBinding.strategy_config_id.asc())
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
@@ -676,75 +693,72 @@ async def get_effective_policies_for_strategy(
     if strategy is None:
         raise HTTPException(status_code=404, detail="Strategy config not found")
 
-    policy_ids = await get_effective_policy_ids(session, strategy_config_id=strategy_config_id)
-    if policy_ids is None:
-        raise HTTPException(status_code=404, detail="Strategy config not found")
+    symbol_norm = _normalize_symbol_or_400(symbol) if symbol is not None else None
+    snapshot = None
+    if symbol_norm is not None:
+        snapshot = await resolve_effective_policy_snapshot(
+            session,
+            strategy_config_id=strategy_config_id,
+            symbol=symbol_norm,
+        )
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="Strategy config not found")
 
-    if policy_ids.bound_risk_policy_id is not None or policy_ids.position_policy_id is not None:
+    binding = await get_strategy_policy_binding(session, strategy_config_id=strategy_config_id)
+    if binding and (binding.risk_policy_id is not None or binding.position_policy_id is not None):
         policy_source = "binding"
-    elif policy_ids.effective_risk_policy_id is not None:
+    elif strategy.risk_policy_id is not None:
         policy_source = "legacy"
     else:
         policy_source = "default"
 
-    symbol_norm = _normalize_symbol_or_400(symbol) if symbol is not None else None
-    risk_limits = {
-        "max_order_notional_usdt": None,
-        "min_order_notional_usdt": None,
-        "max_leverage": None,
-        "max_drawdown_pct": None,
-        "max_drawdown_usdt": None,
-        "max_daily_loss_usdt": None,
-        "equity_lookback_hours": None,
-        "lookback_minutes": None,
+    policy_binding = {
+        "strategy_config_id": strategy_config_id,
+        "legacy_risk_policy_id": strategy.risk_policy_id,
+        "bound_risk_policy_id": binding.risk_policy_id if binding else None,
+        "effective_risk_policy_id": (binding.risk_policy_id if binding and binding.risk_policy_id is not None else strategy.risk_policy_id),
+        "bound_position_policy_id": str(binding.position_policy_id) if binding and binding.position_policy_id else None,
+        "effective_position_policy_id": str(binding.position_policy_id) if binding and binding.position_policy_id else None,
     }
-    risk_limit_source = None
-    risk_policy_overrides = None
-    position_limits = {
-        "max_position_qty": None,
-        "max_position_notional_usdt": None,
-        "max_position_pct_equity": None,
+    if snapshot is not None:
+        policy_binding = snapshot.policy_binding
+        if snapshot.policy_source == "binding":
+            policy_source = "binding"
+        elif snapshot.policy_source == "strategy_legacy":
+            policy_source = "legacy"
+        elif snapshot.policy_source == "account_default":
+            policy_source = "default"
+
+    computed_limits = snapshot.computed_limits if snapshot is not None else {
+        "risk_limits": {
+            "max_order_notional_usdt": None,
+            "min_order_notional_usdt": None,
+            "max_leverage": None,
+            "max_drawdown_pct": None,
+            "max_drawdown_usdt": None,
+            "max_daily_loss_usdt": None,
+            "equity_lookback_hours": None,
+            "lookback_minutes": None,
+        },
+        "risk_limit_source": None,
+        "risk_policy_overrides": None,
+        "symbol_limits": {
+            "max_order_qty": None,
+            "max_position_qty": None,
+            "max_position_notional_usdt": None,
+            "max_position_pct_equity": None,
+        },
+        "symbol_limit_source": None,
+        "position_policy_overrides": None,
     }
-    position_limit_source = None
-    position_policy_overrides = None
 
-    risk_policy = await load_risk_policy(session, policy_id=policy_ids.effective_risk_policy_id)
-    if risk_policy is not None and symbol_norm:
-        risk_limits, risk_limit_source, risk_policy_overrides = get_effective_risk_limits(
-            risk_policy.params or {},
-            symbol_norm,
-        )
-    position_policy = await load_position_policy(session, policy_id=policy_ids.position_policy_id)
-    if position_policy is not None and symbol_norm:
-        position_limits, position_limit_source, position_policy_overrides = get_effective_position_limits(
-            position_policy.params or {},
-            symbol_norm,
-        )
-
-    binding = await get_strategy_policy_binding(session, strategy_config_id=strategy_config_id)
     return {
         "ok": True,
         "policy_source": policy_source,
         "strategy_config": _serialize_strategy_config(strategy),
-        "policy_binding": {
-            "strategy_config_id": strategy_config_id,
-            "legacy_risk_policy_id": policy_ids.legacy_risk_policy_id,
-            "bound_risk_policy_id": policy_ids.bound_risk_policy_id,
-            "effective_risk_policy_id": policy_ids.effective_risk_policy_id,
-            "bound_position_policy_id": str(binding.position_policy_id) if binding and binding.position_policy_id else None,
-            "effective_position_policy_id": str(policy_ids.position_policy_id)
-            if policy_ids.position_policy_id
-            else None,
-        },
+        "policy_binding": policy_binding,
         "symbol": symbol_norm,
-        "computed_limits": {
-            "risk_limits": _serialize_limit_values(risk_limits),
-            "risk_limit_source": risk_limit_source,
-            "risk_policy_overrides": risk_policy_overrides,
-            "symbol_limits": _serialize_limit_values(position_limits),
-            "symbol_limit_source": position_limit_source,
-            "position_policy_overrides": position_policy_overrides,
-        },
+        "computed_limits": computed_limits,
     }
 
 
