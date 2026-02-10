@@ -37,10 +37,15 @@ from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
 from ai_crypto_trader.services.paper_trader.order_entry import (
+    get_effective_risk_limits,
     get_effective_position_limits,
     place_order_unified,
 )
-from ai_crypto_trader.services.policies.loader import get_effective_policy_ids, load_position_policy
+from ai_crypto_trader.services.policies.loader import (
+    get_effective_policy_ids,
+    load_position_policy,
+    load_risk_policy,
+)
 from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
 from ai_crypto_trader.services.paper_trader.utils import prepare_order_inputs, RiskRejected
@@ -113,6 +118,20 @@ def _resolve_strategy_config_id(
     if text_value.isdigit():
         return int(text_value)
     return None
+
+
+def _serialize_limits(limits: dict[str, object] | None) -> dict[str, str | int | None]:
+    payload: dict[str, str | int | None] = {}
+    if not isinstance(limits, dict):
+        return payload
+    for key, value in limits.items():
+        if value is None:
+            payload[key] = None
+        elif isinstance(value, Decimal):
+            payload[key] = str(value)
+        else:
+            payload[key] = value
+    return payload
 
 
 router = APIRouter(prefix="/admin/paper-trader", tags=["admin"], dependencies=[Depends(require_admin_token)])
@@ -553,9 +572,24 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         "max_position_notional_usdt": None,
         "max_position_pct_equity": None,
     }
+    risk_limits = {
+        "max_order_notional_usdt": None,
+        "min_order_notional_usdt": None,
+        "max_leverage": None,
+        "max_drawdown_pct": None,
+        "max_drawdown_usdt": None,
+        "max_daily_loss_usdt": None,
+        "equity_lookback_hours": None,
+        "lookback_minutes": None,
+    }
+    risk_limits_source = None
+    risk_policy_overrides = None
     position_limits_source = None
     position_policy_overrides = None
     computed_limits = {
+        "risk_limits": _serialize_limits(risk_limits),
+        "risk_limit_source": None,
+        "risk_policy_overrides": None,
         "symbol_limits": {
             "max_order_qty": None,
             "max_position_qty": None,
@@ -635,6 +669,14 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             "bound_position_policy_id": str(policy_ids.position_policy_id) if policy_ids.position_policy_id else None,
             "effective_position_policy_id": str(policy_ids.position_policy_id) if policy_ids.position_policy_id else None,
         }
+        if policy_ids.effective_risk_policy_id is not None:
+            risk_policy_row = await load_risk_policy(session, policy_id=policy_ids.effective_risk_policy_id)
+            if risk_policy_row is not None:
+                (
+                    risk_limits,
+                    risk_limits_source,
+                    risk_policy_overrides,
+                ) = get_effective_risk_limits(risk_policy_row.params or {}, symbol_norm)
         if policy_ids.position_policy_id is not None:
             position_policy_row = await load_position_policy(session, policy_id=policy_ids.position_policy_id)
             if position_policy_row is not None:
@@ -645,6 +687,9 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                 ) = get_effective_position_limits(position_policy_row.params or {}, symbol_norm)
 
     computed_limits = {
+        "risk_limits": _serialize_limits(risk_limits),
+        "risk_limit_source": risk_limits_source,
+        "risk_policy_overrides": risk_policy_overrides,
         "symbol_limits": {
             "max_order_qty": None,
             "max_position_qty": str(position_limits["max_position_qty"])
@@ -902,8 +947,28 @@ async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(
         "max_position_notional_usdt": None,
         "max_position_pct_equity": None,
     }
+    risk_limits = {
+        "max_order_notional_usdt": None,
+        "min_order_notional_usdt": None,
+        "max_leverage": None,
+        "max_drawdown_pct": None,
+        "max_drawdown_usdt": None,
+        "max_daily_loss_usdt": None,
+        "equity_lookback_hours": None,
+        "lookback_minutes": None,
+    }
+    risk_limits_source = None
+    risk_policy_overrides = None
     position_limits_source = None
     position_policy_overrides = None
+    if policy_ids is not None and policy_ids.effective_risk_policy_id is not None:
+        risk_policy_row = await load_risk_policy(session, policy_id=policy_ids.effective_risk_policy_id)
+        if risk_policy_row is not None:
+            (
+                risk_limits,
+                risk_limits_source,
+                risk_policy_overrides,
+            ) = get_effective_risk_limits(risk_policy_row.params or {}, symbol_norm)
     if policy_ids is not None and policy_ids.position_policy_id is not None:
         position_policy_row = await load_position_policy(session, policy_id=policy_ids.position_policy_id)
         if position_policy_row is not None:
@@ -926,6 +991,9 @@ async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(
         else None,
     }
     computed_limits = {
+        "risk_limits": _serialize_limits(risk_limits),
+        "risk_limit_source": risk_limits_source,
+        "risk_policy_overrides": risk_policy_overrides,
         "symbol_limits": {
             "max_order_qty": None,
             "max_position_qty": str(position_limits["max_position_qty"])

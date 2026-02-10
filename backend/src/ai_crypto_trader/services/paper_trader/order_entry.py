@@ -227,6 +227,44 @@ def get_effective_position_limits(
     return limits, source, symbol_override
 
 
+def get_effective_risk_limits(
+    risk_policy_params: dict | None,
+    symbol_normalized: str,
+) -> tuple[dict[str, Decimal | int | None], str | None, dict | None]:
+    if not isinstance(risk_policy_params, dict):
+        return (
+            {
+                "max_order_notional_usdt": None,
+                "min_order_notional_usdt": None,
+                "max_leverage": None,
+                "max_drawdown_pct": None,
+                "max_drawdown_usdt": None,
+                "max_daily_loss_usdt": None,
+                "equity_lookback_hours": None,
+                "lookback_minutes": None,
+            },
+            None,
+            None,
+        )
+    merged, raw_source, symbol_override = merge_policy_params(risk_policy_params, symbol_normalized)
+    source = None
+    if raw_source == "default":
+        source = "risk_policy.default"
+    elif raw_source == "per_symbol":
+        source = "risk_policy.per_symbol"
+    limits: dict[str, Decimal | int | None] = {
+        "max_order_notional_usdt": _to_decimal(merged.get("max_order_notional_usdt")),
+        "min_order_notional_usdt": _to_decimal(merged.get("min_order_notional_usdt")),
+        "max_leverage": _to_decimal(merged.get("max_leverage")),
+        "max_drawdown_pct": _to_decimal(merged.get("max_drawdown_pct")),
+        "max_drawdown_usdt": _to_decimal(merged.get("max_drawdown_usdt")),
+        "max_daily_loss_usdt": _to_decimal(merged.get("max_daily_loss_usdt")),
+        "equity_lookback_hours": _to_int(merged.get("equity_lookback_hours")),
+        "lookback_minutes": _to_int(merged.get("lookback_minutes")),
+    }
+    return limits, source, symbol_override
+
+
 def _apply_position_params(policy, params: dict, symbol: str) -> tuple[object, dict]:
     if not params:
         return policy, {}
@@ -346,6 +384,16 @@ async def place_order_unified(
     position_policy_symbol_override: dict | None = None
     risk_policy_limit_source: str | None = None
     risk_policy_symbol_override: dict | None = None
+    risk_policy_limits: dict[str, Decimal | int | None] = {
+        "max_order_notional_usdt": None,
+        "min_order_notional_usdt": None,
+        "max_leverage": None,
+        "max_drawdown_pct": None,
+        "max_drawdown_usdt": None,
+        "max_daily_loss_usdt": None,
+        "equity_lookback_hours": None,
+        "lookback_minutes": None,
+    }
 
     if strategy_config_id is not None:
         policy_ids = await get_effective_policy_ids(session, strategy_config_id=strategy_config_id)
@@ -492,7 +540,30 @@ async def place_order_unified(
             "policies": policy_snapshot,
             "policy_binding": bound_policy_meta,
             "position_policy_overrides": position_policy_symbol_override,
+            "risk_limit_source": risk_policy_limit_source,
             "risk_policy_source": risk_policy_limit_source,
+            "risk_limits": {
+                "max_order_notional_usdt": str(risk_policy_limits.get("max_order_notional_usdt"))
+                if risk_policy_limits.get("max_order_notional_usdt") is not None
+                else None,
+                "min_order_notional_usdt": str(risk_policy_limits.get("min_order_notional_usdt"))
+                if risk_policy_limits.get("min_order_notional_usdt") is not None
+                else None,
+                "max_leverage": str(risk_policy_limits.get("max_leverage"))
+                if risk_policy_limits.get("max_leverage") is not None
+                else None,
+                "max_drawdown_pct": str(risk_policy_limits.get("max_drawdown_pct"))
+                if risk_policy_limits.get("max_drawdown_pct") is not None
+                else None,
+                "max_drawdown_usdt": str(risk_policy_limits.get("max_drawdown_usdt"))
+                if risk_policy_limits.get("max_drawdown_usdt") is not None
+                else None,
+                "max_daily_loss_usdt": str(risk_policy_limits.get("max_daily_loss_usdt"))
+                if risk_policy_limits.get("max_daily_loss_usdt") is not None
+                else None,
+                "equity_lookback_hours": risk_policy_limits.get("equity_lookback_hours"),
+                "lookback_minutes": risk_policy_limits.get("lookback_minutes"),
+            },
             "risk_policy_overrides": risk_policy_symbol_override,
             "policy_source": policy_source_local,
             "strategy_id": strategy_id_for_meta,
@@ -610,6 +681,11 @@ async def place_order_unified(
                 policy_id=policy_ids.effective_risk_policy_id,
             )
             if risk_policy_row is not None:
+                (
+                    risk_policy_limits,
+                    risk_policy_limit_source,
+                    risk_policy_symbol_override,
+                ) = get_effective_risk_limits(risk_policy_row.params or {}, prepared.symbol)
                 risk_params, risk_source_raw, risk_symbol_override = merge_policy_params(
                     risk_policy_row.params or {},
                     prepared.symbol,
@@ -796,6 +872,31 @@ async def place_order_unified(
                     "notional": str(notional),
                     "qty": str(prepared.qty),
                     "market_price": str(prepared.price),
+                },
+            )
+            await _log_reject(
+                reject,
+                prepared=prepared,
+                notional=notional,
+                risk_policy=risk_policy,
+                position_policy=position_policy,
+            )
+            return reject
+
+    risk_min_notional = risk_policy_limits.get("min_order_notional_usdt")
+    if risk_min_notional is not None:
+        min_notional = Decimal(str(risk_min_notional))
+        if min_notional > 0 and notional < min_notional:
+            reject = RejectReason(
+                code=RejectCode.MIN_ORDER_NOTIONAL,
+                reason="Order notional below risk policy minimum",
+                details={
+                    "min_order_notional_usdt": str(min_notional),
+                    "notional": str(notional),
+                    "qty": str(prepared.qty),
+                    "market_price": str(prepared.price),
+                    "risk_limit_source": risk_policy_limit_source,
+                    "policy_binding": bound_policy_meta,
                 },
             )
             await _log_reject(
