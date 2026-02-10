@@ -27,6 +27,8 @@ async def get_effective_policy_ids(
     session: AsyncSession,
     *,
     strategy_config_id: int,
+    risk_policy_name: str | None = None,
+    position_policy_name: str | None = None,
 ) -> EffectivePolicyIds | None:
     row = await session.execute(
         select(
@@ -64,6 +66,37 @@ async def get_effective_policy_ids(
     symbols_raw = record[4] or []
     strategy_symbols = symbols_raw if isinstance(symbols_raw, list) else []
     effective_risk_policy_id = bound_risk_policy_id or legacy_risk_policy_id
+    effective_position_policy_id = position_policy_id
+    risk_source = "binding" if bound_risk_policy_id is not None else ("legacy" if legacy_risk_policy_id is not None else None)
+    position_source = "binding" if position_policy_id is not None else None
+
+    if effective_risk_policy_id is None and risk_policy_name:
+        active_risk = await session.scalar(
+            select(RiskPolicy.id)
+            .where(
+                RiskPolicy.name == risk_policy_name,
+                RiskPolicy.is_active.is_(True),
+            )
+            .order_by(RiskPolicy.version.desc())
+            .limit(1)
+        )
+        if active_risk is not None:
+            effective_risk_policy_id = active_risk
+            risk_source = "active_by_name"
+
+    if effective_position_policy_id is None and position_policy_name:
+        active_position = await session.scalar(
+            select(PositionPolicyConfig.id)
+            .where(
+                PositionPolicyConfig.name == position_policy_name,
+                PositionPolicyConfig.status == "active",
+            )
+            .order_by(PositionPolicyConfig.version.desc())
+            .limit(1)
+        )
+        if active_position is not None:
+            effective_position_policy_id = active_position
+            position_source = "active_by_name"
 
     logger.info(
         "POLICY_RESOLVED",
@@ -72,7 +105,9 @@ async def get_effective_policy_ids(
             "legacy_risk_policy_id": legacy_risk_policy_id,
             "bound_risk_policy_id": bound_risk_policy_id,
             "effective_risk_policy_id": effective_risk_policy_id,
-            "position_policy_id": str(position_policy_id) if position_policy_id else None,
+            "position_policy_id": str(effective_position_policy_id) if effective_position_policy_id else None,
+            "risk_source": risk_source,
+            "position_source": position_source,
         },
     )
 
@@ -81,7 +116,7 @@ async def get_effective_policy_ids(
         legacy_risk_policy_id=legacy_risk_policy_id,
         bound_risk_policy_id=bound_risk_policy_id,
         effective_risk_policy_id=effective_risk_policy_id,
-        position_policy_id=position_policy_id,
+        position_policy_id=effective_position_policy_id,
         strategy_symbols=strategy_symbols,
     )
 

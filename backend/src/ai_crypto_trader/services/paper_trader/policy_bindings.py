@@ -28,15 +28,18 @@ async def create_risk_policy_version(
     params: dict | None = None,
     notes: str | None = None,
     status: str = "draft",
+    activate: bool = False,
 ) -> RiskPolicy:
     max_version = await session.scalar(
         select(func.max(RiskPolicy.version)).where(RiskPolicy.name == name)
     )
     version = int(max_version or 0) + 1
+    status_norm = (status or "draft").strip().lower()
+    should_activate = bool(activate and status_norm == "active")
     policy = RiskPolicy(
         name=name,
         version=version,
-        status=status,
+        status=status_norm,
         params=_safe_params(params),
         notes=notes,
         max_loss_per_trade_usd=Decimal("0"),
@@ -46,10 +49,19 @@ async def create_risk_policy_version(
         cooldown_seconds=0,
         fee_bps=Decimal("0"),
         slippage_bps=Decimal("0"),
-        is_active=status.lower() == "active",
+        is_active=should_activate,
     )
     session.add(policy)
     await session.flush()
+    if should_activate:
+        await session.execute(
+            update(RiskPolicy)
+            .where(
+                RiskPolicy.name == policy.name,
+                RiskPolicy.id != policy.id,
+            )
+            .values(is_active=False)
+        )
     return policy
 
 
@@ -57,10 +69,16 @@ async def list_risk_policy_versions(
     session: AsyncSession,
     *,
     name: str | None = None,
+    limit: int = 50,
 ) -> list[RiskPolicy]:
-    stmt = select(RiskPolicy).order_by(RiskPolicy.name.asc(), RiskPolicy.version.desc())
+    capped_limit = max(1, min(int(limit or 50), 200))
+    stmt = select(RiskPolicy)
     if name:
         stmt = stmt.where(RiskPolicy.name == name)
+        stmt = stmt.order_by(RiskPolicy.version.desc())
+    else:
+        stmt = stmt.order_by(RiskPolicy.name.asc(), RiskPolicy.version.desc())
+    stmt = stmt.limit(capped_limit)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -80,7 +98,7 @@ async def create_position_policy_version(
     policy = PositionPolicyConfig(
         name=name,
         version=version,
-        status=status,
+        status=(status or "draft").strip().lower(),
         params=_safe_params(params),
         notes=notes,
     )
@@ -93,12 +111,16 @@ async def list_position_policy_versions(
     session: AsyncSession,
     *,
     name: str | None = None,
+    limit: int = 50,
 ) -> list[PositionPolicyConfig]:
-    stmt = select(PositionPolicyConfig).order_by(
-        PositionPolicyConfig.name.asc(), PositionPolicyConfig.version.desc()
-    )
+    capped_limit = max(1, min(int(limit or 50), 200))
+    stmt = select(PositionPolicyConfig)
     if name:
         stmt = stmt.where(PositionPolicyConfig.name == name)
+        stmt = stmt.order_by(PositionPolicyConfig.version.desc())
+    else:
+        stmt = stmt.order_by(PositionPolicyConfig.name.asc(), PositionPolicyConfig.version.desc())
+    stmt = stmt.limit(capped_limit)
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -226,6 +248,22 @@ async def get_risk_policy_by_name_version(
     )
 
 
+async def get_active_risk_policy_by_name(
+    session: AsyncSession,
+    *,
+    name: str,
+) -> RiskPolicy | None:
+    return await session.scalar(
+        select(RiskPolicy)
+        .where(
+            RiskPolicy.name == name,
+            RiskPolicy.is_active.is_(True),
+        )
+        .order_by(RiskPolicy.version.desc())
+        .limit(1)
+    )
+
+
 async def get_position_policy_by_name_version(
     session: AsyncSession,
     *,
@@ -238,6 +276,22 @@ async def get_position_policy_by_name_version(
             PositionPolicyConfig.name == name,
             PositionPolicyConfig.version == version,
         )
+        .limit(1)
+    )
+
+
+async def get_active_position_policy_by_name(
+    session: AsyncSession,
+    *,
+    name: str,
+) -> PositionPolicyConfig | None:
+    return await session.scalar(
+        select(PositionPolicyConfig)
+        .where(
+            PositionPolicyConfig.name == name,
+            PositionPolicyConfig.status == "active",
+        )
+        .order_by(PositionPolicyConfig.version.desc())
         .limit(1)
     )
 

@@ -30,7 +30,8 @@ router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(requir
 class PolicyCreate(BaseModel):
     name: str = Field(..., min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
-    status: str = Field("draft", min_length=1)
+    status: Literal["draft", "active", "archived"] = "draft"
+    activate: bool = False
     notes: Optional[str] = None
 
 
@@ -126,6 +127,7 @@ async def create_risk_policy(payload: PolicyCreate, session: AsyncSession = Depe
         params=payload.params,
         notes=payload.notes,
         status=payload.status,
+        activate=payload.activate,
     )
     await _audit_action(
         session,
@@ -141,6 +143,7 @@ async def create_risk_policy(payload: PolicyCreate, session: AsyncSession = Depe
             "to_id": policy.id,
             "to_version": policy.version,
             "status": policy.status,
+            "is_active": policy.is_active,
             "notes": payload.notes,
         },
     )
@@ -152,9 +155,10 @@ async def create_risk_policy(payload: PolicyCreate, session: AsyncSession = Depe
 @router.get("/risk-policies")
 async def list_risk_policies(
     name: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    policies = await list_risk_policy_versions(session, name=name)
+    policies = await list_risk_policy_versions(session, name=name, limit=limit)
     return {"ok": True, "items": [_serialize_risk_policy(p) for p in policies]}
 
 
@@ -223,9 +227,10 @@ async def create_position_policy(payload: PolicyCreate, session: AsyncSession = 
 @router.get("/position-policies")
 async def list_position_policies(
     name: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    policies = await list_position_policy_versions(session, name=name)
+    policies = await list_position_policy_versions(session, name=name, limit=limit)
     return {"ok": True, "items": [_serialize_position_policy(p) for p in policies]}
 
 
@@ -271,7 +276,10 @@ async def _bind_policies_impl(
         raise HTTPException(status_code=404, detail="Strategy config not found")
 
     existing = await get_strategy_policy_binding(session, strategy_config_id=strategy_config_id)
-    fields_set = set(getattr(payload, "__fields_set__", set()))
+    fields_set = set(
+        getattr(payload, "model_fields_set", None)
+        or getattr(payload, "__fields_set__", set())
+    )
 
     risk_policy_id = (
         payload.risk_policy_id
@@ -319,6 +327,10 @@ async def _bind_policies_impl(
             "strategy_config_id": strategy_config_id,
             "policy_type": "risk+position",
             "actor": "admin",
+            "name": {
+                "risk": risk_policy.name if risk_policy else (old_risk.name if old_risk else None),
+                "position": position_policy.name if position_policy else (old_position.name if old_position else None),
+            },
             "notes": notes,
             "from_id": {
                 "risk": old_risk.id if old_risk else None,
@@ -415,17 +427,17 @@ async def rollback_strategy_policy(
     if policy_type == "risk":
         current_risk_id = binding.risk_policy_id if binding and binding.risk_policy_id is not None else strategy.risk_policy_id
         if current_risk_id is None:
-            raise HTTPException(status_code=409, detail="No effective risk policy to roll back")
+            raise HTTPException(status_code=400, detail="Cannot resolve current risk policy name")
         from_policy = await session.get(RiskPolicy, current_risk_id)
         if from_policy is None:
-            raise HTTPException(status_code=404, detail="Current risk policy not found")
+            raise HTTPException(status_code=400, detail="Cannot resolve current risk policy name")
         to_policy = await get_risk_policy_by_name_version(
             session,
             name=from_policy.name,
             version=payload.to_version,
         )
         if to_policy is None:
-            raise HTTPException(status_code=404, detail="Target risk policy version not found")
+            raise HTTPException(status_code=400, detail="Target risk policy version not found")
 
         binding_row, _ = await bind_strategy_policy(
             session,
@@ -442,6 +454,7 @@ async def rollback_strategy_policy(
                 "strategy_config_id": strategy_config_id,
                 "policy_type": "risk",
                 "actor": "admin",
+                "name": from_policy.name,
                 "notes": notes,
                 "from_id": from_policy.id,
                 "from_version": from_policy.version,
@@ -465,17 +478,17 @@ async def rollback_strategy_policy(
         }
 
     if binding is None or binding.position_policy_id is None:
-        raise HTTPException(status_code=409, detail="No bound position policy to roll back")
+        raise HTTPException(status_code=400, detail="Cannot resolve current position policy name")
     from_policy = await session.get(PositionPolicyConfig, binding.position_policy_id)
     if from_policy is None:
-        raise HTTPException(status_code=404, detail="Current position policy not found")
+        raise HTTPException(status_code=400, detail="Cannot resolve current position policy name")
     to_policy = await get_position_policy_by_name_version(
         session,
         name=from_policy.name,
         version=payload.to_version,
     )
     if to_policy is None:
-        raise HTTPException(status_code=404, detail="Target position policy version not found")
+        raise HTTPException(status_code=400, detail="Target position policy version not found")
 
     binding_row, _ = await bind_strategy_policy(
         session,
@@ -492,6 +505,7 @@ async def rollback_strategy_policy(
             "strategy_config_id": strategy_config_id,
             "policy_type": "position",
             "actor": "admin",
+            "name": from_policy.name,
             "notes": notes,
             "from_id": str(from_policy.id),
             "from_version": from_policy.version,
