@@ -63,7 +63,16 @@ async def check_equity_risk(
     max_daily_loss = _to_decimal(getattr(policy, "max_daily_loss_usdt", None))
     max_drawdown = _to_decimal(getattr(policy, "max_drawdown_usdt", None))
     max_drawdown_pct = _to_decimal(getattr(policy, "max_drawdown_pct", None))
-    lookback_hours = _to_int(getattr(policy, "equity_lookback_hours", None)) or 24
+    lookback_minutes_raw = _to_int(getattr(policy, "lookback_minutes", None))
+    lookback_hours_raw = _to_int(getattr(policy, "equity_lookback_hours", None))
+    if lookback_minutes_raw is not None and lookback_minutes_raw > 0:
+        lookback_minutes = lookback_minutes_raw
+        lookback_hours = max(1, (lookback_minutes + 59) // 60)
+        lookback_delta = timedelta(minutes=lookback_minutes)
+    else:
+        lookback_hours = lookback_hours_raw or 24
+        lookback_minutes = lookback_hours * 60
+        lookback_delta = timedelta(hours=lookback_hours)
 
     if max_daily_loss is None and max_drawdown is None and max_drawdown_pct is None:
         return None if not return_details else {"code": None, "reason": None, "details": None}
@@ -71,18 +80,20 @@ async def check_equity_risk(
     try:
         equity_expr = _equity_col()
         latest_row = await session.execute(
-            select(equity_expr, EquitySnapshot.created_at)
+            select(EquitySnapshot.id, equity_expr, EquitySnapshot.created_at)
             .where(EquitySnapshot.account_id == account_id)
-            .order_by(EquitySnapshot.created_at.desc())
+            .order_by(EquitySnapshot.created_at.desc(), EquitySnapshot.id.desc())
             .limit(1)
         )
         latest = latest_row.first()
-        if not latest or latest[0] is None:
+        if not latest or latest[1] is None:
             return None if not return_details else {"code": None, "reason": None, "details": None}
-        current_equity = Decimal(str(latest[0]))
+        latest_snapshot_id = latest[0]
+        current_equity = Decimal(str(latest[1]))
+        latest_snapshot_created_at = latest[2]
 
         now = now_utc if now_utc.tzinfo else now_utc.replace(tzinfo=timezone.utc)
-        window_start = now - timedelta(hours=lookback_hours)
+        window_start = now - lookback_delta
 
         peak_equity = None
         if max_drawdown is not None or max_drawdown_pct is not None:
@@ -91,6 +102,7 @@ async def check_equity_risk(
                 .where(
                     EquitySnapshot.account_id == account_id,
                     EquitySnapshot.created_at >= window_start,
+                    EquitySnapshot.created_at <= now,
                 )
             )
             if peak is not None:
@@ -129,10 +141,15 @@ async def check_equity_risk(
             "account_id": account_id,
             "strategy_id": str(strategy_id) if strategy_id is not None else None,
             "current_equity": fmt_decimal(current_equity),
+            "latest_snapshot_id": latest_snapshot_id,
+            "latest_snapshot_created_at": latest_snapshot_created_at.isoformat()
+            if latest_snapshot_created_at is not None
+            else None,
             "peak_equity": fmt_decimal(peak_equity),
             "drawdown_usdt": None,
             "max_drawdown_usdt": fmt_decimal(max_drawdown),
             "drawdown_pct": None,
+            "drawdown_pct_percent": None,
             "max_drawdown_pct": fmt_decimal(max_drawdown_pct),
             "sod_equity": fmt_decimal(sod_equity),
             "daily_loss_usdt": None,
@@ -140,6 +157,7 @@ async def check_equity_risk(
             "window_start": window_start.isoformat(),
             "now": now.isoformat(),
             "equity_lookback_hours": lookback_hours,
+            "lookback_minutes": lookback_minutes,
         }
 
         if max_daily_loss is not None and sod_equity is not None:
@@ -165,7 +183,9 @@ async def check_equity_risk(
         if max_drawdown_pct is not None and peak_equity is not None and peak_equity > 0:
             pct_limit = max_drawdown_pct / Decimal("100") if max_drawdown_pct > 1 else max_drawdown_pct
             drawdown_pct = (peak_equity - current_equity) / peak_equity
-            details["drawdown_pct"] = fmt_decimal(drawdown_pct * Decimal("100"))
+            details["drawdown_pct"] = fmt_decimal(drawdown_pct)
+            details["drawdown_pct_percent"] = fmt_decimal(drawdown_pct * Decimal("100"))
+            details["max_drawdown_pct_limit"] = fmt_decimal(pct_limit)
             if drawdown_pct > pct_limit:
                 return make_reject(
                     "MAX_DRAWDOWN_PCT",
