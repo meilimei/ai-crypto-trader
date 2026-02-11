@@ -22,7 +22,7 @@ from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceRes
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
-from ai_crypto_trader.services.explainability.store import create_trade_explanation
+from ai_crypto_trader.services.explainability.explainability import emit_trade_decision
 from ai_crypto_trader.services.paper_trader.rejects import RejectReason, log_reject_throttled, make_reject
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
@@ -213,30 +213,34 @@ class PaperTradingEngine:
             if qty_dec <= 0:
                 reject = make_reject("ZERO_OR_NEGATIVE_QTY", "Execution skipped")
                 try:
-                    await create_trade_explanation(
+                    await emit_trade_decision(
                         session,
-                        account_id=account_id,
-                        strategy_config_id=strategy_config_id,
-                        strategy_id=str(strategy_config_id) if strategy_config_id is not None else None,
-                        symbol=symbol_norm,
-                        side=side,
-                        requested_qty=qty_dec,
-                        decision={
-                            "message": "Execution skipped",
-                            "reject": reject,
-                            "request": {
-                                "account_id": account_id,
-                                "strategy_config_id": strategy_config_id,
-                                "symbol": symbol_norm,
-                                "side": side,
-                                "qty": str(delta_qty),
+                        {
+                            "created_now_utc": datetime.now(timezone.utc),
+                            "account_id": str(account_id),
+                            "strategy_id": str(strategy_config_id) if strategy_config_id is not None else None,
+                            "strategy_config_id": strategy_config_id,
+                            "symbol_in": symbol,
+                            "symbol_normalized": symbol_norm,
+                            "side": side,
+                            "qty_requested": str(qty_dec),
+                            "status": "skipped",
+                            "rationale": "Execution skipped: zero or negative qty",
+                            "inputs": {
+                                "strategy_thresholds": None,
+                                "timeframe": self.config.timeframe,
+                                "symbols": [symbol_norm],
+                                "price_source": "engine",
+                                "market_price_used": str(summary.last_close),
                             },
+                            "policy_source": "strategy_legacy" if strategy_config_id is not None else "account_default",
+                            "policy_binding": {"strategy_config_id": strategy_config_id},
+                            "computed_limits": {},
+                            "result": {"reject": reject},
                         },
-                        rationale="ZERO_OR_NEGATIVE_QTY",
-                        status="skipped",
                     )
                 except Exception:
-                    logger.exception("Failed to create trade explanation for skipped zero qty")
+                    logger.exception("Failed to emit trade decision for skipped zero qty")
                 await log_reject_throttled(
                     action="ORDER_SKIPPED",
                     account_id=account_id,
@@ -275,32 +279,34 @@ class PaperTradingEngine:
             logger.exception("Execution failed; skipping symbol", extra={"symbol": symbol_norm})
             reject = make_reject(exc.__class__.__name__, "Execution skipped", {"error": str(exc)})
             try:
-                await create_trade_explanation(
+                await emit_trade_decision(
                     session,
-                    account_id=account_id,
-                    strategy_config_id=strategy_config_id,
-                    strategy_id=str(strategy_config_id) if strategy_config_id is not None else None,
-                    symbol=symbol_norm,
-                    side=side,
-                    requested_qty=qty_dec if qty_dec > 0 else None,
-                    decision={
-                        "message": "Execution skipped",
-                        "reject": reject,
-                        "request": {
-                            "account_id": account_id,
-                            "strategy_config_id": strategy_config_id,
-                            "symbol": symbol_norm,
-                            "side": side,
-                            "qty": str(delta_qty),
+                    {
+                        "created_now_utc": datetime.now(timezone.utc),
+                        "account_id": str(account_id),
+                        "strategy_id": str(strategy_config_id) if strategy_config_id is not None else None,
+                        "strategy_config_id": strategy_config_id,
+                        "symbol_in": symbol,
+                        "symbol_normalized": symbol_norm,
+                        "side": side,
+                        "qty_requested": str(qty_dec if qty_dec > 0 else Decimal("0")),
+                        "status": "skipped",
+                        "rationale": f"{exc.__class__.__name__}: {exc}",
+                        "inputs": {
+                            "strategy_thresholds": None,
+                            "timeframe": self.config.timeframe,
+                            "symbols": [symbol_norm],
+                            "price_source": "engine",
+                            "market_price_used": str(summary.last_close),
                         },
-                        "error": str(exc),
-                        "error_type": exc.__class__.__name__,
+                        "policy_source": "strategy_legacy" if strategy_config_id is not None else "account_default",
+                        "policy_binding": {"strategy_config_id": strategy_config_id},
+                        "computed_limits": {},
+                        "result": {"reject": reject},
                     },
-                    rationale=f"{exc.__class__.__name__}: {exc}",
-                    status="skipped",
                 )
             except Exception:
-                logger.exception("Failed to create trade explanation for execution exception")
+                logger.exception("Failed to emit trade decision for execution exception")
             await log_reject_throttled(
                 action="ORDER_SKIPPED",
                 account_id=account_id,

@@ -33,7 +33,6 @@ from ai_crypto_trader.services.admin_actions.throttled import write_admin_action
 from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
 from ai_crypto_trader.services.monitoring.strategy_monitor import run_strategy_monitor_tick
 from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox_once
-from ai_crypto_trader.services.explainability.store import update_open_trade_explanations_outcomes
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -59,7 +58,6 @@ class PaperTraderRunner:
         self._stall_monitor_task: Optional[asyncio.Task[None]] = None
         self._outbox_task: Optional[asyncio.Task[None]] = None
         self._strategy_monitor_task: Optional[asyncio.Task[None]] = None
-        self._explainability_task: Optional[asyncio.Task[None]] = None
         self.last_reconcile_at: Optional[datetime] = None
         self.reconcile_tick_count: int = 0
         self.reconcile_interval_seconds: int = 0
@@ -114,10 +112,6 @@ class PaperTraderRunner:
             self._strategy_monitor_loop(),
             name="strategy_monitor",
         )
-        self._explainability_task = asyncio.create_task(
-            self._explainability_loop(),
-            name="trade_explainability",
-        )
         self._task = asyncio.create_task(_run(), name="paper-trader")
 
     async def stop(self) -> None:
@@ -153,13 +147,6 @@ class PaperTraderRunner:
             except asyncio.CancelledError:
                 pass
         self._strategy_monitor_task = None
-        if self._explainability_task:
-            self._explainability_task.cancel()
-            try:
-                await self._explainability_task
-            except asyncio.CancelledError:
-                pass
-        self._explainability_task = None
         if self._stall_monitor_task:
             self._stall_monitor_task.cancel()
             try:
@@ -668,37 +655,6 @@ class PaperTraderRunner:
                         await session.commit()
                     except Exception:
                         logger.exception("Strategy monitor tick heartbeat write failed")
-            await asyncio.sleep(tick_seconds)
-
-    async def _explainability_loop(self) -> None:
-        tick_seconds = max(int(os.getenv("EXPLAINABILITY_TICK_SECONDS", "60")), 1)
-        min_age_seconds = max(int(os.getenv("EXPLAINABILITY_OUTCOME_MIN_AGE_SECONDS", "60")), 0)
-        limit = max(int(os.getenv("EXPLAINABILITY_OUTCOME_BATCH_SIZE", "200")), 1)
-        while self.is_running:
-            now_utc = datetime.now(timezone.utc)
-            async with AsyncSessionLocal() as session:
-                try:
-                    stats = await update_open_trade_explanations_outcomes(
-                        session,
-                        now_utc=now_utc,
-                        min_age_seconds=min_age_seconds,
-                        limit=limit,
-                    )
-                    await session.commit()
-                    logger.info(
-                        "trade explainability outcome tick",
-                        extra={
-                            "now_utc": now_utc.isoformat(),
-                            "min_age_seconds": min_age_seconds,
-                            "limit": limit,
-                            "scanned_count": int(stats.get("scanned_count", 0) or 0),
-                            "closed_count": int(stats.get("closed_count", 0) or 0),
-                            "pending_count": int(stats.get("pending_count", 0) or 0),
-                        },
-                    )
-                except Exception:
-                    await session.rollback()
-                    logger.exception("Trade explainability outcome updater failed")
             await asyncio.sleep(tick_seconds)
 
 

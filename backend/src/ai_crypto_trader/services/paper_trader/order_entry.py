@@ -10,7 +10,8 @@ from uuid import UUID
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_crypto_trader.common.models import Candle, EquitySnapshot, PaperPosition, PaperTrade
+from ai_crypto_trader.common.models import Candle, EquitySnapshot, PaperPosition, PaperTrade, StrategyConfig
+from ai_crypto_trader.services.explainability.explainability import emit_trade_decision
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.execution import ExecutionResult, execute_market_order_with_costs
 from ai_crypto_trader.services.paper_trader.equity import compute_equity
@@ -20,7 +21,6 @@ from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
     get_effective_risk_policy,
 )
-from ai_crypto_trader.services.explainability.store import create_trade_explanation
 from ai_crypto_trader.services.policies.loader import (
     get_effective_policy_ids,
     load_position_policy,
@@ -396,8 +396,26 @@ async def place_order_unified(
         "equity_lookback_hours": None,
         "lookback_minutes": None,
     }
+    strategy_thresholds = None
+    strategy_timeframe = None
+    strategy_symbols_snapshot = None
 
     if strategy_config_id is not None:
+        strategy_row = (
+            await session.execute(
+                select(
+                    StrategyConfig.thresholds,
+                    StrategyConfig.timeframe,
+                    StrategyConfig.symbols,
+                )
+                .where(StrategyConfig.id == strategy_config_id)
+                .limit(1)
+            )
+        ).first()
+        if strategy_row is not None:
+            strategy_thresholds = strategy_row[0] if isinstance(strategy_row[0], dict) else None
+            strategy_timeframe = strategy_row[1]
+            strategy_symbols_snapshot = strategy_row[2] if isinstance(strategy_row[2], list) else None
         policy_ids = await get_effective_policy_ids(session, strategy_config_id=strategy_config_id)
         if policy_ids is not None:
             bound_policy_meta = {
@@ -416,6 +434,8 @@ async def place_order_unified(
                 policy_source = "binding"
             elif policy_ids.effective_risk_policy_id is not None:
                 policy_source = "strategy_legacy"
+            if strategy_symbols_snapshot is None and policy_ids.strategy_symbols:
+                strategy_symbols_snapshot = list(policy_ids.strategy_symbols)
             if policy_ids.position_policy_id is not None:
                 bound_position_policy_row = await load_position_policy(
                     session,
@@ -576,21 +596,48 @@ async def place_order_unified(
         if extra_meta:
             payload.update(extra_meta)
         try:
-            await create_trade_explanation(
+            await emit_trade_decision(
                 session,
-                account_id=account_id,
-                strategy_config_id=strategy_config_id,
-                strategy_id=strategy_id_for_meta,
-                symbol=symbol_norm,
-                side=side_norm,
-                requested_qty=prepared.qty if prepared is not None else qty_dec_raw,
-                decision=payload,
-                rationale=reject.reason,
-                status="skipped" if reject_action_type == "ORDER_SKIPPED" else "rejected",
+                {
+                    "created_now_utc": datetime.now(timezone.utc),
+                    "account_id": str(account_id),
+                    "strategy_id": strategy_id_for_meta,
+                    "strategy_config_id": strategy_config_id,
+                    "symbol_in": symbol_in,
+                    "symbol_normalized": symbol_norm,
+                    "side": side_norm,
+                    "qty_requested": str(
+                        prepared.qty
+                        if prepared is not None
+                        else (qty_dec_raw if qty_dec_raw is not None else qty)
+                    ),
+                    "status": "skipped" if reject_action_type == "ORDER_SKIPPED" else "rejected",
+                    "rationale": reject.reason,
+                    "inputs": {
+                        "strategy_thresholds": strategy_thresholds,
+                        "timeframe": strategy_timeframe,
+                        "symbols": strategy_symbols_snapshot,
+                        "price_source": price_source or market_price_source,
+                        "market_price_used": str(prepared.price)
+                        if prepared is not None
+                        else (str(market_price) if market_price is not None else None),
+                    },
+                    "policy_source": policy_source_local,
+                    "policy_binding": bound_policy_meta,
+                    "computed_limits": {
+                        "risk_limits": payload.get("risk_limits"),
+                        "risk_limit_source": payload.get("risk_limit_source"),
+                        "risk_policy_overrides": payload.get("risk_policy_overrides"),
+                        "symbol_limits": payload.get("symbol_limits"),
+                        "symbol_limit_source": payload.get("symbol_limit_source"),
+                        "position_policy_overrides": payload.get("position_policy_overrides"),
+                    },
+                    "result": {"reject": reject_payload},
+                },
             )
         except Exception:
             logger.exception(
-                "Failed to create trade explanation for reject",
+                "Failed to emit trade decision for reject",
                 extra={
                     "account_id": account_id,
                     "strategy_config_id": strategy_config_id,
@@ -1329,22 +1376,23 @@ async def place_order_unified(
         return reject
 
     decision_payload = {
-        "message": "Order accepted and executed",
-        "account_id": account_id,
-        "symbol": prepared.symbol,
-        "request": {
-            "account_id": account_id,
-            "symbol_in": symbol_in,
-            "symbol_normalized": prepared.symbol,
-            "side": side_norm,
-            "qty": str(prepared.qty),
-            "price_override": str(price_override) if price_override is not None else None,
-            "strategy_id": strategy_id_for_meta,
-            "strategy_config_id": strategy_config_id,
+        "created_now_utc": datetime.now(timezone.utc),
+        "account_id": str(account_id),
+        "strategy_id": strategy_id_for_meta,
+        "strategy_config_id": strategy_config_id,
+        "symbol_in": symbol_in,
+        "symbol_normalized": prepared.symbol,
+        "side": side_norm,
+        "qty_requested": str(prepared.qty),
+        "status": "executed",
+        "rationale": "Risk and position checks passed; order executed",
+        "inputs": {
+            "strategy_thresholds": strategy_thresholds,
+            "timeframe": strategy_timeframe,
+            "symbols": strategy_symbols_snapshot,
+            "price_source": price_source or market_price_source,
+            "market_price_used": str(prepared.price),
         },
-        "market_price": str(prepared.price),
-        "price_source": price_source or market_price_source,
-        "notional": str(notional),
         "policy_source": policy_source,
         "policy_binding": bound_policy_meta,
         "computed_limits": {
@@ -1389,31 +1437,22 @@ async def place_order_unified(
             "symbol_limit_source": position_policy_limit_source,
             "position_policy_overrides": position_policy_symbol_override,
         },
-        "execution": {
+        "result": {
             "order_id": execution.order.id,
             "trade_id": execution.trade.id,
-            "fill_price": str(execution.order.avg_fill_price) if execution.order.avg_fill_price is not None else str(prepared.price),
-            "fee_paid": str(execution.order.fee_paid) if execution.order.fee_paid is not None else None,
+            "executed_qty": str(prepared.qty),
+            "executed_price": str(execution.order.avg_fill_price)
+            if execution.order.avg_fill_price is not None
+            else str(prepared.price),
+            "fee": str(execution.order.fee_paid) if execution.order.fee_paid is not None else None,
+            "created_at": execution.trade.created_at.isoformat() if execution.trade.created_at else None,
         },
     }
     try:
-        await create_trade_explanation(
-            session,
-            account_id=account_id,
-            strategy_config_id=strategy_config_id,
-            strategy_id=strategy_id_for_meta,
-            symbol=prepared.symbol,
-            side=side_norm,
-            requested_qty=prepared.qty,
-            decision=decision_payload,
-            rationale="Risk and position checks passed; order executed",
-            status="open",
-            executed_trade_id=execution.trade.id,
-            order_id=execution.order.id,
-        )
+        await emit_trade_decision(session, decision_payload)
     except Exception:
         logger.exception(
-            "Failed to create trade explanation for executed order",
+            "Failed to emit trade decision for executed order",
             extra={
                 "account_id": account_id,
                 "strategy_config_id": strategy_config_id,
