@@ -401,7 +401,9 @@ async def explainability_summary(
         raise HTTPException(status_code=500, detail="Failed to compute explainability summary")
 
 
-@router.post("/outcome-tick")
+@router.post("/emit-outcomes", operation_id="emit_explainability_outcomes")
+@router.post("/emit_outcomes", include_in_schema=False)
+@router.post("/outcome-tick", include_in_schema=False)
 async def run_explainability_outcome_tick(
     payload: OutcomeTickRequest | None = None,
     session: AsyncSession = Depends(get_db_session),
@@ -418,6 +420,14 @@ async def run_explainability_outcome_tick(
         return stats
     except Exception as exc:
         await session.rollback()
+        logger.exception(
+            "EXPLAINABILITY_EMIT_OUTCOMES_FAILED",
+            extra={
+                "limit": int(body.limit),
+                "min_age_seconds": int(body.min_age_seconds),
+                "horizon_seconds": int(body.horizon_seconds),
+            },
+        )
         raise HTTPException(status_code=500, detail=f"outcome tick failed: {exc}")
 
 
