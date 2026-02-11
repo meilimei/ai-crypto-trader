@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_crypto_trader.common.models import AdminAction, Candle, PaperTrade
+from ai_crypto_trader.common.models import AdminAction, Candle, EquitySnapshot, PaperTrade
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.utils.json_safe import json_safe
 
@@ -164,9 +164,24 @@ async def emit_trade_decision(
     meta["account_id"] = str(account_id_raw) if account_id_raw is not None else None
     meta["strategy_id"] = str(strategy_id) if strategy_id is not None else None
     meta["strategy_config_id"] = strategy_config_id
+    meta["symbol"] = symbol_normalized
     meta["symbol_normalized"] = symbol_normalized
     meta["side"] = side
     meta["status"] = status
+    if "qty" not in meta:
+        meta["qty"] = str(qty_requested) if qty_requested is not None else None
+    if "market_price" not in meta or meta.get("market_price") is None:
+        market_price = _latest_price_from_payload(meta)
+        if market_price is not None:
+            meta["market_price"] = str(market_price)
+    if "price_source" not in meta or meta.get("price_source") is None:
+        inputs = meta.get("inputs")
+        if isinstance(inputs, dict):
+            meta["price_source"] = inputs.get("price_source")
+    if "reject" not in meta:
+        result = meta.get("result")
+        if isinstance(result, dict) and isinstance(result.get("reject"), dict):
+            meta["reject"] = result.get("reject")
 
     row = AdminAction(
         action="TRADE_DECISION",
@@ -351,6 +366,18 @@ async def run_outcome_tick(
                 errors += 1
                 continue
 
+            latest_equity_row = await session.execute(
+                select(
+                    EquitySnapshot.id,
+                    EquitySnapshot.created_at,
+                    func.coalesce(EquitySnapshot.equity_usdt, EquitySnapshot.equity),
+                )
+                .where(EquitySnapshot.account_id == account_id)
+                .order_by(EquitySnapshot.created_at.desc(), EquitySnapshot.id.desc())
+                .limit(1)
+            )
+            equity_snapshot = latest_equity_row.first()
+
             sign = Decimal("1") if side == "buy" else Decimal("-1")
             pnl_usdt_est = qty * (eval_price - entry_price) * sign
             return_pct_signed = (
@@ -366,12 +393,20 @@ async def run_outcome_tick(
                 "qty": str(qty),
                 "entry_price": str(entry_price),
                 "horizon_seconds": int(horizon_seconds),
+                "decision_action_id": decision.id,
+                "decision_action_created_at": _to_iso(decision.created_at),
                 "eval_price": str(eval_price),
                 "eval_price_source": price_source,
                 "return_pct_signed": str(return_pct_signed),
                 "pnl_usdt_est": str(pnl_usdt_est),
                 "win": pnl_usdt_est > 0,
             }
+            if equity_snapshot:
+                payload["latest_equity_snapshot_id"] = equity_snapshot[0]
+                payload["latest_equity_snapshot_created_at"] = _to_iso(equity_snapshot[1])
+                payload["latest_equity_usdt"] = (
+                    str(equity_snapshot[2]) if equity_snapshot[2] is not None else None
+                )
             emitted_row = await emit_trade_outcome(session, payload)
             if emitted_row is not None:
                 emitted += 1
@@ -379,10 +414,22 @@ async def run_outcome_tick(
             errors += 1
             logger.exception("trade explainability outcome tick failed for decision", extra={"decision_key": decision_key})
 
-    return {
+    stats = {
         "picked": picked,
         "emitted": emitted,
         "skipped_existing": skipped_existing,
         "errors": errors,
     }
-
+    logger.info(
+        "trade explainability outcome tick",
+        extra={
+            "picked_count": picked,
+            "wrote_count": emitted,
+            "skipped_existing": skipped_existing,
+            "errors": errors,
+            "min_age_seconds": int(min_age_seconds),
+            "horizon_seconds": int(horizon_seconds),
+            "limit": int(limit),
+        },
+    )
+    return stats

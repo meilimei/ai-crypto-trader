@@ -69,15 +69,25 @@ def _to_decimal(value: Any) -> Decimal | None:
 def _base_filters(
     *,
     action: str,
-    since_minutes: int,
     account_id: int | None,
     strategy_config_id: int | None,
     symbol: str | None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    since_minutes: int | None = None,
 ) -> list[Any]:
-    filters: list[Any] = [
-        AdminAction.action == action,
-        AdminAction.created_at >= (datetime.now(timezone.utc) - timedelta(minutes=max(int(since_minutes), 1))),
-    ]
+    filters: list[Any] = [AdminAction.action == action]
+    if since_minutes is not None:
+        filters.append(
+            AdminAction.created_at
+            >= (datetime.now(timezone.utc) - timedelta(minutes=max(int(since_minutes), 1)))
+        )
+    if since is not None:
+        since_utc = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
+        filters.append(AdminAction.created_at >= since_utc)
+    if until is not None:
+        until_utc = until if until.tzinfo is not None else until.replace(tzinfo=timezone.utc)
+        filters.append(AdminAction.created_at <= until_utc)
     if account_id is not None:
         filters.append(meta_text(AdminAction.meta, "account_id") == str(account_id))
     if strategy_config_id is not None:
@@ -94,37 +104,49 @@ def _flag_enabled(name: str, default: str = "false") -> bool:
 @router.get("/decisions")
 async def list_trade_decisions(
     limit: int = Query(default=50),
-    offset: int = Query(default=0, ge=0),
+    cursor: int | None = Query(default=None, ge=1),
     account_id: int | None = Query(default=None),
     strategy_config_id: int | None = Query(default=None),
     symbol: str | None = Query(default=None),
     status: str | None = Query(default=None),
-    since_minutes: int = Query(default=1440, ge=1),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    limit_value, offset_value = clamp_limit_offset(limit=limit, offset=offset, default_limit=50, max_limit=200)
-    filters = _base_filters(
+    limit_value, _ = clamp_limit_offset(limit=limit, offset=0, default_limit=50, max_limit=200)
+    base_filters = _base_filters(
         action="TRADE_DECISION",
-        since_minutes=since_minutes,
         account_id=account_id,
         strategy_config_id=strategy_config_id,
         symbol=symbol,
+        since=since,
+        until=until,
     )
+    filters = list(base_filters)
     if status:
-        filters.append(meta_text(AdminAction.meta, "status") == status.strip().lower())
+        filters.append(func.lower(func.coalesce(meta_text(AdminAction.meta, "status"), "")) == status.strip().lower())
+    if cursor is not None:
+        filters.append(AdminAction.id < cursor)
 
     total = int(
-        (await session.execute(select(func.count()).select_from(AdminAction).where(and_(*filters)))).scalar_one() or 0
+        (
+            await session.execute(
+                select(func.count()).select_from(AdminAction).where(and_(*base_filters))
+            )
+        ).scalar_one()
+        or 0
     )
     rows = (
         await session.execute(
             select(AdminAction)
             .where(and_(*filters))
-            .order_by(AdminAction.created_at.desc(), AdminAction.id.asc())
-            .offset(offset_value)
-            .limit(limit_value)
+            .order_by(AdminAction.id.desc())
+            .limit(limit_value + 1)
         )
     ).scalars().all()
+    has_more = len(rows) > limit_value
+    rows = rows[:limit_value]
+    next_cursor = rows[-1].id if has_more and rows else None
 
     decision_keys = []
     for row in rows:
@@ -144,7 +166,7 @@ async def list_trade_decisions(
                         meta_text(AdminAction.meta, "decision_key").in_(decision_keys),
                     )
                 )
-                .order_by(AdminAction.created_at.desc(), AdminAction.id.desc())
+                .order_by(AdminAction.id.desc())
             )
         ).scalars().all()
         for outcome in outcome_rows:
@@ -165,45 +187,64 @@ async def list_trade_decisions(
         "items": items,
         "total": total,
         "limit": limit_value,
-        "offset": offset_value,
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
     }
 
 
 @router.get("/outcomes")
 async def list_trade_outcomes(
     limit: int = Query(default=50),
-    offset: int = Query(default=0, ge=0),
+    cursor: int | None = Query(default=None, ge=1),
     account_id: int | None = Query(default=None),
     strategy_config_id: int | None = Query(default=None),
     symbol: str | None = Query(default=None),
-    since_minutes: int = Query(default=1440, ge=1),
+    status: str | None = Query(default=None),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    limit_value, offset_value = clamp_limit_offset(limit=limit, offset=offset, default_limit=50, max_limit=200)
-    filters = _base_filters(
+    limit_value, _ = clamp_limit_offset(limit=limit, offset=0, default_limit=50, max_limit=200)
+    base_filters = _base_filters(
         action="TRADE_OUTCOME",
-        since_minutes=since_minutes,
         account_id=account_id,
         strategy_config_id=strategy_config_id,
         symbol=symbol,
+        since=since,
+        until=until,
     )
+    filters = list(base_filters)
+    if status:
+        filters.append(AdminAction.status == status.strip().lower())
+    if cursor is not None:
+        filters.append(AdminAction.id < cursor)
     total = int(
-        (await session.execute(select(func.count()).select_from(AdminAction).where(and_(*filters)))).scalar_one() or 0
+        (
+            await session.execute(
+                select(func.count()).select_from(AdminAction).where(and_(*base_filters))
+            )
+        ).scalar_one()
+        or 0
     )
     rows = (
         await session.execute(
             select(AdminAction)
             .where(and_(*filters))
-            .order_by(AdminAction.created_at.desc(), AdminAction.id.asc())
-            .offset(offset_value)
-            .limit(limit_value)
+            .order_by(AdminAction.id.desc())
+            .limit(limit_value + 1)
         )
     ).scalars().all()
+    has_more = len(rows) > limit_value
+    rows = rows[:limit_value]
+    next_cursor = rows[-1].id if has_more and rows else None
     return {
         "items": [_serialize_action(row) for row in rows],
         "total": total,
         "limit": limit_value,
-        "offset": offset_value,
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
     }
 
 
@@ -217,10 +258,10 @@ async def explainability_summary(
 ) -> dict[str, Any]:
     decision_filters = _base_filters(
         action="TRADE_DECISION",
-        since_minutes=window_minutes,
         account_id=account_id,
         strategy_config_id=strategy_config_id,
         symbol=symbol,
+        since_minutes=window_minutes,
     )
     decision_rows = (
         await session.execute(
@@ -249,10 +290,10 @@ async def explainability_summary(
 
     outcome_filters = _base_filters(
         action="TRADE_OUTCOME",
-        since_minutes=window_minutes,
         account_id=account_id,
         strategy_config_id=strategy_config_id,
         symbol=symbol,
+        since_minutes=window_minutes,
     )
     rows = (
         await session.execute(
