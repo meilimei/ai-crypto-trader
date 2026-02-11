@@ -28,12 +28,14 @@ from ai_crypto_trader.common.models import (
     PaperPosition,
     PaperTrade,
     AdminAction,
+    StrategyConfig,
     utc_now,
 )
 
 from ai_crypto_trader.common.log_buffer import get_log_buffer
 from ai_crypto_trader.services.paper_trader.config import get_active_bundle, ActiveConfigMissingError, PaperTraderConfig
 from ai_crypto_trader.services.agent.auto_trade import AutoTradeAgent, AutoTradeSettings
+from ai_crypto_trader.agents.auto_symbol import select_symbol
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
@@ -82,6 +84,30 @@ def _reject_response(reason: RejectReason, status_code: int = 400) -> JSONRespon
     return JSONResponse(status_code=status_code, content={"ok": False, "reject": reason.dict()})
 
 
+def _attach_auto_symbol_response(result: dict | JSONResponse, auto_symbol: dict | None) -> dict | JSONResponse:
+    if not auto_symbol:
+        return result
+    selected_symbol = normalize_symbol(
+        str(auto_symbol.get("selected_symbol") or auto_symbol.get("symbol") or "")
+    )
+    if isinstance(result, dict):
+        enriched = dict(result)
+        enriched["auto_symbol"] = auto_symbol
+        if selected_symbol and "selected_symbol" not in enriched:
+            enriched["selected_symbol"] = selected_symbol
+        return enriched
+    try:
+        payload = json.loads((result.body or b"{}").decode("utf-8"))
+    except Exception:
+        return result
+    if not isinstance(payload, dict):
+        return result
+    payload["auto_symbol"] = auto_symbol
+    if selected_symbol and "selected_symbol" not in payload:
+        payload["selected_symbol"] = selected_symbol
+    return JSONResponse(status_code=result.status_code, content=payload, headers=dict(result.headers))
+
+
 def _reject_from_reason(reason: str) -> RejectReason:
     reason_norm = (reason or "").strip().upper()
     if reason_norm in {"QTY_NOT_POSITIVE", "QTY_ZERO"}:
@@ -128,6 +154,8 @@ def _to_decimal_or_none(value: object | None) -> Decimal | None:
 def _is_auto_symbol(value: str | None) -> bool:
     if value is None:
         return True
+    if not str(value).strip():
+        return True
     return normalize_symbol(value) == "AUTO"
 
 
@@ -141,47 +169,48 @@ async def _resolve_auto_smoke_decision(
     )
     if strategy_config_id is None:
         raise HTTPException(status_code=400, detail="strategy_config_id is required for AUTO symbol")
+    strategy_config = await session.get(StrategyConfig, strategy_config_id)
+    if strategy_config is None:
+        raise HTTPException(status_code=404, detail=f"strategy_config_id {strategy_config_id} not found")
 
-    agent = AutoTradeAgent(AutoTradeSettings.from_env())
-    try:
-        decision_bundle = await agent.decide_for_strategy(
-            session,
-            account_id=payload.account_id,
-            strategy_config_id=strategy_config_id,
-            symbol="AUTO",
-            timeframe=None,
-            window_minutes=60,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    decision = decision_bundle["decision"]
-    universe = decision_bundle["universe"]
-    timeframe = str(universe.get("timeframe") or PaperTraderConfig.from_env().timeframe)
-    if "candidates" not in decision:
-        decision["candidates"] = universe.get("fresh_candidates") or universe.get("candidates") or []
-    decision["candidates_count"] = len(decision.get("candidates") or [])
-    decision["candidates_sample"] = list((decision.get("candidates") or [])[:10])
-    decision["timeframe"] = timeframe
-    decision["strategy_config_id"] = strategy_config_id
-    decision["universe"] = {
-        "source": universe.get("source"),
-        "reason": universe.get("reason"),
-        "candidates_count": universe.get("candidates_count"),
-        "fresh_candidates_count": universe.get("fresh_candidates_count"),
+    strategy_symbols = strategy_config.symbols if isinstance(strategy_config.symbols, list) else []
+    normalized_symbols = [
+        normalize_symbol(item)
+        for item in strategy_symbols
+        if normalize_symbol(item) and normalize_symbol(item) != "AUTO"
+    ]
+    if not normalized_symbols:
+        raise HTTPException(status_code=400, detail="strategy_config symbols are empty for AUTO selection")
+
+    timeframe = str(strategy_config.timeframe or PaperTraderConfig.from_env().timeframe)
+    auto_symbol = await select_symbol(
+        session,
+        account_id=payload.account_id,
+        strategy_config_id=strategy_config_id,
+        timeframe=timeframe,
+        symbols=normalized_symbols,
+        now_utc=datetime.now(timezone.utc),
+    )
+    selected_symbol = normalize_symbol(str(auto_symbol.get("symbol") or auto_symbol.get("selected_symbol") or ""))
+    if not selected_symbol:
+        selected_symbol = normalized_symbols[0]
+
+    decision = {
+        "symbol": selected_symbol,
+        "selected_symbol": selected_symbol,
+        "confidence": auto_symbol.get("confidence"),
+        "rationale_bullets": auto_symbol.get("rationale") if isinstance(auto_symbol.get("rationale"), list) else [],
+        "signals": auto_symbol.get("signals") if isinstance(auto_symbol.get("signals"), dict) else {},
+        "reason": auto_symbol.get("reason"),
+        "candidates": normalized_symbols,
+        "candidates_count": len(normalized_symbols),
+        "candidates_sample": normalized_symbols[:10],
+        "timeframe": timeframe,
+        "strategy_config_id": strategy_config_id,
     }
 
-    selected_symbol = normalize_symbol(str(decision.get("selected_symbol") or ""))
-    selected_side = str(decision.get("side") or "hold").lower().strip()
-    qty_text = str(decision.get("qty") or "0")
-    try:
-        selected_qty = Decimal(qty_text)
-    except Exception:
-        selected_qty = Decimal("0")
-
     update_payload = {
-        "symbol": selected_symbol if selected_symbol else "AUTO",
-        "side": selected_side,
-        "qty": selected_qty if selected_qty > 0 else Decimal("0"),
+        "symbol": selected_symbol,
         "strategy_config_id": strategy_config_id,
         "strategy_id": str(strategy_config_id),
     }
@@ -1478,82 +1507,6 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
     agent_decision: dict | None = None
     if _is_auto_symbol(payload.symbol):
         resolved_payload, agent_decision = await _resolve_auto_smoke_decision(payload, session)
-        if str(agent_decision.get("side") or "hold").lower().strip() == "hold":
-            strategy_config_id = _resolve_strategy_config_id(
-                strategy_config_id=resolved_payload.strategy_config_id,
-                strategy_id=resolved_payload.strategy_id,
-            )
-            selected_symbol = normalize_symbol(str(agent_decision.get("selected_symbol") or "AUTO"))
-            snapshot = None
-            if strategy_config_id is not None:
-                snapshot = await resolve_effective_policy_snapshot(
-                    session,
-                    strategy_config_id=strategy_config_id,
-                    symbol=selected_symbol,
-                )
-            rationale = (
-                (agent_decision.get("rationale_bullets") or [agent_decision.get("reason") or "Agent decided hold"])[0]
-                if isinstance(agent_decision.get("rationale_bullets"), list)
-                else str(agent_decision.get("reason") or "Agent decided hold")
-            )
-            await emit_trade_decision(
-                session,
-                {
-                    "created_now_utc": datetime.now(timezone.utc),
-                    "account_id": str(resolved_payload.account_id),
-                    "strategy_id": resolved_payload.strategy_id,
-                    "strategy_config_id": strategy_config_id,
-                    "symbol_in": selected_symbol,
-                    "symbol_normalized": selected_symbol,
-                    "side": "hold",
-                    "qty_requested": "0",
-                    "status": "skipped",
-                    "rationale": rationale,
-                    "inputs": {
-                        "strategy_thresholds": None,
-                        "timeframe": agent_decision.get("timeframe"),
-                        "symbols": agent_decision.get("candidates"),
-                        "price_source": "agent_auto",
-                        "market_price_used": None,
-                    },
-                    "policy_source": snapshot.policy_source if snapshot else "account_default",
-                    "policy_binding": snapshot.policy_binding if snapshot else {"strategy_config_id": strategy_config_id},
-                    "computed_limits": snapshot.computed_limits if snapshot else {},
-                    "agent_decision": agent_decision,
-                    "result": {
-                        "reject": {
-                            "code": "AUTO_HOLD",
-                            "reason": str(agent_decision.get("reason") or "Agent decided hold"),
-                            "details": {"selected_symbol": selected_symbol},
-                        }
-                    },
-                },
-            )
-            await _record_action(
-                session,
-                "SMOKE_TRADE",
-                "ok",
-                "Smoke trade skipped (agent hold)",
-                meta=json_safe(
-                    {
-                        "account_id": resolved_payload.account_id,
-                        "strategy_config_id": strategy_config_id,
-                        "symbol": selected_symbol,
-                        "status": "skipped",
-                        "agent_decision": agent_decision,
-                    }
-                ),
-            )
-            return {
-                "ok": True,
-                "status": "skipped",
-                "reason": agent_decision.get("reason") or "Agent decided hold",
-                "selected_symbol": selected_symbol,
-                "agent_decision": agent_decision,
-                "policy_source": snapshot.policy_source if snapshot else "account_default",
-                "policy_binding": snapshot.policy_binding if snapshot else {"strategy_config_id": strategy_config_id},
-                "computed_limits": snapshot.computed_limits if snapshot else {},
-            }
 
     price_override_value = (
         resolved_payload.price_override
@@ -1633,13 +1586,14 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             await session.commit()
         except Exception:
             await session.rollback()
-        return _reject_response(reject, status_code=400)
+        return _attach_auto_symbol_response(_reject_response(reject, status_code=400), agent_decision)
     try:
-        return await _smoke_trade_impl(
+        response = await _smoke_trade_impl(
             resolved_payload,
             session,
             agent_decision=agent_decision,
         )
+        return _attach_auto_symbol_response(response, agent_decision)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1664,7 +1618,12 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
         )
         return JSONResponse(
             status_code=500,
-            content={"ok": False, "error": str(exc), "error_type": exc.__class__.__name__},
+            content={
+                "ok": False,
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+                "auto_symbol": agent_decision,
+            },
         )
 
 
