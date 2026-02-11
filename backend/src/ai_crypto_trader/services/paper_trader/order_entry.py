@@ -20,6 +20,7 @@ from ai_crypto_trader.services.paper_trader.policies_effective import (
     get_effective_position_policy,
     get_effective_risk_policy,
 )
+from ai_crypto_trader.services.explainability.store import create_trade_explanation
 from ai_crypto_trader.services.policies.loader import (
     get_effective_policy_ids,
     load_position_policy,
@@ -362,6 +363,7 @@ async def place_order_unified(
     symbol_in = (symbol or "ETHUSDT").strip()
     symbol_norm = normalize_symbol(symbol_in)
     side_norm = (side or "buy").lower().strip()
+    qty_dec_raw: Decimal | None = None
     price_source: Optional[str] = None
     policy_source = "account_default"
     strategy_id_norm = strategy_id
@@ -573,6 +575,30 @@ async def place_order_unified(
         }
         if extra_meta:
             payload.update(extra_meta)
+        try:
+            await create_trade_explanation(
+                session,
+                account_id=account_id,
+                strategy_config_id=strategy_config_id,
+                strategy_id=strategy_id_for_meta,
+                symbol=symbol_norm,
+                side=side_norm,
+                requested_qty=prepared.qty if prepared is not None else qty_dec_raw,
+                decision=payload,
+                rationale=reject.reason,
+                status="skipped" if reject_action_type == "ORDER_SKIPPED" else "rejected",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to create trade explanation for reject",
+                extra={
+                    "account_id": account_id,
+                    "strategy_config_id": strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": side_norm,
+                    "reject_code": str(reject.code),
+                },
+            )
         await log_reject_throttled(
             action=reject_action_type,
             account_id=account_id,
@@ -1301,6 +1327,102 @@ async def place_order_unified(
             position_policy=position_policy,
         )
         return reject
+
+    decision_payload = {
+        "message": "Order accepted and executed",
+        "account_id": account_id,
+        "symbol": prepared.symbol,
+        "request": {
+            "account_id": account_id,
+            "symbol_in": symbol_in,
+            "symbol_normalized": prepared.symbol,
+            "side": side_norm,
+            "qty": str(prepared.qty),
+            "price_override": str(price_override) if price_override is not None else None,
+            "strategy_id": strategy_id_for_meta,
+            "strategy_config_id": strategy_config_id,
+        },
+        "market_price": str(prepared.price),
+        "price_source": price_source or market_price_source,
+        "notional": str(notional),
+        "policy_source": policy_source,
+        "policy_binding": bound_policy_meta,
+        "computed_limits": {
+            "risk_limits": {
+                "max_order_notional_usdt": str(risk_policy_limits.get("max_order_notional_usdt"))
+                if risk_policy_limits.get("max_order_notional_usdt") is not None
+                else None,
+                "min_order_notional_usdt": str(risk_policy_limits.get("min_order_notional_usdt"))
+                if risk_policy_limits.get("min_order_notional_usdt") is not None
+                else None,
+                "max_leverage": str(risk_policy_limits.get("max_leverage"))
+                if risk_policy_limits.get("max_leverage") is not None
+                else None,
+                "max_drawdown_pct": str(risk_policy_limits.get("max_drawdown_pct"))
+                if risk_policy_limits.get("max_drawdown_pct") is not None
+                else None,
+                "max_drawdown_usdt": str(risk_policy_limits.get("max_drawdown_usdt"))
+                if risk_policy_limits.get("max_drawdown_usdt") is not None
+                else None,
+                "max_daily_loss_usdt": str(risk_policy_limits.get("max_daily_loss_usdt"))
+                if risk_policy_limits.get("max_daily_loss_usdt") is not None
+                else None,
+                "equity_lookback_hours": risk_policy_limits.get("equity_lookback_hours"),
+                "lookback_minutes": risk_policy_limits.get("lookback_minutes"),
+            },
+            "risk_limit_source": risk_policy_limit_source,
+            "risk_policy_overrides": risk_policy_symbol_override,
+            "symbol_limits": {
+                "max_order_qty": str(symbol_limit.max_order_qty)
+                if symbol_limit is not None and symbol_limit.max_order_qty is not None
+                else None,
+                "max_position_qty": str(position_policy_limits.get("max_position_qty"))
+                if position_policy_limits.get("max_position_qty") is not None
+                else None,
+                "max_position_notional_usdt": str(position_policy_limits.get("max_position_notional_usdt"))
+                if position_policy_limits.get("max_position_notional_usdt") is not None
+                else None,
+                "max_position_pct_equity": str(position_policy_limits.get("max_position_pct_equity"))
+                if position_policy_limits.get("max_position_pct_equity") is not None
+                else None,
+            },
+            "symbol_limit_source": position_policy_limit_source,
+            "position_policy_overrides": position_policy_symbol_override,
+        },
+        "execution": {
+            "order_id": execution.order.id,
+            "trade_id": execution.trade.id,
+            "fill_price": str(execution.order.avg_fill_price) if execution.order.avg_fill_price is not None else str(prepared.price),
+            "fee_paid": str(execution.order.fee_paid) if execution.order.fee_paid is not None else None,
+        },
+    }
+    try:
+        await create_trade_explanation(
+            session,
+            account_id=account_id,
+            strategy_config_id=strategy_config_id,
+            strategy_id=strategy_id_for_meta,
+            symbol=prepared.symbol,
+            side=side_norm,
+            requested_qty=prepared.qty,
+            decision=decision_payload,
+            rationale="Risk and position checks passed; order executed",
+            status="open",
+            executed_trade_id=execution.trade.id,
+            order_id=execution.order.id,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to create trade explanation for executed order",
+            extra={
+                "account_id": account_id,
+                "strategy_config_id": strategy_config_id,
+                "symbol": prepared.symbol,
+                "side": side_norm,
+                "order_id": execution.order.id,
+                "trade_id": execution.trade.id,
+            },
+        )
 
     return UnifiedOrderResult(
         execution=execution,

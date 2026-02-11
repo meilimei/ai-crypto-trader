@@ -564,3 +564,36 @@ class NotificationOutbox(Base):
     )
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     payload: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+
+
+class TradeExplanation(Base):
+    __tablename__ = "trade_explanations"
+    __table_args__ = (
+        Index("ix_trade_explanations_created_at", "created_at"),
+        Index("ix_trade_explanations_account_id_created_at", "account_id", "created_at"),
+        Index("ix_trade_explanations_strategy_config_id_created_at", "strategy_config_id", "created_at"),
+        Index("ix_trade_explanations_symbol_created_at", "symbol", "created_at"),
+        Index(
+            "ux_trade_explanations_executed_trade_id",
+            "executed_trade_id",
+            unique=True,
+            postgresql_where=text("executed_trade_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
+    account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    strategy_config_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    strategy_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False)
+    requested_qty: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10), nullable=True)
+    executed_trade_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    order_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    decision: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    outcome: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="open", server_default=text("'open'"))

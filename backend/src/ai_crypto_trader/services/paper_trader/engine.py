@@ -22,6 +22,7 @@ from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceRes
 from ai_crypto_trader.services.llm_agent.service import LLMService
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
+from ai_crypto_trader.services.explainability.store import create_trade_explanation
 from ai_crypto_trader.services.paper_trader.rejects import RejectReason, log_reject_throttled, make_reject
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
@@ -211,6 +212,31 @@ class PaperTradingEngine:
             qty_dec = Decimal(str(delta_qty)).copy_abs()
             if qty_dec <= 0:
                 reject = make_reject("ZERO_OR_NEGATIVE_QTY", "Execution skipped")
+                try:
+                    await create_trade_explanation(
+                        session,
+                        account_id=account_id,
+                        strategy_config_id=strategy_config_id,
+                        strategy_id=str(strategy_config_id) if strategy_config_id is not None else None,
+                        symbol=symbol_norm,
+                        side=side,
+                        requested_qty=qty_dec,
+                        decision={
+                            "message": "Execution skipped",
+                            "reject": reject,
+                            "request": {
+                                "account_id": account_id,
+                                "strategy_config_id": strategy_config_id,
+                                "symbol": symbol_norm,
+                                "side": side,
+                                "qty": str(delta_qty),
+                            },
+                        },
+                        rationale="ZERO_OR_NEGATIVE_QTY",
+                        status="skipped",
+                    )
+                except Exception:
+                    logger.exception("Failed to create trade explanation for skipped zero qty")
                 await log_reject_throttled(
                     action="ORDER_SKIPPED",
                     account_id=account_id,
@@ -248,6 +274,33 @@ class PaperTradingEngine:
         except Exception as exc:  # safety net to keep engine alive
             logger.exception("Execution failed; skipping symbol", extra={"symbol": symbol_norm})
             reject = make_reject(exc.__class__.__name__, "Execution skipped", {"error": str(exc)})
+            try:
+                await create_trade_explanation(
+                    session,
+                    account_id=account_id,
+                    strategy_config_id=strategy_config_id,
+                    strategy_id=str(strategy_config_id) if strategy_config_id is not None else None,
+                    symbol=symbol_norm,
+                    side=side,
+                    requested_qty=qty_dec if qty_dec > 0 else None,
+                    decision={
+                        "message": "Execution skipped",
+                        "reject": reject,
+                        "request": {
+                            "account_id": account_id,
+                            "strategy_config_id": strategy_config_id,
+                            "symbol": symbol_norm,
+                            "side": side,
+                            "qty": str(delta_qty),
+                        },
+                        "error": str(exc),
+                        "error_type": exc.__class__.__name__,
+                    },
+                    rationale=f"{exc.__class__.__name__}: {exc}",
+                    status="skipped",
+                )
+            except Exception:
+                logger.exception("Failed to create trade explanation for execution exception")
             await log_reject_throttled(
                 action="ORDER_SKIPPED",
                 account_id=account_id,

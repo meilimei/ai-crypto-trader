@@ -39,6 +39,7 @@ from ai_crypto_trader.services.paper_trader.execution import execute_market_orde
 from ai_crypto_trader.services.paper_trader.order_entry import (
     place_order_unified,
 )
+from ai_crypto_trader.services.explainability.store import create_trade_explanation
 from ai_crypto_trader.services.policies.effective import resolve_effective_policy_snapshot
 from ai_crypto_trader.services.paper_trader.policies import DEFAULT_POSITION_POLICY, DEFAULT_RISK_POLICY, validate_order
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason
@@ -598,22 +599,51 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
     }
 
     async def _reject_smoke(reject: RejectReason, *, status_code: int = 400):
+        decision_payload = {
+            "message": "Smoke trade rejected",
+            "request": request_meta,
+            "reject": reject.dict(),
+            "policy_source": policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+        }
+        try:
+            await create_trade_explanation(
+                session,
+                account_id=payload.account_id,
+                strategy_config_id=strategy_config_id,
+                strategy_id=payload.strategy_id,
+                symbol=symbol_norm,
+                side=side,
+                requested_qty=payload.qty,
+                decision=decision_payload,
+                rationale=reject.reason,
+                status="rejected",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to create smoke-trade explanation",
+                extra={
+                    "account_id": payload.account_id,
+                    "strategy_config_id": strategy_config_id,
+                    "symbol": symbol_norm,
+                    "side": side,
+                    "reject_code": str(reject.code),
+                },
+            )
         await log_order_rejected_throttled(
             session,
             account_id=payload.account_id,
             symbol=symbol_norm,
             reject_code=str(reject.code),
             reject_reason=reject.reason,
-            meta={
-                "message": "Smoke trade rejected",
-                "request": request_meta,
-                "reject": reject.dict(),
-                "policy_source": policy_source,
-                "policy_binding": policy_binding,
-                "computed_limits": computed_limits,
-            },
+            meta=decision_payload,
             window_seconds=120,
         )
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
         return JSONResponse(
             status_code=status_code,
             content=jsonable_encoder(
@@ -1275,11 +1305,45 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
     price_override_value = payload.price_override if payload.price_override is not None else payload.price
     if not runner.is_running:
         reject = RejectReason(code=RejectCode.ENGINE_NOT_RUNNING, reason="Paper trader engine is not running")
+        strategy_config_id = _resolve_strategy_config_id(
+            strategy_config_id=payload.strategy_config_id,
+            strategy_id=payload.strategy_id,
+        )
+        symbol_norm = normalize_symbol(getattr(payload, "symbol", ""))
+        side_norm = (getattr(payload, "side", "") or "").lower().strip()
+        try:
+            await create_trade_explanation(
+                session,
+                account_id=payload.account_id,
+                strategy_config_id=strategy_config_id,
+                strategy_id=payload.strategy_id,
+                symbol=symbol_norm,
+                side=side_norm or "buy",
+                requested_qty=payload.qty,
+                decision={
+                    "message": "Smoke trade rejected",
+                    "reject": reject.dict(),
+                    "endpoint": "POST /admin/paper-trader/smoke-trade",
+                    "request": {
+                        "account_id": payload.account_id,
+                        "symbol_in": getattr(payload, "symbol", None),
+                        "side": getattr(payload, "side", None),
+                        "qty": str(getattr(payload, "qty", None)),
+                        "price_override": str(price_override_value) if price_override_value is not None else None,
+                        "strategy_id": getattr(payload, "strategy_id", None),
+                        "strategy_config_id": strategy_config_id,
+                    },
+                },
+                rationale=reject.reason,
+                status="rejected",
+            )
+        except Exception:
+            logger.exception("Failed to create smoke-trade explanation when engine is not running")
         engine_status = runner.status()
         await log_order_rejected_throttled(
             session,
             account_id=payload.account_id,
-            symbol=normalize_symbol(getattr(payload, "symbol", "")),
+            symbol=symbol_norm,
             reject_code=reject.code,
             reject_reason=reject.reason,
             meta={
@@ -1302,6 +1366,10 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             },
             window_seconds=120,
         )
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
         return _reject_response(reject, status_code=400)
     try:
         return await _smoke_trade_impl(payload, session)
