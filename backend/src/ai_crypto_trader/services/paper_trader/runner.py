@@ -31,6 +31,7 @@ from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.policies_effective import get_effective_risk_policy
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
+from ai_crypto_trader.services.monitoring.strategy_monitor import run_strategy_monitor_tick
 from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox_once
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
@@ -56,6 +57,7 @@ class PaperTraderRunner:
         self._reconcile_task: Optional[asyncio.Task[None]] = None
         self._stall_monitor_task: Optional[asyncio.Task[None]] = None
         self._outbox_task: Optional[asyncio.Task[None]] = None
+        self._strategy_monitor_task: Optional[asyncio.Task[None]] = None
         self.last_reconcile_at: Optional[datetime] = None
         self.reconcile_tick_count: int = 0
         self.reconcile_interval_seconds: int = 0
@@ -106,6 +108,10 @@ class PaperTraderRunner:
             self._reconcile_task.add_done_callback(self._reconcile_done)
         self._stall_monitor_task = asyncio.create_task(self._stall_monitor_loop(), name="paper_stall_monitor")
         self._outbox_task = asyncio.create_task(self._outbox_loop(), name="notifications_outbox")
+        self._strategy_monitor_task = asyncio.create_task(
+            self._strategy_monitor_loop(),
+            name="strategy_monitor",
+        )
         self._task = asyncio.create_task(_run(), name="paper-trader")
 
     async def stop(self) -> None:
@@ -134,6 +140,13 @@ class PaperTraderRunner:
             except asyncio.CancelledError:
                 pass
         self._outbox_task = None
+        if self._strategy_monitor_task:
+            self._strategy_monitor_task.cancel()
+            try:
+                await self._strategy_monitor_task
+            except asyncio.CancelledError:
+                pass
+        self._strategy_monitor_task = None
         if self._stall_monitor_task:
             self._stall_monitor_task.cancel()
             try:
@@ -549,6 +562,100 @@ class PaperTraderRunner:
                     except Exception:
                         logger.exception("Notifications outbox tick heartbeat write failed")
             await asyncio.sleep(max(poll_seconds, 1))
+
+    async def _strategy_monitor_loop(self) -> None:
+        tick_seconds = max(int(os.getenv("STRATEGY_MONITOR_TICK_SECONDS", "60")), 1)
+        window_seconds = max(int(os.getenv("STRATEGY_MONITOR_WINDOW_SECONDS", "3600")), 60)
+        max_pairs = max(int(os.getenv("STRATEGY_MONITOR_MAX_PAIRS", "200")), 1)
+        while self.is_running:
+            started_at = datetime.now(timezone.utc)
+            now_utc = started_at
+            tick_bucket = now_utc.strftime("%Y%m%d%H%M")
+            tick_dedupe_key = f"STRATEGY_MONITOR_TICK:{tick_bucket}"
+            async with AsyncSessionLocal() as session:
+                try:
+                    stats = await run_strategy_monitor_tick(
+                        session,
+                        now_utc=now_utc,
+                        window_seconds=window_seconds,
+                        max_pairs=max_pairs,
+                    )
+                    duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+                    meta = {
+                        "now_utc": now_utc.isoformat(),
+                        "duration_ms": duration_ms,
+                        "pairs_scanned": int(stats.get("pairs_scanned", 0) or 0),
+                        "alerts_emitted_count": int(stats.get("alerts_emitted_count", 0) or 0),
+                        "alerts_sample": stats.get("alerts_sample") or [],
+                        "window_seconds": int(stats.get("window_seconds", window_seconds) or window_seconds),
+                        "reject_spike_window_seconds": int(
+                            stats.get("reject_spike_window_seconds", 60) or 60
+                        ),
+                        "reject_spike_threshold": int(stats.get("reject_spike_threshold", 10) or 10),
+                        "alert_throttle_seconds": int(
+                            stats.get("alert_throttle_seconds", 1800) or 1800
+                        ),
+                        "limit_pairs": max_pairs,
+                    }
+                    logger.info("strategy monitor tick", extra=meta)
+                    existing_tick = await session.scalar(
+                        select(AdminAction)
+                        .where(AdminAction.dedupe_key == tick_dedupe_key)
+                        .limit(1)
+                    )
+                    if existing_tick:
+                        existing_tick.status = "ok"
+                        existing_tick.message = "strategy monitoring tick"
+                        existing_tick.meta = meta
+                    else:
+                        session.add(
+                            AdminAction(
+                                action="STRATEGY_MONITOR_TICK",
+                                status="ok",
+                                message="strategy monitoring tick",
+                                dedupe_key=tick_dedupe_key,
+                                meta=meta,
+                            )
+                        )
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    logger.exception("Strategy monitor loop failed")
+                    try:
+                        duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+                        existing_tick = await session.scalar(
+                            select(AdminAction)
+                            .where(AdminAction.dedupe_key == tick_dedupe_key)
+                            .limit(1)
+                        )
+                        error_meta = {
+                            "now_utc": now_utc.isoformat(),
+                            "duration_ms": duration_ms,
+                            "pairs_scanned": 0,
+                            "alerts_emitted_count": 0,
+                            "alerts_sample": [],
+                            "window_seconds": window_seconds,
+                            "error": str(exc),
+                            "limit_pairs": max_pairs,
+                        }
+                        if existing_tick:
+                            existing_tick.status = "error"
+                            existing_tick.message = "strategy monitoring failed"
+                            existing_tick.meta = error_meta
+                        else:
+                            session.add(
+                                AdminAction(
+                                    action="STRATEGY_MONITOR_TICK",
+                                    status="error",
+                                    message="strategy monitoring failed",
+                                    dedupe_key=tick_dedupe_key,
+                                    meta=error_meta,
+                                )
+                            )
+                        await session.commit()
+                    except Exception:
+                        logger.exception("Strategy monitor tick heartbeat write failed")
+            await asyncio.sleep(tick_seconds)
 
 
 async def reset_paper_data(session: AsyncSession) -> Dict[str, object]:
