@@ -258,12 +258,12 @@ async def explainability_summary(
 ) -> dict[str, Any]:
     now_utc = datetime.now(timezone.utc)
     since_ts = now_utc - timedelta(minutes=max(int(window_minutes), 1))
-    symbol_norm = normalize_symbol(symbol) if symbol else None
+    symbol_value = symbol if symbol else None
     params = {
         "since_ts": since_ts,
         "account_id": str(account_id),
         "strategy_config_id": str(strategy_config_id) if strategy_config_id is not None else None,
-        "symbol": symbol_norm,
+        "symbol": symbol_value,
     }
     decisions_sql = text(
         """
@@ -275,11 +275,11 @@ async def explainability_summary(
         FROM public.admin_actions
         WHERE action='TRADE_DECISION'
           AND created_at >= :since_ts
-          AND meta->>'account_id' = :account_id
-          AND (:strategy_config_id IS NULL OR meta->>'strategy_config_id' = :strategy_config_id)
+          AND meta->>'account_id' = :account_id::text
+          AND (:strategy_config_id::text IS NULL OR meta->>'strategy_config_id' = :strategy_config_id::text)
           AND (
-            :symbol IS NULL
-            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol
+            :symbol::text IS NULL
+            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol::text
           )
         """
     )
@@ -318,11 +318,11 @@ async def explainability_summary(
         FROM public.admin_actions
         WHERE action='TRADE_OUTCOME'
           AND created_at >= :since_ts
-          AND meta->>'account_id' = :account_id
-          AND (:strategy_config_id IS NULL OR meta->>'strategy_config_id' = :strategy_config_id)
+          AND meta->>'account_id' = :account_id::text
+          AND (:strategy_config_id::text IS NULL OR meta->>'strategy_config_id' = :strategy_config_id::text)
           AND (
-            :symbol IS NULL
-            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol
+            :symbol::text IS NULL
+            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol::text
           )
         """
     )
@@ -346,7 +346,7 @@ async def explainability_summary(
             "filters": {
                 "account_id": account_id,
                 "strategy_config_id": strategy_config_id,
-                "symbol": symbol_norm,
+                "symbol": symbol_value,
             },
             "window": {
                 "minutes": int(window_minutes),
@@ -367,7 +367,7 @@ async def explainability_summary(
             extra={
                 "account_id": account_id,
                 "strategy_config_id": strategy_config_id,
-                "symbol": symbol_norm,
+                "symbol": symbol_value,
                 "window_minutes": int(window_minutes),
                 "decisions_total": decisions["decisions_total"],
                 "outcomes_total": outcomes_total,
@@ -382,8 +382,14 @@ async def explainability_summary(
             extra={
                 "account_id": account_id,
                 "strategy_config_id": strategy_config_id,
-                "symbol": symbol_norm,
+                "symbol": symbol_value,
                 "window_minutes": int(window_minutes),
+                "params": {
+                    "since_ts": since_ts.isoformat(),
+                    "account_id": str(account_id),
+                    "strategy_config_id": str(strategy_config_id) if strategy_config_id is not None else None,
+                    "symbol": symbol_value,
+                },
             },
         )
         raise HTTPException(status_code=500, detail="Failed to compute explainability summary")
