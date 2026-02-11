@@ -359,6 +359,7 @@ async def place_order_unified(
     meta: Optional[dict[str, str]] = None,
     reject_action_type: str = "ORDER_REJECTED",
     reject_window_seconds: int = 120,
+    bypass_max_order_notional: bool = False,
 ) -> UnifiedOrderResult | RejectReason:
     symbol_in = (symbol or "ETHUSDT").strip()
     symbol_norm = normalize_symbol(symbol_in)
@@ -981,7 +982,9 @@ async def place_order_unified(
             )
             return reject
 
-    if risk_policy.max_order_notional_usdt is not None:
+    # Admin explainability test endpoint can bypass only this check to validate executed/outcome flows
+    # when policy combinations (e.g. high min_qty + low max_order_notional) make execution impossible.
+    if risk_policy.max_order_notional_usdt is not None and not bypass_max_order_notional:
         max_notional = Decimal(str(risk_policy.max_order_notional_usdt))
         if notional > max_notional:
             reject = RejectReason(
@@ -992,6 +995,9 @@ async def place_order_unified(
                     "notional": str(notional),
                     "qty": str(prepared.qty),
                     "market_price": str(prepared.price),
+                    "explainability_hint": (
+                        "Order may be unexecutable when min_qty-implied notional is above max_order_notional_usdt"
+                    ),
                 },
             )
             await _log_reject(

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
+import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,15 +22,28 @@ from ai_crypto_trader.services.explainability.explainability import (
     run_outcome_tick,
 )
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
+from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
+from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
+from ai_crypto_trader.services.paper_trader.rejects import RejectReason
 from ai_crypto_trader.utils.json_safe import json_safe
 
 router = APIRouter(prefix="/admin/explainability", tags=["admin"], dependencies=[Depends(require_admin_token)])
+logger = logging.getLogger(__name__)
 
 
 class OutcomeTickRequest(BaseModel):
     limit: int = 200
     min_age_seconds: int = 900
     horizon_seconds: int = 900
+
+
+class TestExecutedRequest(BaseModel):
+    account_id: int
+    strategy_config_id: int
+    symbol: str
+    side: str
+    qty: Decimal
+    price_override: Decimal | None = None
 
 
 def _serialize_action(row: AdminAction) -> dict[str, Any]:
@@ -69,6 +85,10 @@ def _base_filters(
     if symbol:
         filters.append(meta_symbol_upper(AdminAction.meta) == normalize_symbol(symbol))
     return filters
+
+
+def _flag_enabled(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @router.get("/decisions")
@@ -195,7 +215,39 @@ async def explainability_summary(
     window_minutes: int = Query(default=1440, ge=1),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    filters = _base_filters(
+    decision_filters = _base_filters(
+        action="TRADE_DECISION",
+        since_minutes=window_minutes,
+        account_id=account_id,
+        strategy_config_id=strategy_config_id,
+        symbol=symbol,
+    )
+    decision_rows = (
+        await session.execute(
+            select(
+                func.lower(func.coalesce(meta_text(AdminAction.meta, "status"), "")).label("decision_status"),
+                func.count().label("cnt"),
+            )
+            .where(and_(*decision_filters))
+            .group_by(func.lower(func.coalesce(meta_text(AdminAction.meta, "status"), "")))
+        )
+    ).all()
+    executed_total = 0
+    rejected_total = 0
+    skipped_total = 0
+    decisions_total = 0
+    for status_value, count_value in decision_rows:
+        cnt = int(count_value or 0)
+        decisions_total += cnt
+        status_norm = (status_value or "").strip().lower()
+        if status_norm == "executed":
+            executed_total += cnt
+        elif status_norm == "rejected":
+            rejected_total += cnt
+        elif status_norm == "skipped":
+            skipped_total += cnt
+
+    outcome_filters = _base_filters(
         action="TRADE_OUTCOME",
         since_minutes=window_minutes,
         account_id=account_id,
@@ -205,7 +257,7 @@ async def explainability_summary(
     rows = (
         await session.execute(
             select(AdminAction.meta)
-            .where(and_(*filters))
+            .where(and_(*outcome_filters))
             .order_by(AdminAction.created_at.desc(), AdminAction.id.desc())
         )
     ).all()
@@ -213,6 +265,10 @@ async def explainability_summary(
     outcomes_total = len(rows)
     if outcomes_total == 0:
         return {
+            "decisions_total": decisions_total,
+            "executed_total": executed_total,
+            "rejected_total": rejected_total,
+            "skipped_total": skipped_total,
             "outcomes_total": 0,
             "win_rate": 0.0,
             "avg_return_pct": 0.0,
@@ -246,6 +302,10 @@ async def explainability_summary(
     win_rate = wins / outcomes_total if outcomes_total > 0 else 0.0
 
     return {
+        "decisions_total": decisions_total,
+        "executed_total": executed_total,
+        "rejected_total": rejected_total,
+        "skipped_total": skipped_total,
         "outcomes_total": outcomes_total,
         "win_rate": float(win_rate),
         "avg_return_pct": float(avg_return),
@@ -274,3 +334,72 @@ async def run_explainability_outcome_tick(
         await session.rollback()
         raise HTTPException(status_code=500, detail=f"outcome tick failed: {exc}")
 
+
+@router.post("/test-executed")
+async def explainability_test_executed(
+    payload: TestExecutedRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    if not _flag_enabled("EXPLAINABILITY_ALLOW_TEST_BYPASS", "false"):
+        logger.info(
+            "explainability test-executed blocked: bypass flag disabled",
+            extra={
+                "account_id": payload.account_id,
+                "strategy_config_id": payload.strategy_config_id,
+                "symbol": payload.symbol,
+            },
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="EXPLAINABILITY_ALLOW_TEST_BYPASS is disabled",
+        )
+
+    config = PaperTraderConfig.from_env()
+    try:
+        result = await place_order_unified(
+            session,
+            account_id=payload.account_id,
+            symbol=payload.symbol,
+            side=payload.side,
+            qty=payload.qty,
+            strategy_id=payload.strategy_config_id,
+            fee_bps=config.fee_bps,
+            slippage_bps=config.slippage_bps,
+            price_override=payload.price_override,
+            meta={"origin": "admin_explainability_test_executed"},
+            bypass_max_order_notional=True,
+        )
+        if isinstance(result, RejectReason):
+            await session.commit()
+            return {
+                "ok": False,
+                "reject": result.dict(),
+                "bypass_applied": "max_order_notional_usdt",
+            }
+
+        execution = result.execution
+        await session.commit()
+        return jsonable_encoder(
+            {
+                "ok": True,
+                "bypass_applied": "max_order_notional_usdt",
+                "execution": {
+                    "order_id": execution.order.id,
+                    "trade_id": execution.trade.id,
+                    "symbol": result.prepared.symbol,
+                    "side": result.prepared.side,
+                    "qty": str(result.prepared.qty),
+                    "price": str(result.prepared.price),
+                    "price_source": result.price_source,
+                    "strategy_id": str(result.strategy_id) if result.strategy_id is not None else None,
+                    "strategy_config_id": payload.strategy_config_id,
+                },
+            }
+        )
+    except HTTPException:
+        await session.rollback()
+        raise
+    except Exception as exc:
+        await session.rollback()
+        logger.exception("explainability test-executed failed")
+        raise HTTPException(status_code=500, detail=f"test-executed failed: {exc}")
