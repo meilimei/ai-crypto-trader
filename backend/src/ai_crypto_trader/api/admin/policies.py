@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import Text, and_, cast, desc, func, select
+from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.api.admin_paper_trader import require_admin_token
@@ -58,6 +58,51 @@ class PolicyRollbackRequest(BaseModel):
 class PolicySymbolLimitsUpsert(BaseModel):
     symbol: str = Field(..., min_length=1)
     limits: Any = Field(default_factory=dict)
+
+
+class RiskPolicyPublishRequest(BaseModel):
+    is_active: bool = True
+
+
+class RiskPolicyPatchRequest(BaseModel):
+    params: Optional[dict[str, Any]] = None
+    notes: Optional[str] = None
+    is_active: Optional[bool] = None
+    status: Optional[Literal["draft", "active", "archived"]] = None
+
+
+class PositionPolicyPatchRequest(BaseModel):
+    params: Optional[dict[str, Any]] = None
+    notes: Optional[str] = None
+    status: Optional[Literal["draft", "active", "archived"]] = None
+
+
+class SymbolOverridesBatchUpsertRequest(BaseModel):
+    symbols: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class SymbolOverridesBatchDeleteRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+
+
+class StrategyBindingUpsertRequest(BaseModel):
+    strategy_config_id: int = Field(..., ge=1)
+    risk_policy_id: Optional[int] = None
+    position_policy_id: Optional[UUID] = None
+    notes: Optional[str] = None
+
+
+class PolicyVersionRef(BaseModel):
+    name: str = Field(..., min_length=1)
+    version: int = Field(..., ge=1)
+
+
+class StrategyBindingRollbackRequest(BaseModel):
+    risk_policy: Optional[PolicyVersionRef] = None
+    position_policy: Optional[PolicyVersionRef] = None
+    risk_policy_id: Optional[int] = None
+    position_policy_id: Optional[UUID] = None
+    notes: Optional[str] = None
 
 
 def _serialize_risk_policy(policy: RiskPolicy) -> dict:
@@ -150,6 +195,59 @@ def _merge_symbol_limits(params: dict[str, Any] | None, *, symbol: str, limits: 
     return payload
 
 
+def _safe_params(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _merge_symbol_limits_batch(
+    params: dict[str, Any] | None,
+    symbols: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    payload = _safe_params(params)
+    per_symbol_raw = payload.get("per_symbol")
+    per_symbol: dict[str, Any] = dict(per_symbol_raw) if isinstance(per_symbol_raw, dict) else {}
+    updated_symbols: list[str] = []
+    for symbol_raw, limits in symbols.items():
+        symbol_norm = _normalize_symbol_or_400(symbol_raw)
+        if not isinstance(limits, dict):
+            raise HTTPException(status_code=400, detail="symbols values must be objects")
+        merged = dict(per_symbol.get(symbol_norm)) if isinstance(per_symbol.get(symbol_norm), dict) else {}
+        merged.update(limits)
+        per_symbol[symbol_norm] = merged
+        updated_symbols.append(symbol_norm)
+    payload["per_symbol"] = per_symbol
+    return payload, updated_symbols
+
+
+def _delete_symbol_limits_batch(
+    params: dict[str, Any] | None,
+    symbols: list[str],
+) -> tuple[dict[str, Any], list[str]]:
+    payload = _safe_params(params)
+    per_symbol_raw = payload.get("per_symbol")
+    per_symbol: dict[str, Any] = dict(per_symbol_raw) if isinstance(per_symbol_raw, dict) else {}
+    deleted_symbols: list[str] = []
+    for symbol_raw in symbols:
+        symbol_norm = _normalize_symbol_or_400(symbol_raw)
+        removed = per_symbol.pop(symbol_norm, None)
+        if removed is not None:
+            deleted_symbols.append(symbol_norm)
+    payload["per_symbol"] = per_symbol
+    return payload, deleted_symbols
+
+
+async def _next_risk_policy_version(session: AsyncSession, *, name: str) -> int:
+    max_version = await session.scalar(select(func.max(RiskPolicy.version)).where(RiskPolicy.name == name))
+    return int(max_version or 0) + 1
+
+
+async def _next_position_policy_version(session: AsyncSession, *, name: str) -> int:
+    max_version = await session.scalar(
+        select(func.max(PositionPolicyConfig.version)).where(PositionPolicyConfig.name == name)
+    )
+    return int(max_version or 0) + 1
+
+
 async def _audit_action(
     session: AsyncSession,
     *,
@@ -213,7 +311,7 @@ async def list_risk_policies(
     limit, offset = clamp_limit_offset(limit=limit, offset=offset)
     conditions = []
     if name:
-        conditions.append(RiskPolicy.name == name)
+        conditions.append(RiskPolicy.name.ilike(f"%{name.strip()}%"))
     if status:
         conditions.append(RiskPolicy.status == status)
     if is_active is not None:
@@ -226,15 +324,13 @@ async def list_risk_policies(
         count_stmt = count_stmt.where(and_(*conditions))
 
     if order == "updated_at_desc":
-        stmt = stmt.order_by(desc(RiskPolicy.updated_at), desc(RiskPolicy.version), desc(RiskPolicy.id))
+        stmt = stmt.order_by(desc(RiskPolicy.updated_at), RiskPolicy.id.asc())
     elif order == "updated_at_asc":
-        stmt = stmt.order_by(RiskPolicy.updated_at.asc(), RiskPolicy.version.asc(), RiskPolicy.id.asc())
+        stmt = stmt.order_by(RiskPolicy.updated_at.asc(), RiskPolicy.id.asc())
     elif order == "created_at_desc":
-        stmt = stmt.order_by(desc(RiskPolicy.created_at), desc(RiskPolicy.version), desc(RiskPolicy.id))
+        stmt = stmt.order_by(desc(RiskPolicy.created_at), RiskPolicy.id.asc())
     elif order == "created_at_asc":
-        stmt = stmt.order_by(RiskPolicy.created_at.asc(), RiskPolicy.version.asc(), RiskPolicy.id.asc())
-    elif order == "version_desc":
-        stmt = stmt.order_by(desc(RiskPolicy.version), desc(RiskPolicy.id))
+        stmt = stmt.order_by(RiskPolicy.created_at.asc(), RiskPolicy.id.asc())
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
 
@@ -245,13 +341,7 @@ async def list_risk_policies(
         limit=limit,
         offset=offset,
     )
-    return {
-        "ok": True,
-        "items": [_serialize_risk_policy(p) for p in items],
-        "limit": limit,
-        "offset": offset,
-        "total": total,
-    }
+    return {"items": [_serialize_risk_policy(p) for p in items], "limit": limit, "offset": offset, "total": total}
 
 
 @router.post("/risk-policies/{policy_id}/activate")
@@ -278,6 +368,229 @@ async def activate_risk_policy(
             "to_id": policy.id,
             "to_version": policy.version,
             "notes": None,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_risk_policy(policy)}
+
+
+@router.post("/risk-policies/{policy_id}/clone")
+async def clone_risk_policy(
+    policy_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    source = await session.get(RiskPolicy, policy_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Risk policy not found")
+
+    new_policy = RiskPolicy(
+        name=source.name,
+        version=await _next_risk_policy_version(session, name=source.name),
+        status="draft",
+        params=_safe_params(source.params),
+        notes=source.notes,
+        max_loss_per_trade_usd=source.max_loss_per_trade_usd,
+        max_loss_per_day_usd=source.max_loss_per_day_usd,
+        max_position_usd=source.max_position_usd,
+        max_open_positions=source.max_open_positions,
+        cooldown_seconds=source.cooldown_seconds,
+        fee_bps=source.fee_bps,
+        slippage_bps=source.slippage_bps,
+        is_active=False,
+    )
+    session.add(new_policy)
+    await session.flush()
+    await _audit_action(
+        session,
+        action="RISK_POLICY_CLONED",
+        message="Risk policy cloned",
+        meta={
+            "actor": "admin",
+            "source_id": source.id,
+            "new_id": new_policy.id,
+            "name": new_policy.name,
+            "new_version": new_policy.version,
+        },
+    )
+    await session.commit()
+    await session.refresh(new_policy)
+    return {"ok": True, "policy": _serialize_risk_policy(new_policy)}
+
+
+@router.post("/risk-policies/{policy_id}/publish")
+async def publish_risk_policy(
+    payload: RiskPolicyPublishRequest = RiskPolicyPublishRequest(),
+    policy_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(RiskPolicy, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Risk policy not found")
+
+    archived_ids = list(
+        (
+            await session.scalars(
+                select(RiskPolicy.id).where(
+                    RiskPolicy.name == policy.name,
+                    RiskPolicy.id != policy.id,
+                    or_(
+                        RiskPolicy.status == "active",
+                        RiskPolicy.is_active.is_(True),
+                    ),
+                )
+            )
+        ).all()
+    )
+    if archived_ids:
+        await session.execute(
+            update(RiskPolicy)
+            .where(RiskPolicy.id.in_(archived_ids))
+            .values(status="archived", is_active=False)
+        )
+    policy.status = "active"
+    policy.is_active = bool(payload.is_active)
+    await _audit_action(
+        session,
+        action="RISK_POLICY_PUBLISHED",
+        message="Risk policy published",
+        meta={
+            "actor": "admin",
+            "id": policy.id,
+            "name": policy.name,
+            "version": policy.version,
+            "archived_ids": archived_ids,
+            "is_active": policy.is_active,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_risk_policy(policy)}
+
+
+@router.patch("/risk-policies/{policy_id}")
+async def patch_risk_policy(
+    payload: RiskPolicyPatchRequest,
+    policy_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(RiskPolicy, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Risk policy not found")
+
+    fields_set = set(getattr(payload, "model_fields_set", None) or getattr(payload, "__fields_set__", set()))
+    changed_fields: list[str] = []
+    if "params" in fields_set:
+        if payload.params is None or not isinstance(payload.params, dict):
+            raise HTTPException(status_code=400, detail="params must be an object")
+        policy.params = payload.params
+        changed_fields.append("params")
+    if "notes" in fields_set:
+        policy.notes = payload.notes
+        changed_fields.append("notes")
+    if "status" in fields_set:
+        policy.status = payload.status or policy.status
+        if policy.status != "active":
+            policy.is_active = False
+        changed_fields.append("status")
+    if "is_active" in fields_set:
+        policy.is_active = bool(payload.is_active)
+        changed_fields.append("is_active")
+    if policy.is_active and policy.status != "active":
+        policy.status = "active"
+        if "status" not in changed_fields:
+            changed_fields.append("status")
+
+    archived_ids: list[int] = []
+    if policy.status == "active" or policy.is_active:
+        archived_ids = list(
+            (
+                await session.scalars(
+                    select(RiskPolicy.id).where(
+                        RiskPolicy.name == policy.name,
+                        RiskPolicy.id != policy.id,
+                        or_(
+                            RiskPolicy.status == "active",
+                            RiskPolicy.is_active.is_(True),
+                        ),
+                    )
+                )
+            ).all()
+        )
+        if archived_ids:
+            await session.execute(
+                update(RiskPolicy)
+                .where(RiskPolicy.id.in_(archived_ids))
+                .values(status="archived", is_active=False)
+            )
+
+    await _audit_action(
+        session,
+        action="RISK_POLICY_UPDATED",
+        message="Risk policy updated",
+        meta={
+            "actor": "admin",
+            "id": policy.id,
+            "name": policy.name,
+            "version": policy.version,
+            "changed_fields": changed_fields,
+            "archived_ids": archived_ids,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_risk_policy(policy)}
+
+
+@router.post("/risk-policies/{policy_id}/upsert-symbol-overrides-batch")
+async def upsert_risk_policy_symbol_overrides_batch(
+    payload: SymbolOverridesBatchUpsertRequest,
+    policy_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(RiskPolicy, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Risk policy not found")
+
+    policy.params, symbols_updated = _merge_symbol_limits_batch(policy.params, payload.symbols)
+    await _audit_action(
+        session,
+        action="RISK_POLICY_SYMBOL_OVERRIDES_BATCH_UPSERTED",
+        message="Risk policy symbol overrides batch upserted",
+        meta={
+            "actor": "admin",
+            "id": policy.id,
+            "name": policy.name,
+            "version": policy.version,
+            "symbols": symbols_updated,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_risk_policy(policy)}
+
+
+@router.post("/risk-policies/{policy_id}/delete-symbol-overrides-batch")
+async def delete_risk_policy_symbol_overrides_batch(
+    payload: SymbolOverridesBatchDeleteRequest,
+    policy_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(RiskPolicy, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Risk policy not found")
+
+    policy.params, symbols_deleted = _delete_symbol_limits_batch(policy.params, payload.symbols)
+    await _audit_action(
+        session,
+        action="RISK_POLICY_SYMBOL_OVERRIDES_BATCH_DELETED",
+        message="Risk policy symbol overrides batch deleted",
+        meta={
+            "actor": "admin",
+            "id": policy.id,
+            "name": policy.name,
+            "version": policy.version,
+            "symbols": symbols_deleted,
         },
     )
     await session.commit()
@@ -403,7 +716,7 @@ async def list_position_policies(
     limit, offset = clamp_limit_offset(limit=limit, offset=offset)
     conditions = []
     if name:
-        conditions.append(PositionPolicyConfig.name == name)
+        conditions.append(PositionPolicyConfig.name.ilike(f"%{name.strip()}%"))
     if status:
         conditions.append(PositionPolicyConfig.status == status)
 
@@ -414,31 +727,13 @@ async def list_position_policies(
         count_stmt = count_stmt.where(and_(*conditions))
 
     if order == "updated_at_desc":
-        stmt = stmt.order_by(
-            desc(PositionPolicyConfig.updated_at),
-            desc(PositionPolicyConfig.version),
-            desc(PositionPolicyConfig.id),
-        )
+        stmt = stmt.order_by(desc(PositionPolicyConfig.updated_at), PositionPolicyConfig.id.asc())
     elif order == "updated_at_asc":
-        stmt = stmt.order_by(
-            PositionPolicyConfig.updated_at.asc(),
-            PositionPolicyConfig.version.asc(),
-            PositionPolicyConfig.id.asc(),
-        )
+        stmt = stmt.order_by(PositionPolicyConfig.updated_at.asc(), PositionPolicyConfig.id.asc())
     elif order == "created_at_desc":
-        stmt = stmt.order_by(
-            desc(PositionPolicyConfig.created_at),
-            desc(PositionPolicyConfig.version),
-            desc(PositionPolicyConfig.id),
-        )
+        stmt = stmt.order_by(desc(PositionPolicyConfig.created_at), PositionPolicyConfig.id.asc())
     elif order == "created_at_asc":
-        stmt = stmt.order_by(
-            PositionPolicyConfig.created_at.asc(),
-            PositionPolicyConfig.version.asc(),
-            PositionPolicyConfig.id.asc(),
-        )
-    elif order == "version_desc":
-        stmt = stmt.order_by(desc(PositionPolicyConfig.version), desc(PositionPolicyConfig.id))
+        stmt = stmt.order_by(PositionPolicyConfig.created_at.asc(), PositionPolicyConfig.id.asc())
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
 
@@ -450,7 +745,6 @@ async def list_position_policies(
         offset=offset,
     )
     return {
-        "ok": True,
         "items": [_serialize_position_policy(p) for p in items],
         "limit": limit,
         "offset": offset,
@@ -482,6 +776,213 @@ async def activate_position_policy(
             "to_id": str(policy.id),
             "to_version": policy.version,
             "notes": None,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_position_policy(policy)}
+
+
+@router.post("/position-policies/{policy_id}/clone")
+async def clone_position_policy(
+    policy_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    source = await session.get(PositionPolicyConfig, policy_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Position policy not found")
+
+    new_policy = PositionPolicyConfig(
+        name=source.name,
+        version=await _next_position_policy_version(session, name=source.name),
+        status="draft",
+        params=_safe_params(source.params),
+        notes=source.notes,
+    )
+    session.add(new_policy)
+    await session.flush()
+    await _audit_action(
+        session,
+        action="POSITION_POLICY_CLONED",
+        message="Position policy cloned",
+        meta={
+            "actor": "admin",
+            "source_id": str(source.id),
+            "new_id": str(new_policy.id),
+            "name": new_policy.name,
+            "new_version": new_policy.version,
+        },
+    )
+    await session.commit()
+    await session.refresh(new_policy)
+    return {"ok": True, "policy": _serialize_position_policy(new_policy)}
+
+
+@router.post("/position-policies/{policy_id}/publish")
+async def publish_position_policy(
+    policy_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(PositionPolicyConfig, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Position policy not found")
+
+    archived_ids = [
+        str(item)
+        for item in (
+            await session.scalars(
+                select(PositionPolicyConfig.id).where(
+                    PositionPolicyConfig.name == policy.name,
+                    PositionPolicyConfig.id != policy.id,
+                    PositionPolicyConfig.status == "active",
+                )
+            )
+        ).all()
+    ]
+    if archived_ids:
+        await session.execute(
+            update(PositionPolicyConfig)
+            .where(
+                PositionPolicyConfig.name == policy.name,
+                PositionPolicyConfig.id != policy.id,
+                PositionPolicyConfig.status == "active",
+            )
+            .values(status="archived")
+        )
+    policy.status = "active"
+    await _audit_action(
+        session,
+        action="POSITION_POLICY_PUBLISHED",
+        message="Position policy published",
+        meta={
+            "actor": "admin",
+            "id": str(policy.id),
+            "name": policy.name,
+            "version": policy.version,
+            "archived_ids": archived_ids,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_position_policy(policy)}
+
+
+@router.patch("/position-policies/{policy_id}")
+async def patch_position_policy(
+    payload: PositionPolicyPatchRequest,
+    policy_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(PositionPolicyConfig, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Position policy not found")
+
+    fields_set = set(getattr(payload, "model_fields_set", None) or getattr(payload, "__fields_set__", set()))
+    changed_fields: list[str] = []
+    if "params" in fields_set:
+        if payload.params is None or not isinstance(payload.params, dict):
+            raise HTTPException(status_code=400, detail="params must be an object")
+        policy.params = payload.params
+        changed_fields.append("params")
+    if "notes" in fields_set:
+        policy.notes = payload.notes
+        changed_fields.append("notes")
+    if "status" in fields_set:
+        policy.status = payload.status or policy.status
+        changed_fields.append("status")
+
+    archived_ids: list[str] = []
+    if policy.status == "active":
+        archived_ids = [
+            str(item)
+            for item in (
+                await session.scalars(
+                    select(PositionPolicyConfig.id).where(
+                        PositionPolicyConfig.name == policy.name,
+                        PositionPolicyConfig.id != policy.id,
+                        PositionPolicyConfig.status == "active",
+                    )
+                )
+            ).all()
+        ]
+        if archived_ids:
+            await session.execute(
+                update(PositionPolicyConfig)
+                .where(
+                    PositionPolicyConfig.name == policy.name,
+                    PositionPolicyConfig.id != policy.id,
+                    PositionPolicyConfig.status == "active",
+                )
+                .values(status="archived")
+            )
+
+    await _audit_action(
+        session,
+        action="POSITION_POLICY_UPDATED",
+        message="Position policy updated",
+        meta={
+            "actor": "admin",
+            "id": str(policy.id),
+            "name": policy.name,
+            "version": policy.version,
+            "changed_fields": changed_fields,
+            "archived_ids": archived_ids,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_position_policy(policy)}
+
+
+@router.post("/position-policies/{policy_id}/upsert-symbol-limits-batch")
+async def upsert_position_policy_symbol_limits_batch(
+    payload: SymbolOverridesBatchUpsertRequest,
+    policy_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(PositionPolicyConfig, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Position policy not found")
+
+    policy.params, symbols_updated = _merge_symbol_limits_batch(policy.params, payload.symbols)
+    await _audit_action(
+        session,
+        action="POSITION_POLICY_SYMBOL_LIMITS_BATCH_UPSERTED",
+        message="Position policy symbol limits batch upserted",
+        meta={
+            "actor": "admin",
+            "id": str(policy.id),
+            "name": policy.name,
+            "version": policy.version,
+            "symbols": symbols_updated,
+        },
+    )
+    await session.commit()
+    await session.refresh(policy)
+    return {"ok": True, "policy": _serialize_position_policy(policy)}
+
+
+@router.post("/position-policies/{policy_id}/delete-symbol-limits-batch")
+async def delete_position_policy_symbol_limits_batch(
+    payload: SymbolOverridesBatchDeleteRequest,
+    policy_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    policy = await session.get(PositionPolicyConfig, policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail="Position policy not found")
+
+    policy.params, symbols_deleted = _delete_symbol_limits_batch(policy.params, payload.symbols)
+    await _audit_action(
+        session,
+        action="POSITION_POLICY_SYMBOL_LIMITS_BATCH_DELETED",
+        message="Position policy symbol limits batch deleted",
+        meta={
+            "actor": "admin",
+            "id": str(policy.id),
+            "name": policy.name,
+            "version": policy.version,
+            "symbols": symbols_deleted,
         },
     )
     await session.commit()
@@ -577,57 +1078,38 @@ async def list_strategy_configs(
     conditions = []
     if is_active is not None:
         conditions.append(StrategyConfig.is_active.is_(is_active))
-    symbol_norm = None
     if symbol:
         symbol_norm = _normalize_symbol_or_400(symbol)
-        conditions.append(cast(StrategyConfig.symbols, Text).ilike(f'%"{symbol_norm}"%'))
+        conditions.append(StrategyConfig.symbols.contains([symbol_norm]))
 
+    stmt = select(StrategyConfig)
     count_stmt = select(func.count()).select_from(StrategyConfig)
     if conditions:
-        count_stmt = count_stmt.where(and_(*conditions))
-    total = int((await session.execute(count_stmt)).scalar_one() or 0)
-
-    stmt = (
-        select(StrategyConfig, StrategyPolicyBinding)
-        .outerjoin(StrategyPolicyBinding, StrategyPolicyBinding.strategy_config_id == StrategyConfig.id)
-    )
-    if conditions:
         stmt = stmt.where(and_(*conditions))
+        count_stmt = count_stmt.where(and_(*conditions))
     if order == "updated_at_desc":
-        stmt = stmt.order_by(desc(StrategyConfig.updated_at), desc(StrategyConfig.id))
+        stmt = stmt.order_by(desc(StrategyConfig.updated_at), StrategyConfig.id.asc())
     elif order == "updated_at_asc":
         stmt = stmt.order_by(StrategyConfig.updated_at.asc(), StrategyConfig.id.asc())
     elif order == "created_at_desc":
-        stmt = stmt.order_by(desc(StrategyConfig.created_at), desc(StrategyConfig.id))
+        stmt = stmt.order_by(desc(StrategyConfig.created_at), StrategyConfig.id.asc())
     elif order == "created_at_asc":
         stmt = stmt.order_by(StrategyConfig.created_at.asc(), StrategyConfig.id.asc())
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
 
-    rows = await session.execute(stmt.limit(limit).offset(offset))
-    items = []
-    for strategy, binding in rows.all():
-        items.append(
-            {
-                "strategy_config": _serialize_strategy_config(strategy),
-                "binding": _binding_payload(
-                    strategy_config_id=strategy.id,
-                    risk_policy_id=binding.risk_policy_id if binding else None,
-                    position_policy_id=binding.position_policy_id if binding else None,
-                    notes=binding.notes if binding else None,
-                    updated_at=binding.updated_at if binding else None,
-                )
-                if binding
-                else None,
-            }
-        )
+    total, items = await fetch_page(
+        session,
+        count_stmt=count_stmt,
+        data_stmt=stmt,
+        limit=limit,
+        offset=offset,
+    )
     return {
-        "ok": True,
-        "items": items,
+        "items": [_serialize_strategy_config(item) for item in items],
         "limit": limit,
         "offset": offset,
         "total": total,
-        "symbol_filter": symbol_norm,
     }
 
 
@@ -650,26 +1132,29 @@ async def list_strategy_policy_bindings(
     if position_policy_id is not None:
         conditions.append(StrategyPolicyBinding.position_policy_id == position_policy_id)
 
+    stmt = select(StrategyPolicyBinding)
     count_stmt = select(func.count()).select_from(StrategyPolicyBinding)
     if conditions:
-        count_stmt = count_stmt.where(and_(*conditions))
-    total = int((await session.execute(count_stmt)).scalar_one() or 0)
-
-    stmt = select(StrategyPolicyBinding)
-    if conditions:
         stmt = stmt.where(and_(*conditions))
+        count_stmt = count_stmt.where(and_(*conditions))
     if order == "updated_at_desc":
-        stmt = stmt.order_by(desc(StrategyPolicyBinding.updated_at), desc(StrategyPolicyBinding.strategy_config_id))
+        stmt = stmt.order_by(desc(StrategyPolicyBinding.updated_at), StrategyPolicyBinding.strategy_config_id.asc())
     elif order == "updated_at_asc":
         stmt = stmt.order_by(StrategyPolicyBinding.updated_at.asc(), StrategyPolicyBinding.strategy_config_id.asc())
     elif order == "created_at_desc":
-        stmt = stmt.order_by(desc(StrategyPolicyBinding.updated_at), desc(StrategyPolicyBinding.strategy_config_id))
+        stmt = stmt.order_by(desc(StrategyPolicyBinding.updated_at), StrategyPolicyBinding.strategy_config_id.asc())
     elif order == "created_at_asc":
         stmt = stmt.order_by(StrategyPolicyBinding.updated_at.asc(), StrategyPolicyBinding.strategy_config_id.asc())
     else:
         raise HTTPException(status_code=400, detail="Unsupported order")
 
-    rows = await session.execute(stmt.limit(limit).offset(offset))
+    total, rows = await fetch_page(
+        session,
+        count_stmt=count_stmt,
+        data_stmt=stmt,
+        limit=limit,
+        offset=offset,
+    )
     items = [
         _binding_payload(
             strategy_config_id=row.strategy_config_id,
@@ -678,79 +1163,235 @@ async def list_strategy_policy_bindings(
             notes=row.notes,
             updated_at=row.updated_at,
         )
-        for row in rows.scalars().all()
+        for row in rows
     ]
-    return {"ok": True, "items": items, "limit": limit, "offset": offset, "total": total}
+    return {"items": items, "limit": limit, "offset": offset, "total": total}
+
+
+@router.post("/strategy-policy-bindings/upsert")
+async def upsert_strategy_policy_binding(
+    payload: StrategyBindingUpsertRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    strategy = await session.get(StrategyConfig, payload.strategy_config_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Strategy config not found")
+
+    existing = await get_strategy_policy_binding(session, strategy_config_id=payload.strategy_config_id)
+    fields_set = set(getattr(payload, "model_fields_set", None) or getattr(payload, "__fields_set__", set()))
+    risk_policy_id = (
+        payload.risk_policy_id
+        if "risk_policy_id" in fields_set
+        else (existing.risk_policy_id if existing else None)
+    )
+    position_policy_id = (
+        payload.position_policy_id
+        if "position_policy_id" in fields_set
+        else (existing.position_policy_id if existing else None)
+    )
+    notes = payload.notes if "notes" in fields_set else (existing.notes if existing else None)
+
+    if risk_policy_id is not None:
+        risk_policy = await session.get(RiskPolicy, risk_policy_id)
+        if risk_policy is None:
+            raise HTTPException(status_code=404, detail="Risk policy not found")
+    if position_policy_id is not None:
+        position_policy = await session.get(PositionPolicyConfig, position_policy_id)
+        if position_policy is None:
+            raise HTTPException(status_code=404, detail="Position policy not found")
+
+    binding, changes = await bind_strategy_policy(
+        session,
+        strategy_config_id=payload.strategy_config_id,
+        risk_policy_id=risk_policy_id,
+        position_policy_id=position_policy_id,
+        notes=notes,
+    )
+    await _audit_action(
+        session,
+        action="STRATEGY_POLICY_BINDING_UPSERTED",
+        message="Strategy policy binding upserted",
+        meta={
+            "actor": "admin",
+            "strategy_config_id": payload.strategy_config_id,
+            "risk_policy_id": risk_policy_id,
+            "position_policy_id": str(position_policy_id) if position_policy_id else None,
+            "notes": notes,
+            "old": {
+                "risk_policy_id": changes.get("old", {}).get("risk_policy_id"),
+                "position_policy_id": (
+                    str(changes.get("old", {}).get("position_policy_id"))
+                    if changes.get("old", {}).get("position_policy_id")
+                    else None
+                ),
+            },
+            "new": {
+                "risk_policy_id": changes.get("new", {}).get("risk_policy_id"),
+                "position_policy_id": (
+                    str(changes.get("new", {}).get("position_policy_id"))
+                    if changes.get("new", {}).get("position_policy_id")
+                    else None
+                ),
+            },
+        },
+    )
+    await session.commit()
+    await session.refresh(binding)
+    return {
+        "ok": True,
+        "binding": _binding_payload(
+            strategy_config_id=binding.strategy_config_id,
+            risk_policy_id=binding.risk_policy_id,
+            position_policy_id=binding.position_policy_id,
+            notes=binding.notes,
+            updated_at=binding.updated_at,
+        ),
+    }
+
+
+@router.post("/strategy-policy-bindings/{strategy_config_id}/rollback")
+async def rollback_strategy_policy_binding(
+    payload: StrategyBindingRollbackRequest,
+    strategy_config_id: int = Path(..., ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    if not any(
+        [
+            payload.risk_policy_id is not None,
+            payload.position_policy_id is not None,
+            payload.risk_policy is not None,
+            payload.position_policy is not None,
+        ]
+    ):
+        raise HTTPException(status_code=400, detail="Rollback target is required")
+    if payload.risk_policy_id is not None and payload.risk_policy is not None:
+        raise HTTPException(status_code=400, detail="Provide either risk_policy_id or risk_policy")
+    if payload.position_policy_id is not None and payload.position_policy is not None:
+        raise HTTPException(status_code=400, detail="Provide either position_policy_id or position_policy")
+
+    strategy, binding = await get_effective_binding_context(session, strategy_config_id=strategy_config_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Strategy config not found")
+
+    current_risk_id = binding.risk_policy_id if binding and binding.risk_policy_id is not None else strategy.risk_policy_id
+    current_position_id = binding.position_policy_id if binding else None
+
+    target_risk_id = current_risk_id
+    target_position_id = current_position_id
+    if payload.risk_policy_id is not None:
+        risk_policy = await session.get(RiskPolicy, payload.risk_policy_id)
+        if risk_policy is None:
+            raise HTTPException(status_code=404, detail="Risk policy not found")
+        target_risk_id = risk_policy.id
+    elif payload.risk_policy is not None:
+        risk_policy = await get_risk_policy_by_name_version(
+            session,
+            name=payload.risk_policy.name,
+            version=payload.risk_policy.version,
+        )
+        if risk_policy is None:
+            raise HTTPException(status_code=400, detail="Target risk policy version not found")
+        target_risk_id = risk_policy.id
+
+    if payload.position_policy_id is not None:
+        position_policy = await session.get(PositionPolicyConfig, payload.position_policy_id)
+        if position_policy is None:
+            raise HTTPException(status_code=404, detail="Position policy not found")
+        target_position_id = position_policy.id
+    elif payload.position_policy is not None:
+        position_policy = await get_position_policy_by_name_version(
+            session,
+            name=payload.position_policy.name,
+            version=payload.position_policy.version,
+        )
+        if position_policy is None:
+            raise HTTPException(status_code=400, detail="Target position policy version not found")
+        target_position_id = position_policy.id
+
+    old_risk = await session.get(RiskPolicy, current_risk_id) if current_risk_id is not None else None
+    old_position = await session.get(PositionPolicyConfig, current_position_id) if current_position_id is not None else None
+    new_risk = await session.get(RiskPolicy, target_risk_id) if target_risk_id is not None else None
+    new_position = (
+        await session.get(PositionPolicyConfig, target_position_id) if target_position_id is not None else None
+    )
+
+    fields_set = set(getattr(payload, "model_fields_set", None) or getattr(payload, "__fields_set__", set()))
+    notes = payload.notes if "notes" in fields_set else (binding.notes if binding else None)
+    binding_row, _ = await bind_strategy_policy(
+        session,
+        strategy_config_id=strategy_config_id,
+        risk_policy_id=target_risk_id,
+        position_policy_id=target_position_id,
+        notes=notes,
+    )
+    await _audit_action(
+        session,
+        action="STRATEGY_POLICY_BINDING_ROLLED_BACK",
+        message="Strategy policy binding rolled back",
+        meta={
+            "actor": "admin",
+            "strategy_config_id": strategy_config_id,
+            "risk_policy_id": target_risk_id,
+            "position_policy_id": str(target_position_id) if target_position_id else None,
+            "from": {
+                "risk_policy_id": old_risk.id if old_risk else None,
+                "risk_policy_version": old_risk.version if old_risk else None,
+                "position_policy_id": str(old_position.id) if old_position else None,
+                "position_policy_version": old_position.version if old_position else None,
+            },
+            "to": {
+                "risk_policy_id": new_risk.id if new_risk else None,
+                "risk_policy_version": new_risk.version if new_risk else None,
+                "position_policy_id": str(new_position.id) if new_position else None,
+                "position_policy_version": new_position.version if new_position else None,
+            },
+            "notes": notes,
+        },
+    )
+    await session.commit()
+    await session.refresh(binding_row)
+    return {
+        "ok": True,
+        "binding": _binding_payload(
+            strategy_config_id=binding_row.strategy_config_id,
+            risk_policy_id=binding_row.risk_policy_id,
+            position_policy_id=binding_row.position_policy_id,
+            notes=binding_row.notes,
+            updated_at=binding_row.updated_at,
+        ),
+        "from_policy": {"risk": _policy_info(old_risk), "position": _policy_info(old_position)},
+        "to_policy": {"risk": _policy_info(new_risk), "position": _policy_info(new_position)},
+    }
 
 
 @router.get("/strategy-configs/{strategy_config_id}/effective-policies")
 async def get_effective_policies_for_strategy(
     strategy_config_id: int = Path(..., ge=1),
-    symbol: Optional[str] = Query(None),
+    symbol: str = Query(..., min_length=1),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     strategy = await session.get(StrategyConfig, strategy_config_id)
     if strategy is None:
         raise HTTPException(status_code=404, detail="Strategy config not found")
 
-    symbol_norm = _normalize_symbol_or_400(symbol) if symbol is not None else None
-    snapshot = None
-    if symbol_norm is not None:
-        snapshot = await resolve_effective_policy_snapshot(
-            session,
-            strategy_config_id=strategy_config_id,
-            symbol=symbol_norm,
-        )
-        if snapshot is None:
-            raise HTTPException(status_code=404, detail="Strategy config not found")
+    symbol_norm = _normalize_symbol_or_400(symbol)
+    snapshot = await resolve_effective_policy_snapshot(
+        session,
+        strategy_config_id=strategy_config_id,
+        symbol=symbol_norm,
+    )
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Strategy config not found")
 
-    binding = await get_strategy_policy_binding(session, strategy_config_id=strategy_config_id)
-    if binding and (binding.risk_policy_id is not None or binding.position_policy_id is not None):
+    policy_binding = snapshot.policy_binding
+    policy_source = "default"
+    if snapshot.policy_source == "binding":
         policy_source = "binding"
-    elif strategy.risk_policy_id is not None:
+    elif snapshot.policy_source == "strategy_legacy":
         policy_source = "legacy"
-    else:
+    elif snapshot.policy_source == "account_default":
         policy_source = "default"
-
-    policy_binding = {
-        "strategy_config_id": strategy_config_id,
-        "legacy_risk_policy_id": strategy.risk_policy_id,
-        "bound_risk_policy_id": binding.risk_policy_id if binding else None,
-        "effective_risk_policy_id": (binding.risk_policy_id if binding and binding.risk_policy_id is not None else strategy.risk_policy_id),
-        "bound_position_policy_id": str(binding.position_policy_id) if binding and binding.position_policy_id else None,
-        "effective_position_policy_id": str(binding.position_policy_id) if binding and binding.position_policy_id else None,
-    }
-    if snapshot is not None:
-        policy_binding = snapshot.policy_binding
-        if snapshot.policy_source == "binding":
-            policy_source = "binding"
-        elif snapshot.policy_source == "strategy_legacy":
-            policy_source = "legacy"
-        elif snapshot.policy_source == "account_default":
-            policy_source = "default"
-
-    computed_limits = snapshot.computed_limits if snapshot is not None else {
-        "risk_limits": {
-            "max_order_notional_usdt": None,
-            "min_order_notional_usdt": None,
-            "max_leverage": None,
-            "max_drawdown_pct": None,
-            "max_drawdown_usdt": None,
-            "max_daily_loss_usdt": None,
-            "equity_lookback_hours": None,
-            "lookback_minutes": None,
-        },
-        "risk_limit_source": None,
-        "risk_policy_overrides": None,
-        "symbol_limits": {
-            "max_order_qty": None,
-            "max_position_qty": None,
-            "max_position_notional_usdt": None,
-            "max_position_pct_equity": None,
-        },
-        "symbol_limit_source": None,
-        "position_policy_overrides": None,
-    }
+    computed_limits = snapshot.computed_limits
 
     return {
         "ok": True,
