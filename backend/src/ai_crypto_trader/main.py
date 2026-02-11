@@ -18,6 +18,7 @@ from ai_crypto_trader.api.admin.monitoring import router as admin_monitoring_rou
 from ai_crypto_trader.api.admin.notifications import router as admin_notifications_router
 from ai_crypto_trader.api.admin.policies import router as admin_policies_router
 from ai_crypto_trader.api.admin.strategy_monitoring import router as admin_strategy_monitoring_router
+from ai_crypto_trader.api.admin.strategy_metrics import router as admin_strategy_metrics_router
 from ai_crypto_trader.api.admin.explainability import router as admin_explainability_router
 
 
@@ -57,6 +58,7 @@ def create_application() -> FastAPI:
     application.include_router(admin_notifications_router, prefix="/api")
     application.include_router(admin_policies_router, prefix="/api")
     application.include_router(admin_strategy_monitoring_router, prefix="/api")
+    application.include_router(admin_strategy_metrics_router, prefix="/api")
     application.include_router(admin_explainability_router, prefix="/api")
     application.add_api_route("/health", lambda: {"status": "ok"}, methods=["GET"], tags=["system"])
     return application

@@ -32,6 +32,7 @@ from ai_crypto_trader.services.paper_trader.policies_effective import get_effect
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
 from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
 from ai_crypto_trader.services.monitoring.strategy_monitor import run_strategy_monitor_tick
+from ai_crypto_trader.services.monitoring.strategy_metrics import run_strategy_metrics_once
 from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox_once
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
@@ -58,6 +59,7 @@ class PaperTraderRunner:
         self._stall_monitor_task: Optional[asyncio.Task[None]] = None
         self._outbox_task: Optional[asyncio.Task[None]] = None
         self._strategy_monitor_task: Optional[asyncio.Task[None]] = None
+        self._strategy_metrics_task: Optional[asyncio.Task[None]] = None
         self.last_reconcile_at: Optional[datetime] = None
         self.reconcile_tick_count: int = 0
         self.reconcile_interval_seconds: int = 0
@@ -112,6 +114,10 @@ class PaperTraderRunner:
             self._strategy_monitor_loop(),
             name="strategy_monitor",
         )
+        self._strategy_metrics_task = asyncio.create_task(
+            self._strategy_metrics_loop(),
+            name="strategy_metrics",
+        )
         self._task = asyncio.create_task(_run(), name="paper-trader")
 
     async def stop(self) -> None:
@@ -147,6 +153,13 @@ class PaperTraderRunner:
             except asyncio.CancelledError:
                 pass
         self._strategy_monitor_task = None
+        if self._strategy_metrics_task:
+            self._strategy_metrics_task.cancel()
+            try:
+                await self._strategy_metrics_task
+            except asyncio.CancelledError:
+                pass
+        self._strategy_metrics_task = None
         if self._stall_monitor_task:
             self._stall_monitor_task.cancel()
             try:
@@ -655,6 +668,62 @@ class PaperTraderRunner:
                         await session.commit()
                     except Exception:
                         logger.exception("Strategy monitor tick heartbeat write failed")
+            await asyncio.sleep(tick_seconds)
+
+    async def _strategy_metrics_loop(self) -> None:
+        tick_seconds = max(int(os.getenv("STRATEGY_METRICS_TICK_SECONDS", "60")), 1)
+        window_minutes = max(int(os.getenv("STRATEGY_METRICS_WINDOW_MINUTES", "1440")), 1)
+        max_pairs = max(int(os.getenv("STRATEGY_METRICS_MAX_PAIRS", "200")), 1)
+        while self.is_running:
+            now_utc = datetime.now(timezone.utc)
+            tick_bucket = now_utc.strftime("%Y%m%d%H%M")
+            tick_dedupe_key = f"STRATEGY_METRICS_TICK:{tick_bucket}"
+            async with AsyncSessionLocal() as session:
+                try:
+                    await run_strategy_metrics_once(
+                        session,
+                        now_utc=now_utc,
+                        window_minutes=window_minutes,
+                        max_pairs=max_pairs,
+                    )
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    logger.exception("Strategy metrics loop failed")
+                    try:
+                        existing_tick = await session.scalar(
+                            select(AdminAction)
+                            .where(AdminAction.dedupe_key == tick_dedupe_key)
+                            .limit(1)
+                        )
+                        error_meta = {
+                            "now_utc": now_utc.isoformat(),
+                            "window_minutes": window_minutes,
+                            "pairs_scanned": 0,
+                            "snapshots_written": 0,
+                            "alerts_emitted_count": 0,
+                            "duration_ms": 0,
+                            "errors_count": 1,
+                            "error": str(exc),
+                            "limit_pairs": max_pairs,
+                        }
+                        if existing_tick:
+                            existing_tick.status = "error"
+                            existing_tick.message = "strategy metrics failed"
+                            existing_tick.meta = error_meta
+                        else:
+                            session.add(
+                                AdminAction(
+                                    action="STRATEGY_METRICS_TICK",
+                                    status="error",
+                                    message="strategy metrics failed",
+                                    dedupe_key=tick_dedupe_key,
+                                    meta=error_meta,
+                                )
+                            )
+                        await session.commit()
+                    except Exception:
+                        logger.exception("Strategy metrics tick heartbeat write failed")
             await asyncio.sleep(tick_seconds)
 
 

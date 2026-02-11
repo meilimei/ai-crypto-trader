@@ -275,11 +275,14 @@ async def explainability_summary(
         FROM public.admin_actions
         WHERE action='TRADE_DECISION'
           AND created_at >= :since_ts
-          AND meta->>'account_id' = :account_id::text
-          AND (:strategy_config_id::text IS NULL OR meta->>'strategy_config_id' = :strategy_config_id::text)
+          AND meta->>'account_id' = CAST(:account_id AS text)
           AND (
-            :symbol::text IS NULL
-            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol::text
+            CAST(:strategy_config_id AS text) IS NULL
+            OR meta->>'strategy_config_id' = CAST(:strategy_config_id AS text)
+          )
+          AND (
+            CAST(:symbol AS text) IS NULL
+            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = CAST(:symbol AS text)
           )
         """
     )
@@ -318,11 +321,14 @@ async def explainability_summary(
         FROM public.admin_actions
         WHERE action='TRADE_OUTCOME'
           AND created_at >= :since_ts
-          AND meta->>'account_id' = :account_id::text
-          AND (:strategy_config_id::text IS NULL OR meta->>'strategy_config_id' = :strategy_config_id::text)
+          AND meta->>'account_id' = CAST(:account_id AS text)
           AND (
-            :symbol::text IS NULL
-            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol::text
+            CAST(:strategy_config_id AS text) IS NULL
+            OR meta->>'strategy_config_id' = CAST(:strategy_config_id AS text)
+          )
+          AND (
+            CAST(:symbol AS text) IS NULL
+            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = CAST(:symbol AS text)
           )
         """
     )
