@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.api.admin_paper_trader import require_admin_token
@@ -250,110 +250,143 @@ async def list_trade_outcomes(
 
 @router.get("/summary")
 async def explainability_summary(
-    account_id: int | None = Query(default=None),
+    account_id: int = Query(...),
     strategy_config_id: int | None = Query(default=None),
     symbol: str | None = Query(default=None),
     window_minutes: int = Query(default=1440, ge=1),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    decision_filters = _base_filters(
-        action="TRADE_DECISION",
-        account_id=account_id,
-        strategy_config_id=strategy_config_id,
-        symbol=symbol,
-        since_minutes=window_minutes,
-    )
-    decision_rows = (
-        await session.execute(
-            select(
-                func.lower(func.coalesce(meta_text(AdminAction.meta, "status"), "")).label("decision_status"),
-                func.count().label("cnt"),
-            )
-            .where(and_(*decision_filters))
-            .group_by(func.lower(func.coalesce(meta_text(AdminAction.meta, "status"), "")))
-        )
-    ).all()
-    executed_total = 0
-    rejected_total = 0
-    skipped_total = 0
-    decisions_total = 0
-    for status_value, count_value in decision_rows:
-        cnt = int(count_value or 0)
-        decisions_total += cnt
-        status_norm = (status_value or "").strip().lower()
-        if status_norm == "executed":
-            executed_total += cnt
-        elif status_norm == "rejected":
-            rejected_total += cnt
-        elif status_norm == "skipped":
-            skipped_total += cnt
-
-    outcome_filters = _base_filters(
-        action="TRADE_OUTCOME",
-        account_id=account_id,
-        strategy_config_id=strategy_config_id,
-        symbol=symbol,
-        since_minutes=window_minutes,
-    )
-    rows = (
-        await session.execute(
-            select(AdminAction.meta)
-            .where(and_(*outcome_filters))
-            .order_by(AdminAction.created_at.desc(), AdminAction.id.desc())
-        )
-    ).all()
-
-    outcomes_total = len(rows)
-    if outcomes_total == 0:
-        return {
-            "decisions_total": decisions_total,
-            "executed_total": executed_total,
-            "rejected_total": rejected_total,
-            "skipped_total": skipped_total,
-            "outcomes_total": 0,
-            "win_rate": 0.0,
-            "avg_return_pct": 0.0,
-            "total_pnl_usdt_est": "0",
-            "avg_pnl_usdt_est": "0",
-            "window_minutes": window_minutes,
-        }
-
-    wins = 0
-    return_values: list[Decimal] = []
-    pnl_values: list[Decimal] = []
-    for (meta_raw,) in rows:
-        meta = meta_raw if isinstance(meta_raw, dict) else {}
-        win = meta.get("win")
-        if isinstance(win, bool):
-            if win:
-                wins += 1
-        elif str(win).strip().lower() in {"1", "true", "yes", "on"}:
-            wins += 1
-
-        ret = _to_decimal(meta.get("return_pct_signed"))
-        pnl = _to_decimal(meta.get("pnl_usdt_est"))
-        if ret is not None:
-            return_values.append(ret)
-        if pnl is not None:
-            pnl_values.append(pnl)
-
-    total_pnl = sum(pnl_values, Decimal("0"))
-    avg_pnl = total_pnl / Decimal(len(pnl_values)) if pnl_values else Decimal("0")
-    avg_return = sum(return_values, Decimal("0")) / Decimal(len(return_values)) if return_values else Decimal("0")
-    win_rate = wins / outcomes_total if outcomes_total > 0 else 0.0
-
-    return {
-        "decisions_total": decisions_total,
-        "executed_total": executed_total,
-        "rejected_total": rejected_total,
-        "skipped_total": skipped_total,
-        "outcomes_total": outcomes_total,
-        "win_rate": float(win_rate),
-        "avg_return_pct": float(avg_return),
-        "total_pnl_usdt_est": str(total_pnl),
-        "avg_pnl_usdt_est": str(avg_pnl),
-        "window_minutes": window_minutes,
+    now_utc = datetime.now(timezone.utc)
+    since_ts = now_utc - timedelta(minutes=max(int(window_minutes), 1))
+    symbol_norm = normalize_symbol(symbol) if symbol else None
+    params = {
+        "since_ts": since_ts,
+        "account_id": str(account_id),
+        "strategy_config_id": str(strategy_config_id) if strategy_config_id is not None else None,
+        "symbol": symbol_norm,
     }
+    decisions_sql = text(
+        """
+        SELECT
+          COUNT(*)::bigint AS decisions_total,
+          COALESCE(SUM(CASE WHEN lower(COALESCE(meta->>'status',''))='executed' THEN 1 ELSE 0 END),0)::bigint AS executed_total,
+          COALESCE(SUM(CASE WHEN lower(COALESCE(meta->>'status',''))='rejected' THEN 1 ELSE 0 END),0)::bigint AS rejected_total,
+          COALESCE(SUM(CASE WHEN lower(COALESCE(meta->>'status',''))='skipped' THEN 1 ELSE 0 END),0)::bigint AS skipped_total
+        FROM public.admin_actions
+        WHERE action='TRADE_DECISION'
+          AND created_at >= :since_ts
+          AND meta->>'account_id' = :account_id
+          AND (:strategy_config_id IS NULL OR meta->>'strategy_config_id' = :strategy_config_id)
+          AND (
+            :symbol IS NULL
+            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol
+          )
+        """
+    )
+    outcomes_sql = text(
+        """
+        SELECT
+          COUNT(*)::bigint AS outcomes_total,
+          AVG(
+            CASE
+              WHEN lower(COALESCE(meta->>'win','')) IN ('true','t','1','yes','y','on') THEN 1.0
+              WHEN lower(COALESCE(meta->>'win','')) IN ('false','f','0','no','n','off') THEN 0.0
+              ELSE NULL
+            END
+          ) AS win_rate,
+          AVG(
+            CASE
+              WHEN meta ? 'return_pct_signed'
+                AND NULLIF(meta->>'return_pct_signed','') IS NOT NULL
+                AND (meta->>'return_pct_signed') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+              THEN (meta->>'return_pct_signed')::numeric
+              ELSE NULL
+            END
+          ) AS avg_return_pct_signed,
+          COALESCE(
+            SUM(
+              CASE
+                WHEN meta ? 'pnl_usdt_est'
+                  AND NULLIF(meta->>'pnl_usdt_est','') IS NOT NULL
+                  AND (meta->>'pnl_usdt_est') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                THEN (meta->>'pnl_usdt_est')::numeric
+                ELSE NULL
+              END
+            ),
+            0
+          ) AS total_pnl_usdt_est
+        FROM public.admin_actions
+        WHERE action='TRADE_OUTCOME'
+          AND created_at >= :since_ts
+          AND meta->>'account_id' = :account_id
+          AND (:strategy_config_id IS NULL OR meta->>'strategy_config_id' = :strategy_config_id)
+          AND (
+            :symbol IS NULL
+            OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = :symbol
+          )
+        """
+    )
+    try:
+        decisions_row = (await session.execute(decisions_sql, params)).mappings().first() or {}
+        outcomes_row = (await session.execute(outcomes_sql, params)).mappings().first() or {}
+
+        decisions = {
+            "decisions_total": int(decisions_row.get("decisions_total") or 0),
+            "executed_total": int(decisions_row.get("executed_total") or 0),
+            "rejected_total": int(decisions_row.get("rejected_total") or 0),
+            "skipped_total": int(decisions_row.get("skipped_total") or 0),
+        }
+        outcomes_total = int(outcomes_row.get("outcomes_total") or 0)
+        win_rate_value = outcomes_row.get("win_rate")
+        avg_return_value = outcomes_row.get("avg_return_pct_signed")
+        total_pnl_value = outcomes_row.get("total_pnl_usdt_est")
+
+        response = {
+            "ok": True,
+            "filters": {
+                "account_id": account_id,
+                "strategy_config_id": strategy_config_id,
+                "symbol": symbol_norm,
+            },
+            "window": {
+                "minutes": int(window_minutes),
+                "since_utc": since_ts.isoformat(),
+            },
+            "decisions": decisions,
+            "outcomes": {
+                "outcomes_total": outcomes_total,
+                "win_rate": float(win_rate_value) if win_rate_value is not None else 0.0,
+                "avg_return_pct_signed": float(avg_return_value) if avg_return_value is not None else 0.0,
+                "avg_return_pct": float(avg_return_value) if avg_return_value is not None else 0.0,
+                "total_pnl_usdt_est": str(total_pnl_value) if total_pnl_value is not None else "0",
+                "total_pnl_est": str(total_pnl_value) if total_pnl_value is not None else "0",
+            },
+        }
+        logger.info(
+            "EXPLAINABILITY_SUMMARY",
+            extra={
+                "account_id": account_id,
+                "strategy_config_id": strategy_config_id,
+                "symbol": symbol_norm,
+                "window_minutes": int(window_minutes),
+                "decisions_total": decisions["decisions_total"],
+                "outcomes_total": outcomes_total,
+            },
+        )
+        # Smoke check example:
+        # curl -sS "$BASE_URL/api/admin/explainability/summary?account_id=5&window_minutes=1440" -H "X-Admin-Token: $ADMIN_TOKEN" | python -m json.tool
+        return response
+    except Exception:
+        logger.exception(
+            "EXPLAINABILITY_SUMMARY_FAILED",
+            extra={
+                "account_id": account_id,
+                "strategy_config_id": strategy_config_id,
+                "symbol": symbol_norm,
+                "window_minutes": int(window_minutes),
+            },
+        )
+        raise HTTPException(status_code=500, detail="Failed to compute explainability summary")
 
 
 @router.post("/outcome-tick")
