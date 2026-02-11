@@ -138,7 +138,7 @@ async def emit_trade_decision(
 
     side = str(meta.get("side") or "").lower().strip()
     status = str(meta.get("status") or "").lower().strip()
-    if status not in {"executed", "rejected", "skipped"}:
+    if status not in {"executed", "rejected", "skipped", "proposed"}:
         logger.warning("trade decision emit skipped: invalid status", extra={"status": status})
         return None
 

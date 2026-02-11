@@ -33,6 +33,7 @@ from ai_crypto_trader.common.models import (
 
 from ai_crypto_trader.common.log_buffer import get_log_buffer
 from ai_crypto_trader.services.paper_trader.config import get_active_bundle, ActiveConfigMissingError, PaperTraderConfig
+from ai_crypto_trader.services.agent.auto_trade import AutoTradeAgent, AutoTradeSettings
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
@@ -122,6 +123,128 @@ def _to_decimal_or_none(value: object | None) -> Decimal | None:
         return Decimal(str(value))
     except Exception:
         return None
+
+
+def _is_auto_symbol(value: str | None) -> bool:
+    if value is None:
+        return True
+    return normalize_symbol(value) == "AUTO"
+
+
+async def _resolve_auto_smoke_decision(
+    payload: "SmokeTradeRequest",
+    session: AsyncSession,
+) -> tuple["SmokeTradeRequest", dict]:
+    strategy_config_id = _resolve_strategy_config_id(
+        strategy_config_id=payload.strategy_config_id,
+        strategy_id=payload.strategy_id,
+    )
+    if strategy_config_id is None:
+        raise HTTPException(status_code=400, detail="strategy_config_id is required for AUTO symbol")
+
+    agent = AutoTradeAgent(AutoTradeSettings.from_env())
+    try:
+        decision_bundle = await agent.decide_for_strategy(
+            session,
+            account_id=payload.account_id,
+            strategy_config_id=strategy_config_id,
+            symbol="AUTO",
+            timeframe=None,
+            window_minutes=60,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    decision = decision_bundle["decision"]
+    universe = decision_bundle["universe"]
+    timeframe = str(universe.get("timeframe") or PaperTraderConfig.from_env().timeframe)
+    if "candidates" not in decision:
+        decision["candidates"] = universe.get("fresh_candidates") or universe.get("candidates") or []
+    decision["candidates_count"] = len(decision.get("candidates") or [])
+    decision["candidates_sample"] = list((decision.get("candidates") or [])[:10])
+    decision["timeframe"] = timeframe
+    decision["strategy_config_id"] = strategy_config_id
+    decision["universe"] = {
+        "source": universe.get("source"),
+        "reason": universe.get("reason"),
+        "candidates_count": universe.get("candidates_count"),
+        "fresh_candidates_count": universe.get("fresh_candidates_count"),
+    }
+
+    selected_symbol = normalize_symbol(str(decision.get("selected_symbol") or ""))
+    selected_side = str(decision.get("side") or "hold").lower().strip()
+    qty_text = str(decision.get("qty") or "0")
+    try:
+        selected_qty = Decimal(qty_text)
+    except Exception:
+        selected_qty = Decimal("0")
+
+    update_payload = {
+        "symbol": selected_symbol if selected_symbol else "AUTO",
+        "side": selected_side,
+        "qty": selected_qty if selected_qty > 0 else Decimal("0"),
+        "strategy_config_id": strategy_config_id,
+        "strategy_id": str(strategy_config_id),
+    }
+    if hasattr(payload, "model_copy"):
+        resolved_payload = payload.model_copy(update=update_payload)
+    else:
+        resolved_payload = payload.copy(update=update_payload)
+    return resolved_payload, decision
+
+
+async def _emit_agent_decision_event(
+    session: AsyncSession,
+    *,
+    account_id: int,
+    strategy_config_id: int,
+    strategy_id: str | None,
+    decision: dict,
+    status: str,
+    rationale: str,
+    policy_source: str,
+    policy_binding: dict,
+    computed_limits: dict,
+    reject: dict | None = None,
+    execution: dict | None = None,
+) -> None:
+    selected_symbol = normalize_symbol(str(decision.get("selected_symbol") or ""))
+    side = str(decision.get("side") or "hold").lower().strip()
+    qty = str(decision.get("qty") or "0")
+    await emit_trade_decision(
+        session,
+        {
+            "created_now_utc": datetime.now(timezone.utc),
+            "account_id": str(account_id),
+            "strategy_id": strategy_id,
+            "strategy_config_id": strategy_config_id,
+            "symbol_in": selected_symbol or decision.get("symbol_in") or "AUTO",
+            "symbol_normalized": selected_symbol or "AUTO",
+            "side": side,
+            "qty_requested": qty,
+            "status": status,
+            "rationale": rationale,
+            "candidates_count": int(decision.get("candidates_count") or len(decision.get("candidates") or [])),
+            "candidates_sample": list((decision.get("candidates_sample") or decision.get("candidates") or [])[:10]),
+            "confidence": decision.get("confidence"),
+            "rationale_bullets": decision.get("rationale_bullets"),
+            "signals": decision.get("signals"),
+            "inputs": {
+                "strategy_thresholds": None,
+                "timeframe": decision.get("timeframe"),
+                "symbols": decision.get("candidates"),
+                "price_source": "agent_auto",
+                "market_price_used": None,
+            },
+            "policy_source": policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+            "agent_decision": decision,
+            "result": {
+                "reject": reject,
+                **({"execution": execution} if execution else {}),
+            },
+        },
+    )
 
 
 router = APIRouter(prefix="/admin/paper-trader", tags=["admin"], dependencies=[Depends(require_admin_token)])
@@ -343,7 +466,7 @@ class ReconcileApplyBody(BaseModel):
 
 class SmokeTradeRequest(BaseModel):
     account_id: int
-    symbol: str = "ETHUSDT"
+    symbol: str | None = "ETHUSDT"
     side: str = "buy"
     qty: Decimal = Decimal("0.01")
     price: str | None = None
@@ -360,6 +483,16 @@ class TestOrderRequest(BaseModel):
     qty: Decimal | str
     price_override: Decimal | str | None = None
     execute: bool = False
+
+
+class AgentDecideRequest(BaseModel):
+    account_id: int
+    strategy_config_id: int
+    symbol: str | None = "AUTO"
+    timeframe: str | None = None
+    window_minutes: int = 60
+    dry_run: bool = True
+    price_override: Decimal | str | None = None
 
 
 class PaperAccountCreateRequest(BaseModel):
@@ -536,7 +669,12 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
     }
 
 
-async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -> dict | JSONResponse:
+async def _smoke_trade_impl(
+    payload: SmokeTradeRequest,
+    session: AsyncSession,
+    *,
+    agent_decision: dict | None = None,
+) -> dict | JSONResponse:
     # Self-test: NEW_ID=3 smoke buy 0.01 + sell 0.005 (with price), then verify positions/balances,
     # reconcile?account_id=3 diff_count ok, /status has no InvalidStateError, admin_actions meta serializes.
     symbol_in = (payload.symbol or "ETHUSDT").strip()
@@ -596,6 +734,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         "side": side,
         "qty": str(payload.qty),
         "price_override": str(price_override_value) if price_override_value is not None else None,
+        "agent_decision": agent_decision,
     }
 
     async def _reject_smoke(reject: RejectReason, *, status_code: int = 400):
@@ -621,6 +760,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             "policy_source": policy_source,
             "policy_binding": policy_binding,
             "computed_limits": computed_limits,
+            "agent_decision": agent_decision,
             "reject": reject.dict(),
             "result": {"reject": reject.dict()},
         }
@@ -662,6 +802,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                     "policy_source": policy_source,
                     "policy_binding": policy_binding,
                     "computed_limits": computed_limits,
+                    "agent_decision": agent_decision,
                 }
             ),
         )
@@ -793,7 +934,10 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         price_override=price_override_value,
         fee_bps=config.fee_bps,
         slippage_bps=config.slippage_bps,
-        meta={"origin": "admin_smoke"},
+        meta={
+            "origin": "admin_smoke",
+            "agent_decision": agent_decision,
+        },
     )
     if isinstance(result, RejectReason):
         await _record_action(
@@ -820,6 +964,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                     "policy_source": policy_source,
                     "policy_binding": policy_binding,
                     "computed_limits": computed_limits,
+                    "agent_decision": agent_decision,
                 }
             ),
         )
@@ -847,6 +992,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
             "policy_source": result.policy_source,
             "policy_binding": policy_binding,
             "computed_limits": computed_limits,
+            "agent_decision": agent_decision,
         }),
     )
     await _record_action(
@@ -869,6 +1015,7 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
                 "policy_source": result.policy_source,
                 "policy_binding": policy_binding,
                 "computed_limits": computed_limits,
+                "agent_decision": agent_decision,
             }
         ),
     )
@@ -891,10 +1038,26 @@ async def _smoke_trade_impl(payload: SmokeTradeRequest, session: AsyncSession) -
         "account_id": payload.account_id,
         "symbol_in": symbol_in,
         "symbol_normalized": symbol_norm,
+        "selected_symbol": (
+            normalize_symbol(str(agent_decision.get("selected_symbol")))
+            if isinstance(agent_decision, dict) and agent_decision.get("selected_symbol")
+            else symbol_norm
+        ),
+        "decision_side": (
+            str(agent_decision.get("side")).lower().strip()
+            if isinstance(agent_decision, dict) and agent_decision.get("side")
+            else side
+        ),
+        "decision_confidence": (
+            agent_decision.get("confidence")
+            if isinstance(agent_decision, dict)
+            else None
+        ),
         "price_source": price_source,
         "policy_source": policy_source,
         "policy_binding": policy_binding,
         "computed_limits": computed_limits,
+        "agent_decision": agent_decision,
         "trade": {
             "id": execution.trade.id,
             "symbol": execution.trade.symbol,
@@ -1311,27 +1474,112 @@ async def test_order(payload: TestOrderRequest, session: AsyncSession = Depends(
 
 @router.post("/smoke-trade")
 async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depends(get_db_session)) -> dict:
-    price_override_value = payload.price_override if payload.price_override is not None else payload.price
+    resolved_payload = payload
+    agent_decision: dict | None = None
+    if _is_auto_symbol(payload.symbol):
+        resolved_payload, agent_decision = await _resolve_auto_smoke_decision(payload, session)
+        if str(agent_decision.get("side") or "hold").lower().strip() == "hold":
+            strategy_config_id = _resolve_strategy_config_id(
+                strategy_config_id=resolved_payload.strategy_config_id,
+                strategy_id=resolved_payload.strategy_id,
+            )
+            selected_symbol = normalize_symbol(str(agent_decision.get("selected_symbol") or "AUTO"))
+            snapshot = None
+            if strategy_config_id is not None:
+                snapshot = await resolve_effective_policy_snapshot(
+                    session,
+                    strategy_config_id=strategy_config_id,
+                    symbol=selected_symbol,
+                )
+            rationale = (
+                (agent_decision.get("rationale_bullets") or [agent_decision.get("reason") or "Agent decided hold"])[0]
+                if isinstance(agent_decision.get("rationale_bullets"), list)
+                else str(agent_decision.get("reason") or "Agent decided hold")
+            )
+            await emit_trade_decision(
+                session,
+                {
+                    "created_now_utc": datetime.now(timezone.utc),
+                    "account_id": str(resolved_payload.account_id),
+                    "strategy_id": resolved_payload.strategy_id,
+                    "strategy_config_id": strategy_config_id,
+                    "symbol_in": selected_symbol,
+                    "symbol_normalized": selected_symbol,
+                    "side": "hold",
+                    "qty_requested": "0",
+                    "status": "skipped",
+                    "rationale": rationale,
+                    "inputs": {
+                        "strategy_thresholds": None,
+                        "timeframe": agent_decision.get("timeframe"),
+                        "symbols": agent_decision.get("candidates"),
+                        "price_source": "agent_auto",
+                        "market_price_used": None,
+                    },
+                    "policy_source": snapshot.policy_source if snapshot else "account_default",
+                    "policy_binding": snapshot.policy_binding if snapshot else {"strategy_config_id": strategy_config_id},
+                    "computed_limits": snapshot.computed_limits if snapshot else {},
+                    "agent_decision": agent_decision,
+                    "result": {
+                        "reject": {
+                            "code": "AUTO_HOLD",
+                            "reason": str(agent_decision.get("reason") or "Agent decided hold"),
+                            "details": {"selected_symbol": selected_symbol},
+                        }
+                    },
+                },
+            )
+            await _record_action(
+                session,
+                "SMOKE_TRADE",
+                "ok",
+                "Smoke trade skipped (agent hold)",
+                meta=json_safe(
+                    {
+                        "account_id": resolved_payload.account_id,
+                        "strategy_config_id": strategy_config_id,
+                        "symbol": selected_symbol,
+                        "status": "skipped",
+                        "agent_decision": agent_decision,
+                    }
+                ),
+            )
+            return {
+                "ok": True,
+                "status": "skipped",
+                "reason": agent_decision.get("reason") or "Agent decided hold",
+                "selected_symbol": selected_symbol,
+                "agent_decision": agent_decision,
+                "policy_source": snapshot.policy_source if snapshot else "account_default",
+                "policy_binding": snapshot.policy_binding if snapshot else {"strategy_config_id": strategy_config_id},
+                "computed_limits": snapshot.computed_limits if snapshot else {},
+            }
+
+    price_override_value = (
+        resolved_payload.price_override
+        if resolved_payload.price_override is not None
+        else resolved_payload.price
+    )
     if not runner.is_running:
         reject = RejectReason(code=RejectCode.ENGINE_NOT_RUNNING, reason="Paper trader engine is not running")
         strategy_config_id = _resolve_strategy_config_id(
-            strategy_config_id=payload.strategy_config_id,
-            strategy_id=payload.strategy_id,
+            strategy_config_id=resolved_payload.strategy_config_id,
+            strategy_id=resolved_payload.strategy_id,
         )
-        symbol_norm = normalize_symbol(getattr(payload, "symbol", ""))
-        side_norm = (getattr(payload, "side", "") or "").lower().strip()
+        symbol_norm = normalize_symbol(getattr(resolved_payload, "symbol", ""))
+        side_norm = (getattr(resolved_payload, "side", "") or "").lower().strip()
         try:
             await emit_trade_decision(
                 session,
                 {
                     "created_now_utc": datetime.now(timezone.utc),
-                    "account_id": str(payload.account_id),
-                    "strategy_id": payload.strategy_id,
+                    "account_id": str(resolved_payload.account_id),
+                    "strategy_id": resolved_payload.strategy_id,
                     "strategy_config_id": strategy_config_id,
-                    "symbol_in": getattr(payload, "symbol", None),
+                    "symbol_in": getattr(resolved_payload, "symbol", None),
                     "symbol_normalized": symbol_norm,
                     "side": side_norm or "buy",
-                    "qty_requested": str(payload.qty),
+                    "qty_requested": str(resolved_payload.qty),
                     "status": "rejected",
                     "rationale": reject.reason,
                     "inputs": {
@@ -1344,6 +1592,7 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
                     "policy_source": "account_default",
                     "policy_binding": {"strategy_config_id": strategy_config_id},
                     "computed_limits": {},
+                    "agent_decision": agent_decision,
                     "result": {
                         "reject": reject.dict(),
                         "endpoint": "POST /admin/paper-trader/smoke-trade",
@@ -1355,7 +1604,7 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
         engine_status = runner.status()
         await log_order_rejected_throttled(
             session,
-            account_id=payload.account_id,
+            account_id=resolved_payload.account_id,
             symbol=symbol_norm,
             reject_code=reject.code,
             reject_reason=reject.reason,
@@ -1368,13 +1617,14 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
                 "engine_last_cycle_at": engine_status.get("last_cycle_at"),
                 "engine_last_error": engine_status.get("last_error"),
                 "request": {
-                    "account_id": payload.account_id,
-                    "symbol_in": getattr(payload, "symbol", None),
-                    "side": getattr(payload, "side", None),
-                    "qty": str(getattr(payload, "qty", None)),
+                    "account_id": resolved_payload.account_id,
+                    "symbol_in": getattr(resolved_payload, "symbol", None),
+                    "side": getattr(resolved_payload, "side", None),
+                    "qty": str(getattr(resolved_payload, "qty", None)),
                     "price_override": str(price_override_value) if price_override_value is not None else None,
-                    "strategy_id": getattr(payload, "strategy_id", None),
-                    "strategy_config_id": getattr(payload, "strategy_config_id", None),
+                    "strategy_id": getattr(resolved_payload, "strategy_id", None),
+                    "strategy_config_id": getattr(resolved_payload, "strategy_config_id", None),
+                    "agent_decision": agent_decision,
                 },
             },
             window_seconds=120,
@@ -1385,7 +1635,11 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             await session.rollback()
         return _reject_response(reject, status_code=400)
     try:
-        return await _smoke_trade_impl(payload, session)
+        return await _smoke_trade_impl(
+            resolved_payload,
+            session,
+            agent_decision=agent_decision,
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -1397,13 +1651,14 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             "Smoke trade failed",
             meta=json_safe(
                 {
-                    "account_id": payload.account_id,
-                    "symbol_in": getattr(payload, "symbol", None),
-                    "side": getattr(payload, "side", None),
-                    "qty": str(getattr(payload, "qty", None)),
+                    "account_id": resolved_payload.account_id,
+                    "symbol_in": getattr(resolved_payload, "symbol", None),
+                    "side": getattr(resolved_payload, "side", None),
+                    "qty": str(getattr(resolved_payload, "qty", None)),
                     "price_override": str(price_override_value) if price_override_value is not None else None,
                     "error": str(exc),
                     "error_type": exc.__class__.__name__,
+                    "agent_decision": agent_decision,
                 }
             ),
         )
@@ -1411,6 +1666,224 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
             status_code=500,
             content={"ok": False, "error": str(exc), "error_type": exc.__class__.__name__},
         )
+
+
+@router.get("/agent/universe")
+async def agent_universe(
+    strategy_config_id: int = Query(..., ge=1),
+    timeframe: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    agent = AutoTradeAgent(AutoTradeSettings.from_env())
+    try:
+        universe = await agent.build_universe_for_strategy(
+            session,
+            strategy_config_id=strategy_config_id,
+            timeframe=timeframe,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    logger.info(
+        "AGENT_UNIVERSE_QUERY",
+        extra={
+            "strategy_config_id": strategy_config_id,
+            "timeframe": timeframe,
+            "candidates_count": universe.get("candidates_count"),
+            "fresh_candidates_count": universe.get("fresh_candidates_count"),
+            "source": universe.get("source"),
+        },
+    )
+    return {"ok": True, **universe}
+
+
+@router.post("/agent/decide")
+async def agent_decide(
+    payload: AgentDecideRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    agent = AutoTradeAgent(AutoTradeSettings.from_env())
+    try:
+        bundle = await agent.decide_for_strategy(
+            session,
+            account_id=payload.account_id,
+            strategy_config_id=payload.strategy_config_id,
+            symbol=payload.symbol,
+            timeframe=payload.timeframe,
+            window_minutes=payload.window_minutes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    decision = bundle["decision"]
+    universe = bundle["universe"]
+    selected_symbol = normalize_symbol(str(decision.get("selected_symbol") or ""))
+    side = str(decision.get("side") or "hold").lower().strip()
+    qty_text = str(decision.get("qty") or "0")
+    try:
+        qty = Decimal(qty_text)
+    except Exception:
+        qty = Decimal("0")
+
+    symbol_for_policy = selected_symbol or (
+        (decision.get("candidates") or [None])[0]
+        if isinstance(decision.get("candidates"), list)
+        else None
+    ) or "AUTO"
+    snapshot = await resolve_effective_policy_snapshot(
+        session,
+        strategy_config_id=payload.strategy_config_id,
+        symbol=str(symbol_for_policy),
+    )
+    policy_source = snapshot.policy_source if snapshot else "account_default"
+    policy_binding = (
+        snapshot.policy_binding
+        if snapshot
+        else {"strategy_config_id": payload.strategy_config_id}
+    )
+    computed_limits = snapshot.computed_limits if snapshot else {}
+
+    logger.info(
+        "AGENT_DECIDE",
+        extra={
+            "account_id": payload.account_id,
+            "strategy_config_id": payload.strategy_config_id,
+            "symbol": selected_symbol,
+            "side": side,
+            "qty": str(qty),
+            "dry_run": payload.dry_run,
+            "confidence": decision.get("confidence"),
+            "candidates_count": decision.get("candidates_count"),
+        },
+    )
+
+    if side == "hold" or not selected_symbol or qty <= 0:
+        reason = str(decision.get("reason") or "Agent decided hold")
+        reject_payload = {
+            "code": "AUTO_HOLD",
+            "reason": reason,
+            "details": {
+                "selected_symbol": selected_symbol or None,
+                "candidates_count": decision.get("candidates_count"),
+                "candidates_sample": decision.get("candidates_sample"),
+            },
+        }
+        await _emit_agent_decision_event(
+            session,
+            account_id=payload.account_id,
+            strategy_config_id=payload.strategy_config_id,
+            strategy_id=str(payload.strategy_config_id),
+            decision=decision,
+            status="skipped",
+            rationale=reason,
+            policy_source=policy_source,
+            policy_binding=policy_binding,
+            computed_limits=computed_limits,
+            reject=reject_payload,
+        )
+        await session.commit()
+        return {
+            "ok": True,
+            "status": "skipped",
+            "agent_decision": decision,
+            "selected_symbol": selected_symbol or None,
+            "policy_source": policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+            "universe": universe,
+        }
+
+    if payload.dry_run:
+        await _emit_agent_decision_event(
+            session,
+            account_id=payload.account_id,
+            strategy_config_id=payload.strategy_config_id,
+            strategy_id=str(payload.strategy_config_id),
+            decision=decision,
+            status="proposed",
+            rationale="Agent decision proposed (dry run)",
+            policy_source=policy_source,
+            policy_binding=policy_binding,
+            computed_limits=computed_limits,
+        )
+        await session.commit()
+        return {
+            "ok": True,
+            "status": "proposed",
+            "dry_run": True,
+            "agent_decision": decision,
+            "selected_symbol": selected_symbol,
+            "policy_source": policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+            "universe": universe,
+        }
+
+    config = PaperTraderConfig.from_env()
+    try:
+        result = await place_order_unified(
+            session,
+            account_id=payload.account_id,
+            symbol=selected_symbol,
+            side=side,
+            qty=qty,
+            strategy_id=payload.strategy_config_id,
+            price_override=payload.price_override,
+            fee_bps=config.fee_bps,
+            slippage_bps=config.slippage_bps,
+            meta={
+                "origin": "admin_agent_decide",
+                "agent_decision": decision,
+                "agent_universe": {
+                    "source": universe.get("source"),
+                    "candidates_count": universe.get("candidates_count"),
+                    "fresh_candidates_count": universe.get("fresh_candidates_count"),
+                },
+            },
+            reject_action_type="ORDER_REJECTED",
+            reject_window_seconds=120,
+        )
+    except HTTPException:
+        await session.rollback()
+        raise
+    except Exception as exc:
+        await session.rollback()
+        logger.exception("AGENT_DECIDE_EXECUTION_FAILED")
+        raise HTTPException(status_code=500, detail=f"agent decide execution failed: {exc}")
+
+    if isinstance(result, RejectReason):
+        await session.commit()
+        return {
+            "ok": False,
+            "status": "rejected",
+            "agent_decision": decision,
+            "selected_symbol": selected_symbol,
+            "reject": result.dict(),
+            "policy_source": policy_source,
+            "policy_binding": policy_binding,
+            "computed_limits": computed_limits,
+            "universe": universe,
+        }
+
+    execution = result.execution
+    await session.commit()
+    return {
+        "ok": True,
+        "status": "executed",
+        "agent_decision": decision,
+        "selected_symbol": selected_symbol,
+        "policy_source": result.policy_source or policy_source,
+        "policy_binding": policy_binding,
+        "computed_limits": computed_limits,
+        "execution": {
+            "order_id": execution.order.id,
+            "trade_id": execution.trade.id,
+            "symbol": result.prepared.symbol,
+            "side": execution.order.side,
+            "qty": str(result.prepared.qty),
+            "price": str(result.prepared.price),
+            "price_source": result.price_source,
+        },
+        "universe": universe,
+    }
 
 
 @admin_router.post("/paper-accounts/create")

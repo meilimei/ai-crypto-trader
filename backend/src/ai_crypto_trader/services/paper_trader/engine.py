@@ -20,6 +20,7 @@ from ai_crypto_trader.common.models import (
 from ai_crypto_trader.services.llm_agent.config import LLMConfig
 from ai_crypto_trader.services.llm_agent.schemas import AdviceRequest, AdviceResponse, MarketSummary as AdviceMarketSummary, PerformanceSummary
 from ai_crypto_trader.services.llm_agent.service import LLMService
+from ai_crypto_trader.services.agent.auto_trade import AutoTradeAgent, AutoTradeSettings
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
 from ai_crypto_trader.services.paper_trader.order_entry import place_order_unified
 from ai_crypto_trader.services.explainability.explainability import emit_trade_decision
@@ -29,6 +30,7 @@ from ai_crypto_trader.services.admin_actions.helpers import add_action_deduped
 from ai_crypto_trader.services.paper_trader.market_summary import MarketSummaryBuilder
 from ai_crypto_trader.services.paper_trader.risk import clamp_notional, enforce_confidence
 from ai_crypto_trader.services.paper_trader.sizing import target_notional_from_advice
+from ai_crypto_trader.services.policies.effective import resolve_effective_policy_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,8 @@ class PaperTradingEngine:
     def __init__(self, config: PaperTraderConfig, stop_event: Optional[asyncio.Event] = None) -> None:
         self.config = config
         self.llm_service = LLMService(LLMConfig.from_env())
+        self.auto_trade_settings = AutoTradeSettings.from_env()
+        self.auto_trade_agent = AutoTradeAgent(self.auto_trade_settings, llm_service=self.llm_service)
         self.account_name = f"paper-{self.config.exchange_name}"
         self.peak_equity: Optional[Decimal] = None
         self.stop_event = stop_event or asyncio.Event()
@@ -95,20 +99,46 @@ class PaperTradingEngine:
             symbols_for_cycle = (
                 strategy_config.symbols if strategy_config and strategy_config.symbols else self.config.symbols
             )
+            strategy_thresholds = (
+                strategy_config.thresholds
+                if strategy_config and isinstance(strategy_config.thresholds, dict)
+                else {}
+            )
+            strategy_timeframe = (
+                strategy_config.timeframe
+                if strategy_config and strategy_config.timeframe
+                else self.config.timeframe
+            )
 
-            for symbol in symbols_for_cycle:
+            auto_universe = self._is_auto_universe_mode(
+                thresholds=strategy_thresholds,
+                symbols=symbols_for_cycle,
+            )
+            if auto_universe and strategy_config_id is not None:
                 try:
-                    await self._process_symbol(
+                    await self._process_auto_universe(
                         session,
-                        account.id,
-                        balance,
-                        equity,
-                        symbol,
+                        account_id=account.id,
                         strategy_config_id=strategy_config_id,
+                        timeframe=strategy_timeframe,
+                        symbols=symbols_for_cycle,
                     )
                 except MissingGreenlet as exc:
-                    await self._log_engine_error(session, account_id=account.id, symbol=symbol, exc=exc)
-                    continue
+                    await self._log_engine_error(session, account_id=account.id, symbol="AUTO", exc=exc)
+            else:
+                for symbol in symbols_for_cycle:
+                    try:
+                        await self._process_symbol(
+                            session,
+                            account.id,
+                            balance,
+                            equity,
+                            symbol,
+                            strategy_config_id=strategy_config_id,
+                        )
+                    except MissingGreenlet as exc:
+                        await self._log_engine_error(session, account_id=account.id, symbol=symbol, exc=exc)
+                        continue
 
             try:
                 await self._snapshot_equity(session, account.id, balance, equity)
@@ -141,6 +171,185 @@ class PaperTradingEngine:
         session.add(balance)
         await session.flush()
         return balance
+
+    def _is_auto_universe_mode(self, *, thresholds: dict, symbols: list[str]) -> bool:
+        if not self.auto_trade_settings.enabled:
+            return False
+        auto_flag = bool(thresholds.get("auto_universe")) if isinstance(thresholds, dict) else False
+        has_sentinel = any(normalize_symbol(sym) == "AUTO" for sym in (symbols or []))
+        return auto_flag or has_sentinel
+
+    async def _process_auto_universe(
+        self,
+        session: AsyncSession,
+        *,
+        account_id: int,
+        strategy_config_id: int,
+        timeframe: str,
+        symbols: list[str],
+    ) -> None:
+        bundle = await self.auto_trade_agent.decide_for_strategy(
+            session,
+            account_id=account_id,
+            strategy_config_id=strategy_config_id,
+            symbol="AUTO",
+            timeframe=timeframe,
+            window_minutes=60,
+        )
+        decision = bundle["decision"]
+        universe = bundle["universe"]
+        candidates = list(decision.get("candidates") or universe.get("candidates") or [])
+        selected_symbol = normalize_symbol(str(decision.get("selected_symbol") or ""))
+        side = str(decision.get("side") or "hold").lower().strip()
+        qty_text = str(decision.get("qty") or "0")
+        try:
+            qty = Decimal(qty_text)
+        except Exception:
+            qty = Decimal("0")
+
+        logger.info(
+            "AUTO_TRADE_DECISION",
+            extra={
+                "account_id": account_id,
+                "strategy_config_id": strategy_config_id,
+                "candidates_count": len(candidates),
+                "selected_symbol": selected_symbol or None,
+                "side": side,
+                "qty": str(qty),
+                "confidence": decision.get("confidence"),
+                "status": decision.get("status"),
+                "reason": decision.get("reason"),
+            },
+        )
+
+        if side == "hold" or not selected_symbol or qty <= 0:
+            snapshot = await resolve_effective_policy_snapshot(
+                session,
+                strategy_config_id=strategy_config_id,
+                symbol=selected_symbol or (candidates[0] if candidates else "AUTO"),
+            )
+            await emit_trade_decision(
+                session,
+                {
+                    "created_now_utc": datetime.now(timezone.utc),
+                    "account_id": str(account_id),
+                    "strategy_id": str(strategy_config_id),
+                    "strategy_config_id": strategy_config_id,
+                    "symbol_in": selected_symbol or "AUTO",
+                    "symbol_normalized": selected_symbol or "AUTO",
+                    "side": side if side in {"buy", "sell"} else "hold",
+                    "qty_requested": str(qty if qty > 0 else Decimal("0")),
+                    "status": "skipped",
+                    "rationale": decision.get("reason") or "Agent decided hold",
+                    "inputs": {
+                        "strategy_thresholds": None,
+                        "timeframe": timeframe,
+                        "symbols": candidates,
+                        "price_source": "agent_auto",
+                        "market_price_used": None,
+                    },
+                    "policy_source": snapshot.policy_source if snapshot else "account_default",
+                    "policy_binding": snapshot.policy_binding if snapshot else {"strategy_config_id": strategy_config_id},
+                    "computed_limits": snapshot.computed_limits if snapshot else {},
+                    "agent_decision": decision,
+                    "result": {
+                        "reject": {
+                            "code": "AUTO_HOLD",
+                            "reason": decision.get("reason") or "Agent decided hold",
+                            "details": {
+                                "selected_symbol": selected_symbol or None,
+                                "candidates": candidates,
+                                "universe_source": universe.get("source"),
+                            },
+                        }
+                    },
+                },
+            )
+            return
+
+        summary_builder = MarketSummaryBuilder(session, self.config.exchange_name, timeframe)
+        summary = await summary_builder.build(selected_symbol)
+        if summary is None:
+            await emit_trade_decision(
+                session,
+                {
+                    "created_now_utc": datetime.now(timezone.utc),
+                    "account_id": str(account_id),
+                    "strategy_id": str(strategy_config_id),
+                    "strategy_config_id": strategy_config_id,
+                    "symbol_in": selected_symbol,
+                    "symbol_normalized": selected_symbol,
+                    "side": side,
+                    "qty_requested": str(qty),
+                    "status": "skipped",
+                    "rationale": "No candles for selected symbol",
+                    "inputs": {
+                        "strategy_thresholds": None,
+                        "timeframe": timeframe,
+                        "symbols": candidates,
+                        "price_source": "agent_auto",
+                        "market_price_used": None,
+                    },
+                    "policy_source": "binding",
+                    "policy_binding": {"strategy_config_id": strategy_config_id},
+                    "computed_limits": {},
+                    "agent_decision": decision,
+                    "result": {
+                        "reject": {
+                            "code": "NO_CANDLES",
+                            "reason": "No candles for selected symbol",
+                            "details": {"selected_symbol": selected_symbol},
+                        }
+                    },
+                },
+            )
+            return
+
+        result = await place_order_unified(
+            session,
+            account_id=account_id,
+            symbol=selected_symbol,
+            side=side,
+            qty=qty,
+            strategy_id=strategy_config_id,
+            market_price=summary.last_close,
+            market_price_source="agent_auto",
+            fee_bps=self.config.fee_bps,
+            slippage_bps=self.config.slippage_bps,
+            meta={
+                "origin": "engine_auto_agent",
+                "agent_decision": decision,
+            },
+            reject_action_type="ORDER_SKIPPED",
+            reject_window_seconds=120,
+        )
+        if isinstance(result, RejectReason):
+            logger.info(
+                "AUTO_TRADE_DECISION_RESULT",
+                extra={
+                    "account_id": account_id,
+                    "strategy_config_id": strategy_config_id,
+                    "selected_symbol": selected_symbol,
+                    "side": side,
+                    "qty": str(qty),
+                    "result": "rejected",
+                    "reject_code": str(result.code),
+                },
+            )
+            return
+        logger.info(
+            "AUTO_TRADE_DECISION_RESULT",
+            extra={
+                "account_id": account_id,
+                "strategy_config_id": strategy_config_id,
+                "selected_symbol": selected_symbol,
+                "side": side,
+                "qty": str(qty),
+                "result": "executed",
+                "order_id": result.execution.order.id,
+                "trade_id": result.execution.trade.id,
+            },
+        )
 
     async def _process_symbol(
         self,

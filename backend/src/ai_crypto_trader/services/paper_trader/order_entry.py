@@ -375,6 +375,11 @@ async def place_order_unified(
         else (str(strategy_id_norm) if strategy_id_norm is not None else None)
     )
     symbol_limit = None
+    agent_decision_meta: dict | None = None
+    if isinstance(meta, dict):
+        candidate = meta.get("agent_decision")
+        if isinstance(candidate, dict):
+            agent_decision_meta = candidate
     bound_policy_meta: dict | None = None
     policy_ids = None
     bound_position_policy_row = None
@@ -593,6 +598,7 @@ async def place_order_unified(
             "strategy_config_id": strategy_config_id,
             "symbol_limit_source": symbol_limit_source,
             "symbol_limits": symbol_limits_payload,
+            "agent_decision": agent_decision_meta,
         }
         if extra_meta:
             payload.update(extra_meta)
@@ -634,6 +640,7 @@ async def place_order_unified(
                         "position_policy_overrides": payload.get("position_policy_overrides"),
                     },
                     "result": {"reject": reject_payload},
+                    "agent_decision": agent_decision_meta,
                 },
             )
         except Exception:
@@ -1453,6 +1460,7 @@ async def place_order_unified(
             "fee": str(execution.order.fee_paid) if execution.order.fee_paid is not None else None,
             "created_at": execution.trade.created_at.isoformat() if execution.trade.created_at else None,
         },
+        "agent_decision": agent_decision_meta,
     }
     try:
         await emit_trade_decision(session, decision_payload)

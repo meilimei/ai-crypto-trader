@@ -30,7 +30,13 @@ class OpenAICompatibleClient:
             "Content-Type": "application/json",
         }
 
-    async def chat_completion(self, messages: List[Dict[str, str]]) -> str:
+    async def chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        temperature: float | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
         if not self.api_key:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -41,12 +47,14 @@ class OpenAICompatibleClient:
             "model": self.config.model,
             "messages": messages,
             "response_format": {"type": "json_object"},
-            "temperature": 0.2,
+            "temperature": 0.2 if temperature is None else float(temperature),
         }
 
         try:
             async with httpx.AsyncClient(
-                base_url=str(self.config.base_url), headers=self.headers, timeout=30.0
+                base_url=str(self.config.base_url),
+                headers=self.headers,
+                timeout=30.0 if timeout_seconds is None else float(timeout_seconds),
             ) as client:
                 response = await client.post("/v1/chat/completions", json=payload)
                 response.raise_for_status()

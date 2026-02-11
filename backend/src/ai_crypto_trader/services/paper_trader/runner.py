@@ -16,6 +16,7 @@ from ai_crypto_trader.common.models import (
     PaperOrder,
     PaperPosition,
     PaperTrade,
+    StrategyConfig,
     utc_now,
 )
 from ai_crypto_trader.services.paper_trader.config import PaperTraderConfig
@@ -34,6 +35,7 @@ from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_str
 from ai_crypto_trader.services.monitoring.strategy_monitor import run_strategy_monitor_tick
 from ai_crypto_trader.services.monitoring.strategy_metrics import run_strategy_metrics_once
 from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox_once
+from ai_crypto_trader.services.universe_selector import select_universe
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -60,6 +62,7 @@ class PaperTraderRunner:
         self._outbox_task: Optional[asyncio.Task[None]] = None
         self._strategy_monitor_task: Optional[asyncio.Task[None]] = None
         self._strategy_metrics_task: Optional[asyncio.Task[None]] = None
+        self._universe_selector_task: Optional[asyncio.Task[None]] = None
         self.last_reconcile_at: Optional[datetime] = None
         self.reconcile_tick_count: int = 0
         self.reconcile_interval_seconds: int = 0
@@ -118,6 +121,10 @@ class PaperTraderRunner:
             self._strategy_metrics_loop(),
             name="strategy_metrics",
         )
+        self._universe_selector_task = asyncio.create_task(
+            self._universe_selector_loop(),
+            name="universe_selector",
+        )
         self._task = asyncio.create_task(_run(), name="paper-trader")
 
     async def stop(self) -> None:
@@ -160,6 +167,13 @@ class PaperTraderRunner:
             except asyncio.CancelledError:
                 pass
         self._strategy_metrics_task = None
+        if self._universe_selector_task:
+            self._universe_selector_task.cancel()
+            try:
+                await self._universe_selector_task
+            except asyncio.CancelledError:
+                pass
+        self._universe_selector_task = None
         if self._stall_monitor_task:
             self._stall_monitor_task.cancel()
             try:
@@ -725,6 +739,109 @@ class PaperTraderRunner:
                     except Exception:
                         logger.exception("Strategy metrics tick heartbeat write failed")
             await asyncio.sleep(tick_seconds)
+
+    async def _universe_selector_loop(self) -> None:
+        while self.is_running:
+            started_at = datetime.now(timezone.utc)
+            now_utc = started_at
+            enabled = os.getenv("UNIVERSE_SELECTOR_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+            interval_seconds = max(int(os.getenv("UNIVERSE_SELECTOR_INTERVAL_SECONDS", "900")), 1)
+            top_n = max(int(os.getenv("UNIVERSE_SELECTOR_TOP_N", "5")), 1)
+            window_minutes = max(int(os.getenv("UNIVERSE_SELECTOR_LOOKBACK_MINUTES", "1440")), 1)
+            scanned = 0
+            updated_count = 0
+            errors_count = 0
+            samples: list[dict[str, object]] = []
+
+            if enabled:
+                try:
+                    async with AsyncSessionLocal() as session:
+                        strategy_ids = (
+                            await session.scalars(
+                                select(StrategyConfig.id).where(StrategyConfig.is_active.is_(True)).order_by(StrategyConfig.id.asc())
+                            )
+                        ).all()
+                except Exception:
+                    strategy_ids = []
+                    errors_count += 1
+                    logger.exception("UNIVERSE_SELECTOR_LIST_ACTIVE_STRATEGIES_FAILED")
+
+                for strategy_id in strategy_ids:
+                    scanned += 1
+                    try:
+                        async with AsyncSessionLocal() as strategy_session:
+                            result = await select_universe(
+                                strategy_session,
+                                strategy_config_id=int(strategy_id),
+                                now_utc=now_utc,
+                                top_n=top_n,
+                                window_minutes=window_minutes,
+                            )
+                            await strategy_session.commit()
+                        previous_symbols = list(result.get("previous_symbols") or [])
+                        new_symbols = list(result.get("new_symbols") or [])
+                        if previous_symbols != new_symbols:
+                            updated_count += 1
+                        if len(samples) < 5:
+                            samples.append(
+                                {
+                                    "strategy_config_id": int(strategy_id),
+                                    "source": result.get("source"),
+                                    "picked_by": result.get("picked_by"),
+                                    "previous_symbols": previous_symbols,
+                                    "new_symbols": new_symbols,
+                                    "admin_action_id": result.get("admin_action_id"),
+                                }
+                            )
+                    except Exception:
+                        errors_count += 1
+                        logger.exception(
+                            "UNIVERSE_SELECTOR_STRATEGY_FAILED",
+                            extra={"strategy_config_id": int(strategy_id)},
+                        )
+
+            duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+            tick_bucket = now_utc.strftime("%Y%m%d%H%M")
+            tick_dedupe_key = f"UNIVERSE_SELECTOR_TICK:{tick_bucket}"
+            tick_status = "ok" if errors_count == 0 else "error"
+            tick_meta = {
+                "now_utc": now_utc.isoformat(),
+                "enabled": enabled,
+                "timeframe": os.getenv("UNIVERSE_SELECTOR_TIMEFRAME", "1m"),
+                "window_minutes": window_minutes,
+                "top_n": top_n,
+                "interval_seconds": interval_seconds,
+                "scanned": scanned,
+                "updated_count": updated_count,
+                "errors_count": errors_count,
+                "duration_ms": duration_ms,
+                "sample": samples,
+            }
+            try:
+                async with AsyncSessionLocal() as session:
+                    existing_tick = await session.scalar(
+                        select(AdminAction).where(AdminAction.dedupe_key == tick_dedupe_key).limit(1)
+                    )
+                    if existing_tick:
+                        existing_tick.status = tick_status
+                        existing_tick.message = "universe selector tick"
+                        existing_tick.meta = tick_meta
+                    else:
+                        session.add(
+                            AdminAction(
+                                action="UNIVERSE_SELECTOR_TICK",
+                                status=tick_status,
+                                message="universe selector tick",
+                                dedupe_key=tick_dedupe_key,
+                                meta=tick_meta,
+                            )
+                        )
+                    await session.commit()
+            except Exception:
+                logger.exception("UNIVERSE_SELECTOR_TICK_WRITE_FAILED")
+
+            logger.info("UNIVERSE_SELECTOR_TICK", extra=tick_meta)
+            await asyncio.sleep(interval_seconds)
 
 
 async def reset_paper_data(session: AsyncSession) -> Dict[str, object]:

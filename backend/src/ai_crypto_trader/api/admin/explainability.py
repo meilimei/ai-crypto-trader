@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import DateTime, String, and_, bindparam, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.api.admin_paper_trader import require_admin_token
@@ -44,6 +44,12 @@ class TestExecutedRequest(BaseModel):
     side: str
     qty: Decimal
     price_override: Decimal | None = None
+
+
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 200
+DEFAULT_WINDOW_MINUTES = 1440
+MAX_WINDOW_MINUTES = 10080
 
 
 def _serialize_action(row: AdminAction) -> dict[str, Any]:
@@ -101,37 +107,71 @@ def _flag_enabled(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parse_page_window(
+    *,
+    limit: int | None,
+    offset: int | None,
+    window_minutes: int | None,
+) -> tuple[int, int, int, datetime]:
+    limit_value, offset_value = clamp_limit_offset(
+        limit=limit,
+        offset=offset,
+        default_limit=DEFAULT_LIMIT,
+        max_limit=MAX_LIMIT,
+    )
+    window_value = int(window_minutes or DEFAULT_WINDOW_MINUTES)
+    if window_value < 1:
+        window_value = 1
+    if window_value > MAX_WINDOW_MINUTES:
+        window_value = MAX_WINDOW_MINUTES
+    since_utc = datetime.now(timezone.utc) - timedelta(minutes=window_value)
+    return limit_value, offset_value, window_value, since_utc
+
+
 @router.get("/decisions")
 async def list_trade_decisions(
-    limit: int = Query(default=50),
-    cursor: int | None = Query(default=None, ge=1),
-    account_id: int | None = Query(default=None),
+    account_id: int = Query(...),
     strategy_config_id: int | None = Query(default=None),
     symbol: str | None = Query(default=None),
     status: str | None = Query(default=None),
-    since: datetime | None = Query(default=None),
-    until: datetime | None = Query(default=None),
+    window_minutes: int = Query(default=DEFAULT_WINDOW_MINUTES, ge=1),
+    limit: int = Query(default=DEFAULT_LIMIT),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    limit_value, _ = clamp_limit_offset(limit=limit, offset=0, default_limit=50, max_limit=200)
+    limit_value, offset_value, window_value, since_utc = _parse_page_window(
+        limit=limit,
+        offset=offset,
+        window_minutes=window_minutes,
+    )
+    symbol_norm = normalize_symbol(symbol) if symbol else None
+    logger.info(
+        "EXPLAINABILITY_DECISIONS_QUERY",
+        extra={
+            "account_id": account_id,
+            "strategy_config_id": strategy_config_id,
+            "symbol": symbol_norm,
+            "window_minutes": window_value,
+            "limit": limit_value,
+            "offset": offset_value,
+            "status": status,
+        },
+    )
     base_filters = _base_filters(
         action="TRADE_DECISION",
         account_id=account_id,
         strategy_config_id=strategy_config_id,
-        symbol=symbol,
-        since=since,
-        until=until,
+        symbol=symbol_norm,
+        since=since_utc,
     )
     filters = list(base_filters)
     if status:
         filters.append(func.lower(func.coalesce(meta_text(AdminAction.meta, "status"), "")) == status.strip().lower())
-    if cursor is not None:
-        filters.append(AdminAction.id < cursor)
 
     total = int(
         (
             await session.execute(
-                select(func.count()).select_from(AdminAction).where(and_(*base_filters))
+                select(func.count()).select_from(AdminAction).where(and_(*filters))
             )
         ).scalar_one()
         or 0
@@ -140,13 +180,11 @@ async def list_trade_decisions(
         await session.execute(
             select(AdminAction)
             .where(and_(*filters))
-            .order_by(AdminAction.id.desc())
-            .limit(limit_value + 1)
+            .order_by(AdminAction.created_at.desc(), AdminAction.id.desc())
+            .offset(offset_value)
+            .limit(limit_value)
         )
     ).scalars().all()
-    has_more = len(rows) > limit_value
-    rows = rows[:limit_value]
-    next_cursor = rows[-1].id if has_more and rows else None
 
     decision_keys = []
     for row in rows:
@@ -187,42 +225,53 @@ async def list_trade_decisions(
         "items": items,
         "total": total,
         "limit": limit_value,
-        "cursor": cursor,
-        "next_cursor": next_cursor,
-        "has_more": has_more,
+        "offset": offset_value,
     }
 
 
 @router.get("/outcomes")
 async def list_trade_outcomes(
-    limit: int = Query(default=50),
-    cursor: int | None = Query(default=None, ge=1),
-    account_id: int | None = Query(default=None),
+    account_id: int = Query(...),
     strategy_config_id: int | None = Query(default=None),
     symbol: str | None = Query(default=None),
     status: str | None = Query(default=None),
-    since: datetime | None = Query(default=None),
-    until: datetime | None = Query(default=None),
+    window_minutes: int = Query(default=DEFAULT_WINDOW_MINUTES, ge=1),
+    limit: int = Query(default=DEFAULT_LIMIT),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    limit_value, _ = clamp_limit_offset(limit=limit, offset=0, default_limit=50, max_limit=200)
+    limit_value, offset_value, window_value, since_utc = _parse_page_window(
+        limit=limit,
+        offset=offset,
+        window_minutes=window_minutes,
+    )
+    symbol_norm = normalize_symbol(symbol) if symbol else None
+    logger.info(
+        "EXPLAINABILITY_OUTCOMES_QUERY",
+        extra={
+            "account_id": account_id,
+            "strategy_config_id": strategy_config_id,
+            "symbol": symbol_norm,
+            "window_minutes": window_value,
+            "limit": limit_value,
+            "offset": offset_value,
+            "status": status,
+        },
+    )
     base_filters = _base_filters(
         action="TRADE_OUTCOME",
         account_id=account_id,
         strategy_config_id=strategy_config_id,
-        symbol=symbol,
-        since=since,
-        until=until,
+        symbol=symbol_norm,
+        since=since_utc,
     )
     filters = list(base_filters)
     if status:
         filters.append(AdminAction.status == status.strip().lower())
-    if cursor is not None:
-        filters.append(AdminAction.id < cursor)
     total = int(
         (
             await session.execute(
-                select(func.count()).select_from(AdminAction).where(and_(*base_filters))
+                select(func.count()).select_from(AdminAction).where(and_(*filters))
             )
         ).scalar_one()
         or 0
@@ -231,20 +280,16 @@ async def list_trade_outcomes(
         await session.execute(
             select(AdminAction)
             .where(and_(*filters))
-            .order_by(AdminAction.id.desc())
-            .limit(limit_value + 1)
+            .order_by(AdminAction.created_at.desc(), AdminAction.id.desc())
+            .offset(offset_value)
+            .limit(limit_value)
         )
     ).scalars().all()
-    has_more = len(rows) > limit_value
-    rows = rows[:limit_value]
-    next_cursor = rows[-1].id if has_more and rows else None
     return {
         "items": [_serialize_action(row) for row in rows],
         "total": total,
         "limit": limit_value,
-        "cursor": cursor,
-        "next_cursor": next_cursor,
-        "has_more": has_more,
+        "offset": offset_value,
     }
 
 
@@ -253,12 +298,26 @@ async def explainability_summary(
     account_id: int = Query(...),
     strategy_config_id: int | None = Query(default=None),
     symbol: str | None = Query(default=None),
-    window_minutes: int = Query(default=1440, ge=1),
+    window_minutes: int = Query(default=DEFAULT_WINDOW_MINUTES, ge=1),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    now_utc = datetime.now(timezone.utc)
-    since_ts = now_utc - timedelta(minutes=max(int(window_minutes), 1))
-    symbol_value = symbol if symbol else None
+    _, _, window_value, since_ts = _parse_page_window(
+        limit=DEFAULT_LIMIT,
+        offset=0,
+        window_minutes=window_minutes,
+    )
+    symbol_value = normalize_symbol(symbol) if symbol else None
+    logger.info(
+        "EXPLAINABILITY_SUMMARY_QUERY",
+        extra={
+            "account_id": account_id,
+            "strategy_config_id": strategy_config_id,
+            "symbol": symbol_value,
+            "window_minutes": window_value,
+            "limit": None,
+            "offset": None,
+        },
+    )
     params = {
         "since_ts": since_ts,
         "account_id": str(account_id),
@@ -285,6 +344,11 @@ async def explainability_summary(
             OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = CAST(:symbol AS text)
           )
         """
+    ).bindparams(
+        bindparam("since_ts", type_=DateTime(timezone=True)),
+        bindparam("account_id", type_=String()),
+        bindparam("strategy_config_id", type_=String()),
+        bindparam("symbol", type_=String()),
     )
     outcomes_sql = text(
         """
@@ -331,6 +395,11 @@ async def explainability_summary(
             OR COALESCE(meta->>'symbol', meta->>'symbol_normalized', meta->>'symbol_in') = CAST(:symbol AS text)
           )
         """
+    ).bindparams(
+        bindparam("since_ts", type_=DateTime(timezone=True)),
+        bindparam("account_id", type_=String()),
+        bindparam("strategy_config_id", type_=String()),
+        bindparam("symbol", type_=String()),
     )
     try:
         decisions_row = (await session.execute(decisions_sql, params)).mappings().first() or {}
@@ -355,9 +424,17 @@ async def explainability_summary(
                 "symbol": symbol_value,
             },
             "window": {
-                "minutes": int(window_minutes),
+                "minutes": window_value,
                 "since_utc": since_ts.isoformat(),
             },
+            "decisions_total": decisions["decisions_total"],
+            "executed_total": decisions["executed_total"],
+            "rejected_total": decisions["rejected_total"],
+            "skipped_total": decisions["skipped_total"],
+            "outcomes_total": outcomes_total,
+            "win_rate": float(win_rate_value) if win_rate_value is not None else 0.0,
+            "avg_return_pct_signed": float(avg_return_value) if avg_return_value is not None else 0.0,
+            "total_pnl_usdt_est": str(total_pnl_value) if total_pnl_value is not None else "0",
             "decisions": decisions,
             "outcomes": {
                 "outcomes_total": outcomes_total,
@@ -374,7 +451,7 @@ async def explainability_summary(
                 "account_id": account_id,
                 "strategy_config_id": strategy_config_id,
                 "symbol": symbol_value,
-                "window_minutes": int(window_minutes),
+                "window_minutes": window_value,
                 "decisions_total": decisions["decisions_total"],
                 "outcomes_total": outcomes_total,
             },
@@ -389,7 +466,7 @@ async def explainability_summary(
                 "account_id": account_id,
                 "strategy_config_id": strategy_config_id,
                 "symbol": symbol_value,
-                "window_minutes": int(window_minutes),
+                "window_minutes": window_value,
                 "params": {
                     "since_ts": since_ts.isoformat(),
                     "account_id": str(account_id),
