@@ -39,6 +39,11 @@ from ai_crypto_trader.agents.auto_symbol import select_symbol
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
 from ai_crypto_trader.services.paper_trader.broker import get_broker
+from ai_crypto_trader.services.autopilot.governor import (
+    get_or_create_autopilot_state,
+    is_autopilot_paused,
+    serialize_autopilot_state,
+)
 from ai_crypto_trader.services.paper_trader.order_entry import (
     place_order_unified,
 )
@@ -1509,19 +1514,122 @@ async def smoke_trade(payload: SmokeTradeRequest, session: AsyncSession = Depend
     if _is_auto_symbol(payload.symbol):
         resolved_payload, agent_decision = await _resolve_auto_smoke_decision(payload, session)
 
+    strategy_config_id = _resolve_strategy_config_id(
+        strategy_config_id=resolved_payload.strategy_config_id,
+        strategy_id=resolved_payload.strategy_id,
+    )
     price_override_value = (
         resolved_payload.price_override
         if resolved_payload.price_override is not None
         else resolved_payload.price
     )
+    symbol_norm = normalize_symbol(getattr(resolved_payload, "symbol", ""))
+    side_norm = (getattr(resolved_payload, "side", "") or "").lower().strip()
+
+    if strategy_config_id is not None:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            governor_state = await get_or_create_autopilot_state(
+                session,
+                account_id=resolved_payload.account_id,
+                strategy_config_id=int(strategy_config_id),
+                now_utc=now_utc,
+            )
+            if is_autopilot_paused(
+                status=governor_state.status,
+                paused_until=governor_state.paused_until,
+                now_utc=now_utc,
+            ):
+                governor_meta = serialize_autopilot_state(governor_state)
+                reject = RejectReason(
+                    code=RejectCode.AUTOPILOT_PAUSED,
+                    reason="Autopilot is paused",
+                    details={
+                        "status": governor_meta.get("status"),
+                        "reason": governor_meta.get("reason"),
+                        "paused_until": governor_meta.get("paused_until"),
+                        "meta": governor_meta.get("meta"),
+                        "updated_at": governor_meta.get("updated_at"),
+                        "governor": governor_meta,
+                        "account_id": resolved_payload.account_id,
+                        "strategy_config_id": int(strategy_config_id),
+                    },
+                )
+                try:
+                    await emit_trade_decision(
+                        session,
+                        {
+                            "created_now_utc": now_utc,
+                            "account_id": str(resolved_payload.account_id),
+                            "strategy_id": resolved_payload.strategy_id,
+                            "strategy_config_id": strategy_config_id,
+                            "symbol_in": getattr(resolved_payload, "symbol", None),
+                            "symbol_normalized": symbol_norm,
+                            "side": side_norm or "buy",
+                            "qty_requested": str(resolved_payload.qty),
+                            "status": "rejected",
+                            "rationale": reject.reason,
+                            "inputs": {
+                                "strategy_thresholds": None,
+                                "timeframe": None,
+                                "symbols": None,
+                                "price_source": "override" if price_override_value is not None else "latest",
+                                "market_price_used": None,
+                            },
+                            "policy_source": "binding",
+                            "policy_binding": {
+                                "strategy_config_id": strategy_config_id,
+                            },
+                            "computed_limits": {},
+                            "agent_decision": agent_decision,
+                            "result": {
+                                "reject": reject.dict(),
+                                "endpoint": "POST /admin/paper-trader/smoke-trade",
+                            },
+                        },
+                    )
+                except Exception:
+                    logger.exception("Failed to emit smoke-trade decision when autopilot is paused")
+                await log_order_rejected_throttled(
+                    session,
+                    account_id=resolved_payload.account_id,
+                    symbol=symbol_norm,
+                    reject_code=reject.code,
+                    reject_reason=reject.reason,
+                    meta={
+                        "message": "Smoke trade rejected",
+                        "reject": reject.dict(),
+                        "endpoint": "POST /admin/paper-trader/smoke-trade",
+                        "engine_running": runner.is_running,
+                        "request": {
+                            "account_id": resolved_payload.account_id,
+                            "symbol_in": getattr(resolved_payload, "symbol", None),
+                            "side": getattr(resolved_payload, "side", None),
+                            "qty": str(getattr(resolved_payload, "qty", None)),
+                            "price_override": str(price_override_value) if price_override_value is not None else None,
+                            "strategy_id": getattr(resolved_payload, "strategy_id", None),
+                            "strategy_config_id": strategy_config_id,
+                            "agent_decision": agent_decision,
+                        },
+                    },
+                    window_seconds=120,
+                )
+                try:
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                return _attach_auto_symbol_response(_reject_response(reject, status_code=400), agent_decision)
+        except Exception:
+            logger.exception(
+                "Autopilot governor precheck failed",
+                extra={
+                    "account_id": resolved_payload.account_id,
+                    "strategy_config_id": strategy_config_id,
+                },
+            )
+
     if not runner.is_running:
         reject = RejectReason(code=RejectCode.ENGINE_NOT_RUNNING, reason="Paper trader engine is not running")
-        strategy_config_id = _resolve_strategy_config_id(
-            strategy_config_id=resolved_payload.strategy_config_id,
-            strategy_id=resolved_payload.strategy_id,
-        )
-        symbol_norm = normalize_symbol(getattr(resolved_payload, "symbol", ""))
-        side_norm = (getattr(resolved_payload, "side", "") or "").lower().strip()
         try:
             await emit_trade_decision(
                 session,
