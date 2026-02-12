@@ -11,9 +11,15 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_crypto_trader.common.models import Candle, EquitySnapshot, PaperPosition, PaperTrade, StrategyConfig
+from ai_crypto_trader.services.autopilot.governor import (
+    get_or_create_autopilot_state,
+    is_autopilot_paused,
+    serialize_autopilot_state,
+)
 from ai_crypto_trader.services.explainability.explainability import emit_trade_decision
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
-from ai_crypto_trader.services.paper_trader.execution import ExecutionResult, execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.execution import ExecutionResult
+from ai_crypto_trader.services.paper_trader.broker import get_broker
 from ai_crypto_trader.services.paper_trader.equity import compute_equity
 from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.rejects import RejectCode, RejectReason, log_reject_throttled, make_reject
@@ -675,6 +681,35 @@ async def place_order_unified(
                 )
             except Exception:
                 logger.exception("Strategy reject burst alert failed")
+
+    governor_state = None
+    if strategy_config_id is not None:
+        governor_state = await get_or_create_autopilot_state(
+            session,
+            account_id=account_id,
+            strategy_config_id=strategy_config_id,
+            now_utc=datetime.now(timezone.utc),
+        )
+        if is_autopilot_paused(
+            status=governor_state.status,
+            paused_until=governor_state.paused_until,
+            now_utc=datetime.now(timezone.utc),
+        ):
+            governor_meta = serialize_autopilot_state(governor_state)
+            reject = RejectReason(
+                code=RejectCode.AUTOPILOT_PAUSED,
+                reason="Autopilot is paused for this strategy",
+                details={
+                    "governor": governor_meta,
+                    "account_id": account_id,
+                    "strategy_config_id": strategy_config_id,
+                },
+            )
+            await _log_reject(
+                reject,
+                extra_meta={"governor": governor_meta},
+            )
+            return reject
 
     if "/" in symbol_in:
         reject = RejectReason(code=RejectCode.SYMBOL_DISABLED, reason="Symbol not supported")
@@ -1366,7 +1401,8 @@ async def place_order_unified(
                     return reject
 
     try:
-        execution = await execute_market_order_with_costs(
+        broker = get_broker()
+        execution = await broker.place_order(
             session=session,
             account_id=account_id,
             symbol=prepared.symbol,

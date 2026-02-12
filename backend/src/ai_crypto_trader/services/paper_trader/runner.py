@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
 from sqlalchemy import delete, select
@@ -30,7 +30,9 @@ from ai_crypto_trader.services.paper_trader.equity import (
 )
 from ai_crypto_trader.services.paper_trader.equity_risk import check_equity_risk
 from ai_crypto_trader.services.paper_trader.policies_effective import get_effective_risk_policy
+from ai_crypto_trader.services.autopilot.governor import pause_autopilot_state
 from ai_crypto_trader.services.admin_actions.throttled import write_admin_action_throttled
+from ai_crypto_trader.services.notifications.outbox import enqueue_outbox_notification
 from ai_crypto_trader.services.monitoring.strategy_stalls import maybe_alert_strategy_stalls
 from ai_crypto_trader.services.monitoring.strategy_monitor import run_strategy_monitor_tick
 from ai_crypto_trader.services.monitoring.strategy_metrics import run_strategy_metrics_once
@@ -291,6 +293,117 @@ class PaperTraderRunner:
                         base_status=status,
                         policy=policy,
                     )
+                    mismatch_detected = bool(
+                        diff_count > 0
+                        or summary.get("has_negative_balance")
+                        or summary.get("has_position_mismatch")
+                        or summary.get("has_equity_mismatch")
+                    )
+                    mismatch_state_changed = False
+                    if mismatch_detected:
+                        now_utc = datetime.now(timezone.utc)
+                        strategy_ids = (
+                            await session.scalars(
+                                select(StrategyConfig.id)
+                                .where(StrategyConfig.is_active.is_(True))
+                                .order_by(StrategyConfig.id.asc())
+                            )
+                        ).all()
+                        for strategy_config_id in strategy_ids:
+                            try:
+                                pause_meta = {
+                                    "account_id": account.id,
+                                    "strategy_config_id": int(strategy_config_id),
+                                    "reason": "RECONCILE_MISMATCH",
+                                    "summary": summary,
+                                    "diffs_sample": diffs_sample,
+                                    "policy": policy_snapshot(policy),
+                                }
+                                state = await pause_autopilot_state(
+                                    session,
+                                    account_id=account.id,
+                                    strategy_config_id=int(strategy_config_id),
+                                    reason="RECONCILE_MISMATCH",
+                                    meta=to_jsonable(pause_meta),
+                                    actor="system",
+                                    force_audit=False,
+                                )
+                                mismatch_state_changed = True
+
+                                dedupe_key = (
+                                    f"STRATEGY_ALERT:RECONCILE_MISMATCH:{account.id}:{int(strategy_config_id)}"
+                                )
+                                existing_alert = await session.scalar(
+                                    select(AdminAction)
+                                    .where(
+                                        AdminAction.dedupe_key == dedupe_key,
+                                        AdminAction.created_at >= now_utc - timedelta(seconds=300),
+                                    )
+                                    .order_by(AdminAction.created_at.desc())
+                                    .limit(1)
+                                )
+                                if existing_alert is None:
+                                    alert = AdminAction(
+                                        action="STRATEGY_ALERT",
+                                        status="RECONCILE_MISMATCH",
+                                        message="Autopilot paused due to reconcile mismatch",
+                                        dedupe_key=dedupe_key,
+                                        meta=to_jsonable(
+                                            {
+                                                "account_id": str(account.id),
+                                                "strategy_config_id": int(strategy_config_id),
+                                                "reason": "RECONCILE_MISMATCH",
+                                                "governor": {
+                                                    "status": state.status,
+                                                    "reason": state.reason,
+                                                    "updated_at": state.updated_at.isoformat()
+                                                    if state.updated_at
+                                                    else None,
+                                                },
+                                                "reconcile_summary": summary,
+                                                "diffs_sample": diffs_sample,
+                                            }
+                                        ),
+                                    )
+                                    session.add(alert)
+                                    await session.flush()
+                                    try:
+                                        await enqueue_outbox_notification(
+                                            session,
+                                            channel=None,
+                                            admin_action=alert,
+                                            dedupe_key=alert.dedupe_key,
+                                            payload={
+                                                "action": alert.action,
+                                                "status": alert.status,
+                                                "message": alert.message,
+                                                "meta": alert.meta,
+                                                "created_at": alert.created_at.isoformat()
+                                                if alert.created_at
+                                                else None,
+                                                "account_id": account.id,
+                                                "strategy_config_id": int(strategy_config_id),
+                                            },
+                                            now_utc=now_utc,
+                                        )
+                                    except Exception:
+                                        logger.exception(
+                                            "reconcile mismatch alert outbox enqueue failed",
+                                            extra={
+                                                "account_id": account.id,
+                                                "strategy_config_id": int(strategy_config_id),
+                                            },
+                                        )
+                            except Exception:
+                                logger.exception(
+                                    "autopilot pause on reconcile mismatch failed",
+                                    extra={
+                                        "account_id": account.id,
+                                        "strategy_config_id": int(strategy_config_id),
+                                    },
+                                )
+                        if mismatch_state_changed:
+                            await session.commit()
                     emit = False
                     now_mono = asyncio.get_running_loop().time()
                     if self._last_reconcile_action_at is None:

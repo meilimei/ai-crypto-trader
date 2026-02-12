@@ -521,6 +521,33 @@ class StrategyConfig(Base):
     risk_policy: Mapped[Optional["RiskPolicy"]] = relationship(back_populates="strategies")
 
 
+class AutopilotState(Base):
+    __tablename__ = "autopilot_states"
+    __table_args__ = (
+        UniqueConstraint("account_id", "strategy_config_id", name="ux_autopilot_states_account_strategy"),
+        Index("ix_autopilot_states_account_id", "account_id"),
+        Index("ix_autopilot_states_strategy_config_id", "strategy_config_id"),
+        Index("ix_autopilot_states_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"), nullable=False)
+    strategy_config_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_configs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="running", server_default=text("'running'"))
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    meta: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    paused_until: Mapped[Optional[datetime]] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("CURRENT_TIMESTAMP"), default=utc_now, onupdate=utc_now
+    )
+
+
 class AdminAction(Base):
     __tablename__ = "admin_actions"
     __table_args__ = (

@@ -38,7 +38,7 @@ from ai_crypto_trader.services.agent.auto_trade import AutoTradeAgent, AutoTrade
 from ai_crypto_trader.agents.auto_symbol import select_symbol
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
 from ai_crypto_trader.services.paper_trader.risk import evaluate_and_size
-from ai_crypto_trader.services.paper_trader.execution import execute_market_order_with_costs
+from ai_crypto_trader.services.paper_trader.broker import get_broker
 from ai_crypto_trader.services.paper_trader.order_entry import (
     place_order_unified,
 )
@@ -644,7 +644,8 @@ async def place_order(payload: PlaceOrderRequest, session: AsyncSession = Depend
                 window_seconds=120,
             )
             return _reject_response(reject_reason, status_code=400)
-        execution = await execute_market_order_with_costs(
+        broker = get_broker()
+        execution = await broker.place_order(
             session=session,
             account_id=payload.account_id,
             symbol=prepared.symbol,
