@@ -38,6 +38,10 @@ from ai_crypto_trader.services.monitoring.strategy_monitor import run_strategy_m
 from ai_crypto_trader.services.monitoring.strategy_metrics import run_strategy_metrics_once
 from ai_crypto_trader.services.notifications.dispatcher import dispatch_outbox_once
 from ai_crypto_trader.services.universe_selector import select_universe
+from ai_crypto_trader.services.live_exchange.order_service import (
+    dispatch_live_exchange_orders_once,
+    pause_live_autopilot,
+)
 from ai_crypto_trader.services.paper_trader.reconcile_policy import (
     apply_reconcile_policy_status,
     get_reconcile_policy,
@@ -62,6 +66,7 @@ class PaperTraderRunner:
         self._reconcile_task: Optional[asyncio.Task[None]] = None
         self._stall_monitor_task: Optional[asyncio.Task[None]] = None
         self._outbox_task: Optional[asyncio.Task[None]] = None
+        self._live_exchange_task: Optional[asyncio.Task[None]] = None
         self._strategy_monitor_task: Optional[asyncio.Task[None]] = None
         self._strategy_metrics_task: Optional[asyncio.Task[None]] = None
         self._universe_selector_task: Optional[asyncio.Task[None]] = None
@@ -115,6 +120,7 @@ class PaperTraderRunner:
             self._reconcile_task.add_done_callback(self._reconcile_done)
         self._stall_monitor_task = asyncio.create_task(self._stall_monitor_loop(), name="paper_stall_monitor")
         self._outbox_task = asyncio.create_task(self._outbox_loop(), name="notifications_outbox")
+        self._live_exchange_task = asyncio.create_task(self._live_exchange_loop(), name="live_exchange_orders")
         self._strategy_monitor_task = asyncio.create_task(
             self._strategy_monitor_loop(),
             name="strategy_monitor",
@@ -155,6 +161,13 @@ class PaperTraderRunner:
             except asyncio.CancelledError:
                 pass
         self._outbox_task = None
+        if self._live_exchange_task:
+            self._live_exchange_task.cancel()
+            try:
+                await self._live_exchange_task
+            except asyncio.CancelledError:
+                pass
+        self._live_exchange_task = None
         if self._strategy_monitor_task:
             self._strategy_monitor_task.cancel()
             try:
@@ -266,6 +279,13 @@ class PaperTraderRunner:
             .split(",")
             if x.strip().isdigit()
         }
+        live_scope_accounts = {
+            int(x)
+            for x in os.getenv("LIVE_EXCHANGE_ACCOUNT_IDS", "")
+            .replace(" ", "")
+            .split(",")
+            if x.strip().isdigit()
+        }
         while self.is_running and self.reconcile_interval_seconds > 0:
             try:
                 async with AsyncSessionLocal() as session:
@@ -299,9 +319,104 @@ class PaperTraderRunner:
                         or summary.get("has_position_mismatch")
                         or summary.get("has_equity_mismatch")
                     )
+                    alert_usdt_diff = (
+                        policy.alert_usdt_diff
+                        if policy and policy.alert_usdt_diff is not None
+                        else Decimal("30")
+                    )
+                    per_symbol_diffs = summary.get("per_symbol_diffs") or {}
+                    max_symbol_delta = Decimal("0")
+                    if isinstance(per_symbol_diffs, dict):
+                        for raw_delta in per_symbol_diffs.values():
+                            try:
+                                delta_value = Decimal(str(raw_delta or "0")).copy_abs()
+                            except Exception:
+                                continue
+                            if delta_value > max_symbol_delta:
+                                max_symbol_delta = delta_value
+                    try:
+                        tolerance_qty = Decimal(str(summary.get("tolerance_qty", "0") or "0"))
+                    except Exception:
+                        tolerance_qty = Decimal("0")
+                    position_pause_threshold = tolerance_qty * Decimal("100")
+                    severe_live_mismatch = bool(
+                        usdt_diff.copy_abs() >= alert_usdt_diff
+                        or summary.get("has_negative_balance")
+                        or (
+                            summary.get("has_position_mismatch")
+                            and max_symbol_delta >= position_pause_threshold
+                        )
+                    )
                     mismatch_state_changed = False
                     if mismatch_detected:
                         now_utc = datetime.now(timezone.utc)
+                        should_scope_pause = not live_scope_accounts or account.id in live_scope_accounts
+                        if severe_live_mismatch and should_scope_pause:
+                            try:
+                                await pause_live_autopilot(
+                                    session,
+                                    reason="RECONCILE_MISMATCH",
+                                    actor="system",
+                                    account_id=account.id,
+                                    meta={
+                                        "account_id": account.id,
+                                        "reason": "RECONCILE_MISMATCH",
+                                        "summary": summary,
+                                        "diffs_sample": diffs_sample,
+                                        "policy": policy_snapshot(policy),
+                                        "alert_usdt_diff": str(alert_usdt_diff),
+                                        "max_symbol_delta": str(max_symbol_delta),
+                                        "position_pause_threshold": str(position_pause_threshold),
+                                    },
+                                )
+                                mismatch_state_changed = True
+                            except Exception:
+                                logger.exception(
+                                    "live autopilot pause on reconcile mismatch failed",
+                                    extra={"account_id": account.id},
+                                )
+                        elif not severe_live_mismatch:
+                            session.add(
+                                AdminAction(
+                                    action="RECONCILE_WARNING",
+                                    status="warn",
+                                    message="Reconcile mismatch below live pause threshold",
+                                    dedupe_key=f"RECONCILE_WARNING:{account.id}:{now_utc.strftime('%Y%m%d%H%M')}",
+                                    meta=to_jsonable(
+                                        {
+                                            "account_id": account.id,
+                                            "reason": "RECONCILE_WARNING",
+                                            "summary": summary,
+                                            "diffs_sample": diffs_sample,
+                                            "policy": policy_snapshot(policy),
+                                            "alert_usdt_diff": str(alert_usdt_diff),
+                                            "max_symbol_delta": str(max_symbol_delta),
+                                            "position_pause_threshold": str(position_pause_threshold),
+                                        }
+                                    ),
+                                )
+                            )
+                            mismatch_state_changed = True
+                        elif not should_scope_pause:
+                            session.add(
+                                AdminAction(
+                                    action="RECONCILE_WARNING",
+                                    status="warn",
+                                    message="Reconcile mismatch ignored for non-live account scope",
+                                    dedupe_key=f"RECONCILE_WARNING_SCOPE:{account.id}:{now_utc.strftime('%Y%m%d%H%M')}",
+                                    meta=to_jsonable(
+                                        {
+                                            "account_id": account.id,
+                                            "reason": "RECONCILE_WARNING_SCOPE",
+                                            "summary": summary,
+                                            "diffs_sample": diffs_sample,
+                                            "policy": policy_snapshot(policy),
+                                            "live_scope_accounts": sorted(live_scope_accounts),
+                                        }
+                                    ),
+                                )
+                            )
+                            mismatch_state_changed = True
                         strategy_ids = (
                             await session.scalars(
                                 select(StrategyConfig.id)
@@ -702,6 +817,130 @@ class PaperTraderRunner:
                     except Exception:
                         logger.exception("Notifications outbox tick heartbeat write failed")
             await asyncio.sleep(max(poll_seconds, 1))
+
+    async def _live_exchange_loop(self) -> None:
+        poll_seconds = max(int(os.getenv("LIVE_EXCHANGE_POLL_SECONDS", "5")), 1)
+        limit = max(int(os.getenv("LIVE_EXCHANGE_DISPATCH_LIMIT", "50")), 1)
+        while self.is_running:
+            started_at = datetime.now(timezone.utc)
+            now_utc = started_at
+            tick_bucket = now_utc.strftime("%Y%m%d%H%M")
+            tick_dedupe_key = f"LIVE_EXCHANGE_TICK:{tick_bucket}"
+            async with AsyncSessionLocal() as session:
+                try:
+                    stats = await dispatch_live_exchange_orders_once(session, now_utc=now_utc, limit=limit)
+                    duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+                    existing_tick = await session.scalar(
+                        select(AdminAction)
+                        .where(AdminAction.dedupe_key == tick_dedupe_key)
+                        .limit(1)
+                    )
+
+                    def _value(key: str, default: int = 0) -> int:
+                        try:
+                            return int(stats.get(key, default) or default)
+                        except Exception:
+                            return default
+
+                    meta = {
+                        "now_utc": now_utc.isoformat(),
+                        "picked_count": _value("picked_count"),
+                        "sent_count": _value("sent_count"),
+                        "rejected_count": _value("rejected_count"),
+                        "rejected_local_count": _value("rejected_local_count"),
+                        "failed_count": _value("failed_count"),
+                        "retried_count": _value("retried_count"),
+                        "pending_due_count": _value("pending_due_count"),
+                        "pending_remaining": _value("pending_remaining"),
+                        "paused": bool(stats.get("paused", False)),
+                        "disabled": bool(stats.get("disabled", False)),
+                        "duration_ms": duration_ms,
+                        "limit": limit,
+                    }
+                    if existing_tick:
+                        existing_meta = existing_tick.meta if isinstance(existing_tick.meta, dict) else {}
+                        meta["picked_count"] += int(existing_meta.get("picked_count", 0) or 0)
+                        meta["sent_count"] += int(existing_meta.get("sent_count", 0) or 0)
+                        meta["rejected_count"] += int(existing_meta.get("rejected_count", 0) or 0)
+                        meta["rejected_local_count"] += int(existing_meta.get("rejected_local_count", 0) or 0)
+                        meta["failed_count"] += int(existing_meta.get("failed_count", 0) or 0)
+                        meta["retried_count"] += int(existing_meta.get("retried_count", 0) or 0)
+                        meta["pending_due_count"] = max(
+                            meta["pending_due_count"],
+                            int(existing_meta.get("pending_due_count", 0) or 0),
+                        )
+                        meta["pending_remaining"] = max(
+                            meta["pending_remaining"],
+                            int(existing_meta.get("pending_remaining", 0) or 0),
+                        )
+                        existing_tick.status = "ok"
+                        existing_tick.message = "Live exchange dispatcher tick"
+                        existing_tick.meta = meta
+                    else:
+                        session.add(
+                            AdminAction(
+                                action="LIVE_EXCHANGE_TICK",
+                                status="ok",
+                                message="Live exchange dispatcher tick",
+                                dedupe_key=tick_dedupe_key,
+                                meta=meta,
+                            )
+                        )
+                    await session.commit()
+                except Exception as exc:
+                    await session.rollback()
+                    logger.exception("Live exchange dispatcher failed")
+                    try:
+                        duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+                        existing_tick = await session.scalar(
+                            select(AdminAction)
+                            .where(AdminAction.dedupe_key == tick_dedupe_key)
+                            .limit(1)
+                        )
+                        error_meta = {
+                            "now_utc": now_utc.isoformat(),
+                            "error": str(exc),
+                            "picked_count": 0,
+                            "sent_count": 0,
+                            "rejected_count": 0,
+                            "rejected_local_count": 0,
+                            "failed_count": 0,
+                            "retried_count": 0,
+                            "pending_due_count": 0,
+                            "pending_remaining": 0,
+                            "duration_ms": duration_ms,
+                            "limit": limit,
+                        }
+                        if existing_tick:
+                            existing_meta = existing_tick.meta if isinstance(existing_tick.meta, dict) else {}
+                            for key in (
+                                "picked_count",
+                                "sent_count",
+                                "rejected_count",
+                                "rejected_local_count",
+                                "failed_count",
+                                "retried_count",
+                                "pending_due_count",
+                                "pending_remaining",
+                            ):
+                                error_meta[key] = int(existing_meta.get(key, 0) or 0)
+                            existing_tick.status = "error"
+                            existing_tick.message = "Live exchange dispatcher failed"
+                            existing_tick.meta = error_meta
+                        else:
+                            session.add(
+                                AdminAction(
+                                    action="LIVE_EXCHANGE_TICK",
+                                    status="error",
+                                    message="Live exchange dispatcher failed",
+                                    dedupe_key=tick_dedupe_key,
+                                    meta=error_meta,
+                                )
+                            )
+                        await session.commit()
+                    except Exception:
+                        logger.exception("Live exchange tick heartbeat write failed")
+            await asyncio.sleep(poll_seconds)
 
     async def _strategy_monitor_loop(self) -> None:
         tick_seconds = max(int(os.getenv("STRATEGY_MONITOR_TICK_SECONDS", "60")), 1)

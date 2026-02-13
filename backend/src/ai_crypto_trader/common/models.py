@@ -593,6 +593,51 @@ class NotificationOutbox(Base):
     payload: Mapped[Dict[str, Any]] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
 
 
+class ExchangeOrder(Base):
+    __tablename__ = "exchange_orders"
+    __table_args__ = (
+        UniqueConstraint("exchange", "idempotency_key", name="uq_exchange_orders_exchange_idempotency"),
+        UniqueConstraint("exchange", "client_order_id", name="uq_exchange_orders_exchange_client_order"),
+        Index("ix_exchange_orders_exchange_status_next_attempt", "exchange", "status", "next_attempt_at"),
+        Index("ix_exchange_orders_account_created_at", "account_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    exchange: Mapped[str] = mapped_column(Text, nullable=False)
+    account_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    strategy_config_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(Text, nullable=False)
+    order_type: Mapped[str] = mapped_column(Text, nullable=False, default="market", server_default=text("'market'"))
+    qty: Mapped[Decimal] = mapped_column(Numeric(24, 10), nullable=False)
+    price: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 10), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
+    client_order_id: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending", server_default=text("'pending'"))
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True, default=utc_now, server_default=text("CURRENT_TIMESTAMP")
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    meta: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=utc_now, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
+
+
 class TradeExplanation(Base):
     __tablename__ = "trade_explanations"
     __table_args__ = (
