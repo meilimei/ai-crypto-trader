@@ -110,7 +110,6 @@ def validate_notional_bounds(
     max_value = (max_notional or Decimal("0")).copy_abs()
     step = (step_size or Decimal("0")).copy_abs()
     if min_value > 0 and notional < min_value:
-        suggested = None
         raw_min_qty = min_value / reference_price
         suggested = quantize_qty_up(
             raw_suggested_qty=raw_min_qty,
@@ -122,6 +121,7 @@ def validate_notional_bounds(
             "notional": notional,
             "min_notional": min_value,
             "max_notional": max_value if max_value > 0 else None,
+            "suggested_min_qty_raw": raw_min_qty,
             "suggested_min_qty": suggested,
         }
     if max_value > 0 and notional > max_value:
@@ -419,17 +419,26 @@ class BinanceSpotClient:
         qty = request.qty.copy_abs()
 
         filters = await self._get_symbol_filters(symbol)
+        lot_size_filter = filters.get("lot_size") if isinstance(filters.get("lot_size"), dict) else {}
+        market_lot_size_filter = (
+            filters.get("market_lot_size") if isinstance(filters.get("market_lot_size"), dict) else {}
+        )
         lot_filter = None
         if order_type == "MARKET":
-            lot_filter = filters.get("market_lot_size") or filters.get("lot_size")
+            lot_filter = market_lot_size_filter or lot_size_filter
         else:
-            lot_filter = filters.get("lot_size")
+            lot_filter = lot_size_filter
 
         if isinstance(lot_filter, dict):
-            min_qty = _to_decimal(lot_filter.get("min_qty")) or Decimal("0")
-            max_qty = _to_decimal(lot_filter.get("max_qty")) or Decimal("0")
-            step_size = _to_decimal(lot_filter.get("step_size")) or Decimal("0")
+            min_qty = _to_decimal(lot_filter.get("min_qty")) or _to_decimal(lot_size_filter.get("min_qty")) or Decimal("0")
+            max_qty = _to_decimal(lot_filter.get("max_qty")) or _to_decimal(lot_size_filter.get("max_qty")) or Decimal("0")
+            step_size = _to_decimal(lot_filter.get("step_size")) or _to_decimal(lot_size_filter.get("step_size")) or Decimal("0")
             if min_qty > 0 and qty < min_qty:
+                suggested_rounded = quantize_qty_up(
+                    raw_suggested_qty=min_qty,
+                    min_qty=min_qty,
+                    step_size=step_size if step_size > 0 else None,
+                )
                 self._raise_filter_failure(
                     "LOT_SIZE",
                     {
@@ -438,17 +447,8 @@ class BinanceSpotClient:
                         "min_qty": str(min_qty),
                         "max_qty": str(max_qty) if max_qty > 0 else None,
                         "step_size": str(step_size) if step_size > 0 else None,
-                        "suggested_min_qty": (
-                            str(
-                                quantize_qty_up(
-                                    raw_suggested_qty=min_qty,
-                                    min_qty=min_qty,
-                                    step_size=step_size if step_size > 0 else None,
-                                )
-                            )
-                            if min_qty > 0
-                            else None
-                        ),
+                        "suggested_min_qty_raw": str(min_qty),
+                        "suggested_min_qty": str(suggested_rounded),
                     },
                 )
             if max_qty > 0 and qty > max_qty:
@@ -463,6 +463,11 @@ class BinanceSpotClient:
                     },
                 )
             if step_size > 0 and not _is_step_aligned(qty, step_size):
+                suggested_rounded = quantize_qty_up(
+                    raw_suggested_qty=qty,
+                    min_qty=min_qty if min_qty > 0 else None,
+                    step_size=step_size,
+                )
                 self._raise_filter_failure(
                     "LOT_SIZE",
                     {
@@ -470,13 +475,8 @@ class BinanceSpotClient:
                         "qty": str(qty),
                         "min_qty": str(min_qty) if min_qty > 0 else None,
                         "step_size": str(step_size),
-                        "suggested_min_qty": str(
-                            quantize_qty_up(
-                                raw_suggested_qty=qty,
-                                min_qty=min_qty if min_qty > 0 else None,
-                                step_size=step_size,
-                            )
-                        ),
+                        "suggested_min_qty_raw": str(qty),
+                        "suggested_min_qty": str(suggested_rounded),
                     },
                 )
 
@@ -499,7 +499,11 @@ class BinanceSpotClient:
             apply_min = True
             apply_max = True
             step_size = _to_decimal((lot_filter or {}).get("step_size")) if isinstance(lot_filter, dict) else None
+            if (step_size is None or step_size <= 0) and isinstance(lot_size_filter, dict):
+                step_size = _to_decimal(lot_size_filter.get("step_size"))
             min_qty = _to_decimal((lot_filter or {}).get("min_qty")) if isinstance(lot_filter, dict) else None
+            if (min_qty is None or min_qty <= 0) and isinstance(lot_size_filter, dict):
+                min_qty = _to_decimal(lot_size_filter.get("min_qty"))
             violation = validate_notional_bounds(
                 qty=qty,
                 reference_price=reference_price,
@@ -518,6 +522,13 @@ class BinanceSpotClient:
                         "estimated_notional": str(estimated_notional),
                         "min_notional": str(violation.get("min_notional")) if violation.get("min_notional") is not None else None,
                         "max_notional": str(violation.get("max_notional")) if violation.get("max_notional") is not None else None,
+                        "min_qty": str(min_qty) if min_qty is not None and min_qty > 0 else None,
+                        "step_size": str(step_size) if step_size is not None and step_size > 0 else None,
+                        "suggested_min_qty_raw": (
+                            str(violation.get("suggested_min_qty_raw"))
+                            if violation.get("suggested_min_qty_raw") is not None
+                            else None
+                        ),
                         "suggested_min_qty": (
                             str(violation.get("suggested_min_qty"))
                             if violation.get("suggested_min_qty") is not None
@@ -531,7 +542,11 @@ class BinanceSpotClient:
             min_notional = _to_decimal(min_notional_filter.get("min_notional")) or Decimal("0")
             apply_to_market = True if order_type != "MARKET" else _to_bool(min_notional_filter.get("apply_to_market", True))
             step_size = _to_decimal((lot_filter or {}).get("step_size")) if isinstance(lot_filter, dict) else None
+            if (step_size is None or step_size <= 0) and isinstance(lot_size_filter, dict):
+                step_size = _to_decimal(lot_size_filter.get("step_size"))
             min_qty = _to_decimal((lot_filter or {}).get("min_qty")) if isinstance(lot_filter, dict) else None
+            if (min_qty is None or min_qty <= 0) and isinstance(lot_size_filter, dict):
+                min_qty = _to_decimal(lot_size_filter.get("min_qty"))
             violation = (
                 validate_notional_bounds(
                     qty=qty,
@@ -553,6 +568,13 @@ class BinanceSpotClient:
                         "reference_price": str(reference_price),
                         "estimated_notional": str(estimated_notional),
                         "min_notional": str(violation.get("min_notional")) if violation.get("min_notional") is not None else None,
+                        "min_qty": str(min_qty) if min_qty is not None and min_qty > 0 else None,
+                        "step_size": str(step_size) if step_size is not None and step_size > 0 else None,
+                        "suggested_min_qty_raw": (
+                            str(violation.get("suggested_min_qty_raw"))
+                            if violation.get("suggested_min_qty_raw") is not None
+                            else None
+                        ),
                         "suggested_min_qty": (
                             str(violation.get("suggested_min_qty"))
                             if violation.get("suggested_min_qty") is not None

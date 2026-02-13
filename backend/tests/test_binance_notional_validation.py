@@ -36,3 +36,12 @@ def test_quantize_qty_up_respects_min_qty_and_step() -> None:
         step_size=Decimal("0.001"),
     )
     assert suggested == Decimal("0.005")
+
+
+def test_quantize_qty_up_rounds_notional_suggestion_to_step() -> None:
+    suggested = quantize_qty_up(
+        raw_suggested_qty=Decimal("0.0025854223"),
+        min_qty=None,
+        step_size=Decimal("0.00001"),
+    )
+    assert suggested == Decimal("0.00259")
