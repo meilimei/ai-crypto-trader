@@ -596,7 +596,7 @@ class NotificationOutbox(Base):
 class ExchangeOrder(Base):
     __tablename__ = "exchange_orders"
     __table_args__ = (
-        UniqueConstraint("exchange", "idempotency_key", name="uq_exchange_orders_exchange_idempotency"),
+        UniqueConstraint("exchange", "account_id", "idempotency_key", name="uq_exchange_orders_exchange_account_idempotency"),
         UniqueConstraint("exchange", "client_order_id", name="uq_exchange_orders_exchange_client_order"),
         Index("ix_exchange_orders_exchange_status_next_attempt", "exchange", "status", "next_attempt_at"),
         Index("ix_exchange_orders_account_created_at", "account_id", "created_at"),

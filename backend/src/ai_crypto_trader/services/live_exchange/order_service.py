@@ -21,7 +21,6 @@ from ai_crypto_trader.common.models import AdminAction, Candle, EquitySnapshot, 
 from ai_crypto_trader.exchange import (
     ExchangeError,
     ExchangeOrderRequest,
-    SevereExchangeError,
     get_exchange_client,
 )
 from ai_crypto_trader.services.paper_trader.accounting import normalize_symbol
@@ -88,10 +87,10 @@ def _build_client_order_id(idempotency_key: str) -> str:
 
 
 def _calc_backoff_seconds(*, attempts: int, retry_after_seconds: int | None = None) -> int:
-    base = _env_int("LIVE_EXCHANGE_RETRY_BASE_SECONDS", 2, minimum=1)
-    cap = _env_int("LIVE_EXCHANGE_RETRY_CAP_SECONDS", 120, minimum=1)
-    jitter_max = _env_int("LIVE_EXCHANGE_RETRY_JITTER_SECONDS", 1, minimum=0)
-    exponent = max(0, attempts - 1)
+    base = _env_int("LIVE_EXCHANGE_RETRY_BASE_SECONDS", 5, minimum=1)
+    cap = _env_int("LIVE_EXCHANGE_RETRY_CAP_SECONDS", 300, minimum=1)
+    jitter_max = _env_int("LIVE_EXCHANGE_RETRY_JITTER_SECONDS", 3, minimum=0)
+    exponent = max(0, attempts)
     delay = min(cap, base * (2 ** exponent))
     if retry_after_seconds is not None and retry_after_seconds > 0:
         delay = min(cap, max(delay, retry_after_seconds))
@@ -110,6 +109,130 @@ def _extract_filter_failure_type(exc: ExchangeError) -> str | None:
     if match:
         return match.group(1).strip().upper()
     return None
+
+
+@dataclass(frozen=True)
+class ExchangeErrorDecision:
+    reason_code: str
+    target_status: str
+    retriable: bool
+    pause_trigger: bool
+    retry_after_seconds: int | None
+    attempts: int
+    filter_type: str | None
+    local_precheck: bool
+
+
+def _classify_exchange_error(
+    exc: ExchangeError,
+    *,
+    current_attempts: int,
+    max_attempts: int,
+) -> ExchangeErrorDecision:
+    details = exc.details if isinstance(exc.details, dict) else {}
+    filter_type = _extract_filter_failure_type(exc)
+    source = str(details.get("source") or "exchange_rejection").strip().lower()
+    local_precheck = filter_type is not None and source == "local_precheck"
+    attempts = int(current_attempts if local_precheck else current_attempts + 1)
+    message_lower = str(exc).lower()
+
+    if exc.is_auth_error:
+        return ExchangeErrorDecision(
+            reason_code="AUTH_ERROR",
+            target_status="failed",
+            retriable=False,
+            pause_trigger=True,
+            retry_after_seconds=exc.retry_after_seconds,
+            attempts=attempts,
+            filter_type=filter_type,
+            local_precheck=local_precheck,
+        )
+
+    if filter_type is not None:
+        return ExchangeErrorDecision(
+            reason_code=f"FILTER_{filter_type}",
+            target_status="rejected",
+            retriable=False,
+            pause_trigger=False,
+            retry_after_seconds=exc.retry_after_seconds,
+            attempts=attempts,
+            filter_type=filter_type,
+            local_precheck=local_precheck,
+        )
+
+    if exc.error_code in {-2010, -2011} or ("insufficient" in message_lower and "balance" in message_lower):
+        return ExchangeErrorDecision(
+            reason_code="INSUFFICIENT_BALANCE",
+            target_status="rejected",
+            retriable=False,
+            pause_trigger=False,
+            retry_after_seconds=exc.retry_after_seconds,
+            attempts=attempts,
+            filter_type=None,
+            local_precheck=False,
+        )
+
+    if "price filter" in message_lower:
+        return ExchangeErrorDecision(
+            reason_code="PRICE_FILTER",
+            target_status="rejected",
+            retriable=False,
+            pause_trigger=False,
+            retry_after_seconds=exc.retry_after_seconds,
+            attempts=attempts,
+            filter_type="PRICE_FILTER",
+            local_precheck=False,
+        )
+
+    if exc.error_code == -1021 or "outside of the recvwindow" in message_lower or "invalid timestamp" in message_lower:
+        reason_code = "INVALID_TIMESTAMP"
+    elif exc.status_code == 418 or "ip banned" in message_lower:
+        reason_code = "IP_BANNED"
+    elif exc.status_code == 429 or exc.error_code in {-1003, -1015}:
+        reason_code = "RATE_LIMIT"
+    elif exc.retriable:
+        reason_code = "RETRIABLE_ERROR"
+    else:
+        reason_code = "NON_RETRIABLE"
+
+    if not exc.retriable:
+        return ExchangeErrorDecision(
+            reason_code=reason_code,
+            target_status="rejected",
+            retriable=False,
+            pause_trigger=False,
+            retry_after_seconds=exc.retry_after_seconds,
+            attempts=attempts,
+            filter_type=None,
+            local_precheck=False,
+        )
+
+    critical_retry_threshold = _env_int("LIVE_EXCHANGE_CRITICAL_RETRY_THRESHOLD", 5, minimum=1)
+    pause_trigger = reason_code == "IP_BANNED" or (
+        reason_code in {"INVALID_TIMESTAMP", "RATE_LIMIT", "RETRIABLE_ERROR"}
+        and attempts >= critical_retry_threshold
+    )
+    if attempts >= max_attempts:
+        return ExchangeErrorDecision(
+            reason_code="MAX_ATTEMPTS_EXCEEDED",
+            target_status="failed",
+            retriable=False,
+            pause_trigger=True if pause_trigger or reason_code in {"INVALID_TIMESTAMP", "RATE_LIMIT", "RETRIABLE_ERROR"} else False,
+            retry_after_seconds=exc.retry_after_seconds,
+            attempts=attempts,
+            filter_type=None,
+            local_precheck=False,
+        )
+    return ExchangeErrorDecision(
+        reason_code=reason_code,
+        target_status="pending",
+        retriable=True,
+        pause_trigger=pause_trigger,
+        retry_after_seconds=exc.retry_after_seconds,
+        attempts=attempts,
+        filter_type=None,
+        local_precheck=False,
+    )
 
 
 def _parse_symbol_variants(symbol_normalized: str) -> tuple[str, str]:
@@ -632,11 +755,29 @@ async def create_live_exchange_order(
         select(ExchangeOrder)
         .where(
             ExchangeOrder.exchange == exchange_name,
+            ExchangeOrder.account_id == account_id,
             ExchangeOrder.idempotency_key == idempotency_value,
         )
         .limit(1)
     )
     if existing is not None:
+        session.add(
+            AdminAction(
+                action="IDEMPOTENCY_HIT",
+                status=existing.status,
+                message="Live order idempotency hit",
+                meta=json_safe(
+                    {
+                        "exchange_order_id": str(existing.id),
+                        "exchange": existing.exchange,
+                        "account_id": existing.account_id,
+                        "strategy_config_id": existing.strategy_config_id,
+                        "idempotency_key": existing.idempotency_key,
+                        "status": existing.status,
+                    }
+                ),
+            )
+        )
         if existing.status == "rejected":
             parsed_last_error: dict[str, Any] = {}
             try:
@@ -735,7 +876,7 @@ async def create_live_exchange_order(
                     meta=json_safe(order_meta),
                     updated_at=_now_utc(),
                 )
-                .on_conflict_do_nothing(index_elements=["exchange", "idempotency_key"])
+                .on_conflict_do_nothing(index_elements=["exchange", "account_id", "idempotency_key"])
                 .returning(ExchangeOrder.id)
             )
             inserted_rejected_id = (await session.execute(stmt_rejected)).scalar()
@@ -749,6 +890,7 @@ async def create_live_exchange_order(
                     select(ExchangeOrder)
                     .where(
                         ExchangeOrder.exchange == exchange_name,
+                        ExchangeOrder.account_id == account_id,
                         ExchangeOrder.idempotency_key == idempotency_value,
                     )
                     .limit(1)
@@ -829,7 +971,7 @@ async def create_live_exchange_order(
             meta=json_safe(order_meta),
             updated_at=_now_utc(),
         )
-        .on_conflict_do_nothing(index_elements=["exchange", "idempotency_key"])
+        .on_conflict_do_nothing(index_elements=["exchange", "account_id", "idempotency_key"])
         .returning(ExchangeOrder.id)
     )
     inserted_id = (await session.execute(stmt)).scalar()
@@ -838,6 +980,7 @@ async def create_live_exchange_order(
             select(ExchangeOrder)
             .where(
                 ExchangeOrder.exchange == exchange_name,
+                ExchangeOrder.account_id == account_id,
                 ExchangeOrder.idempotency_key == idempotency_value,
             )
             .limit(1)
@@ -1060,7 +1203,7 @@ async def dispatch_live_exchange_orders_once(
     error_sample = None
     paused_triggered = False
 
-    max_attempts = _env_int("LIVE_EXCHANGE_MAX_ATTEMPTS", 10, minimum=1)
+    max_attempts = _env_int("LIVE_EXCHANGE_MAX_ATTEMPTS", 8, minimum=1)
     account_pause_cache: dict[int, dict[str, Any]] = {}
     for row in rows:
         picked += 1
@@ -1150,47 +1293,51 @@ async def dispatch_live_exchange_orders_once(
             )
             sent += 1
         except ExchangeError as exc:
-            critical = exc.status_code in {418, 429} or exc.is_auth_error
             error_sample = str(exc)
-            filter_failure_type = _extract_filter_failure_type(exc)
+            current_attempts = int(row.attempts or 0)
+            decision = _classify_exchange_error(
+                exc,
+                current_attempts=current_attempts,
+                max_attempts=max_attempts,
+            )
+            row.attempts = decision.attempts
+            filter_failure_type = decision.filter_type
             details = exc.details if isinstance(exc.details, dict) else {}
-            reject_source = str(details.get("source") or "exchange_rejection").strip().lower()
-            is_local_precheck_reject = filter_failure_type is not None and reject_source == "local_precheck"
-            if is_local_precheck_reject:
-                row.attempts = int(row.attempts or 0)
-            else:
-                row.attempts = next_attempt_number
-            retryable = bool(exc.retriable) and row.attempts < max_attempts and filter_failure_type is None
-            delay = _calc_backoff_seconds(attempts=max(1, int(row.attempts or 1)), retry_after_seconds=exc.retry_after_seconds)
-            if exc.retry_after_seconds is not None:
-                _set_rate_limit_cooldown(row.exchange, row.account_id, exc.retry_after_seconds)
-            if filter_failure_type is not None:
+            if decision.retry_after_seconds is not None:
+                _set_rate_limit_cooldown(row.exchange, row.account_id, decision.retry_after_seconds)
+            if decision.target_status == "rejected":
                 row.status = "rejected"
                 row.next_attempt_at = None
                 rejected += 1
-                if is_local_precheck_reject:
+                if decision.local_precheck:
                     rejected_local += 1
                     action = "EXCHANGE_FILTER_REJECT_LOCAL"
                 else:
                     action = "EXCHANGE_FILTER_REJECT_EXCHANGE"
-            elif retryable:
+            elif decision.target_status == "pending":
                 row.status = "pending"
+                delay = _calc_backoff_seconds(
+                    attempts=max(0, int(row.attempts or 0)),
+                    retry_after_seconds=decision.retry_after_seconds,
+                )
                 row.next_attempt_at = now + timedelta(seconds=delay)
                 retried += 1
                 action = "LIVE_ORDER_RETRY_SCHEDULED"
             else:
                 row.status = "failed"
-                row.next_attempt_at = now
+                row.next_attempt_at = None
                 failed += 1
                 action = "LIVE_ORDER_FAILED"
+            critical = bool(decision.pause_trigger)
             error_payload = {
                 "kind": "FILTER_FAILURE" if filter_failure_type is not None else "EXCHANGE_ERROR",
                 "message": str(exc),
                 "status_code": exc.status_code,
-                "retry_after_seconds": exc.retry_after_seconds,
+                "retry_after_seconds": decision.retry_after_seconds,
                 "error_code": exc.error_code,
-                "retriable": bool(exc.retriable and filter_failure_type is None),
+                "retriable": bool(decision.retriable),
                 "filter_type": filter_failure_type,
+                "reason_code": decision.reason_code,
                 "details": exc.details if isinstance(exc.details, dict) else {},
             }
             row.last_error = json.dumps(error_payload, default=str)
@@ -1199,13 +1346,14 @@ async def dispatch_live_exchange_orders_once(
             meta["last_exchange_error"] = {
                 "message": str(exc),
                 "status_code": exc.status_code,
-                "retry_after_seconds": exc.retry_after_seconds,
+                "retry_after_seconds": decision.retry_after_seconds,
                 "error_code": exc.error_code,
-                "retriable": bool(exc.retriable and filter_failure_type is None),
+                "retriable": bool(decision.retriable),
                 "critical": critical,
                 "used_weight_headers": exc.used_weight_headers,
                 "kind": "FILTER_FAILURE" if filter_failure_type is not None else "EXCHANGE_ERROR",
                 "filter_type": filter_failure_type,
+                "reason_code": decision.reason_code,
                 "details": exc.details if isinstance(exc.details, dict) else {},
             }
             row.meta = json_safe(meta)
@@ -1227,10 +1375,11 @@ async def dispatch_live_exchange_orders_once(
                             "account_id": row.account_id,
                             "attempts": row.attempts,
                             "status_code": exc.status_code,
-                            "retry_after_seconds": exc.retry_after_seconds,
+                            "retry_after_seconds": decision.retry_after_seconds,
                             "error_code": exc.error_code,
                             "error": str(exc),
                             "critical": critical,
+                            "reason_code": decision.reason_code,
                             "filter_type": filter_failure_type,
                             "idempotency_key": row.idempotency_key,
                             "symbol": row.symbol,
@@ -1258,16 +1407,10 @@ async def dispatch_live_exchange_orders_once(
                         "idempotency_key": row.idempotency_key,
                     },
                 )
-            severe_attempts_threshold = _env_int("LIVE_EXCHANGE_SEVERE_FAILURE_ATTEMPTS", 5, minimum=1)
-            severe_failure = bool(
-                isinstance(exc, SevereExchangeError)
-                or exc.is_auth_error
-                or (critical and row.attempts >= severe_attempts_threshold)
-            )
-            if severe_failure and filter_failure_type is None:
+            if decision.pause_trigger and filter_failure_type is None:
                 await pause_live_autopilot(
                     session,
-                    reason="LIVE_EXCHANGE_FAILURE",
+                    reason="EXCHANGE_ORDER_CRITICAL",
                     actor="system",
                     account_id=row.account_id,
                     meta={
@@ -1279,6 +1422,7 @@ async def dispatch_live_exchange_orders_once(
                         "error": str(exc),
                         "status_code": exc.status_code,
                         "error_code": exc.error_code,
+                        "reason_code": decision.reason_code,
                     },
                 )
                 paused_triggered = True
