@@ -673,7 +673,7 @@ class BinanceSpotClient:
             "type": order_type,
             "quantity": _to_decimal_text(request.qty.copy_abs()),
             "newClientOrderId": request.client_order_id,
-            "recvWindow": self.recv_window_ms,
+            "recvWindow": int(request.recv_window_ms) if request.recv_window_ms and int(request.recv_window_ms) > 0 else self.recv_window_ms,
             "timestamp": self._timestamp_ms(),
         }
         if request.price is not None and order_type != "MARKET":

@@ -638,6 +638,44 @@ class ExchangeOrder(Base):
     )
 
 
+class LiveExchangePolicy(Base):
+    __tablename__ = "live_exchange_policies"
+    __table_args__ = (
+        UniqueConstraint("exchange", "account_id", name="uq_live_exchange_policies_exchange_account"),
+        Index(
+            "ux_live_exchange_policies_exchange_default",
+            "exchange",
+            unique=True,
+            postgresql_where=text("account_id IS NULL"),
+        ),
+        Index("ix_live_exchange_policies_exchange", "exchange"),
+        Index("ix_live_exchange_policies_updated_at", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    exchange: Mapped[str] = mapped_column(Text, nullable=False)
+    account_id: Mapped[Optional[int]] = mapped_column(ForeignKey("paper_accounts.id", ondelete="CASCADE"), nullable=True)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=8, server_default=text("8"))
+    base_backoff_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default=text("5"))
+    max_backoff_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300, server_default=text("300"))
+    jitter_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default=text("3"))
+    rate_limit_min_interval_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    pause_on_consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default=text("5"))
+    pause_window_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300, server_default=text("300"))
+    pause_on_failures_in_window: Mapped[int] = mapped_column(Integer, nullable=False, default=8, server_default=text("8"))
+    recv_window_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=5000, server_default=text("5000"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=utc_now, server_default=text("CURRENT_TIMESTAMP")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=text("CURRENT_TIMESTAMP"),
+    )
+
+
 class TradeExplanation(Base):
     __tablename__ = "trade_explanations"
     __table_args__ = (

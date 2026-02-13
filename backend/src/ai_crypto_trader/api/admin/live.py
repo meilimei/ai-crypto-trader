@@ -16,6 +16,7 @@ from ai_crypto_trader.common.models import AdminAction, ExchangeOrder
 from ai_crypto_trader.services.live_exchange import (
     create_live_exchange_order,
     dispatch_live_exchange_orders_once,
+    get_effective_live_exchange_policy,
     get_live_pause_state,
     list_live_exchange_orders,
     pause_live_autopilot,
@@ -292,6 +293,36 @@ async def run_live_tick(
         await session.rollback()
         logger.exception("live tick failed")
         raise HTTPException(status_code=500, detail=f"Failed to run live tick: {exc}") from exc
+
+
+@router.get("/exchange-orders/policy")
+async def get_live_execution_policy(
+    exchange: str | None = Query(default=None),
+    account_id: int | None = Query(default=None, ge=1),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    policy = await get_effective_live_exchange_policy(
+        session,
+        exchange=exchange or "binance_spot_testnet",
+        account_id=account_id,
+    )
+    return {
+        "ok": True,
+        "policy": {
+            "exchange": policy.exchange,
+            "account_id": policy.account_id,
+            "max_attempts": policy.max_attempts,
+            "base_backoff_seconds": policy.base_backoff_seconds,
+            "max_backoff_seconds": policy.max_backoff_seconds,
+            "jitter_seconds": policy.jitter_seconds,
+            "rate_limit_min_interval_ms": policy.rate_limit_min_interval_ms,
+            "pause_on_consecutive_failures": policy.pause_on_consecutive_failures,
+            "pause_window_seconds": policy.pause_window_seconds,
+            "pause_on_failures_in_window": policy.pause_on_failures_in_window,
+            "recv_window_ms": policy.recv_window_ms,
+            "source": policy.source,
+        },
+    }
 
 
 @router.get("/exchange-orders/{order_id}")

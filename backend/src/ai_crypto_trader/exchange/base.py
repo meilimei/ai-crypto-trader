@@ -14,6 +14,7 @@ class ExchangeOrderRequest:
     price: Decimal | None
     market_price: Decimal | None
     client_order_id: str
+    recv_window_ms: int | None = None
 
 
 @dataclass(frozen=True)
