@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 LIVE_PAUSE_SCOPE = "live_exchange"
 DEFAULT_EXCHANGE = "binance_spot_testnet"
 PENDING_STATES = {"pending", "retry"}
+TERMINAL_STATES = {"accepted", "filled", "rejected", "failed", "canceled"}
 _rate_limit_locks: dict[tuple[str, int], asyncio.Lock] = {}
 _next_request_at: dict[tuple[str, int], datetime] = {}
 
@@ -111,6 +112,10 @@ def _extract_filter_failure_type(exc: ExchangeError) -> str | None:
     return None
 
 
+def _is_terminal_status(status: str | None) -> bool:
+    return (status or "").strip().lower() in TERMINAL_STATES
+
+
 @dataclass(frozen=True)
 class ExchangeErrorDecision:
     reason_code: str
@@ -132,7 +137,7 @@ def _classify_exchange_error(
     details = exc.details if isinstance(exc.details, dict) else {}
     filter_type = _extract_filter_failure_type(exc)
     source = str(details.get("source") or "exchange_rejection").strip().lower()
-    local_precheck = filter_type is not None and source == "local_precheck"
+    local_precheck = source == "local_precheck"
     attempts = int(current_attempts if local_precheck else current_attempts + 1)
     message_lower = str(exc).lower()
 
@@ -1239,7 +1244,8 @@ async def dispatch_live_exchange_orders_once(
             continue
         row.status = "sending"
         row.updated_at = now
-        next_attempt_number = int(row.attempts or 0) + 1
+        attempts_before_send = int(row.attempts or 0)
+        send_attempted = False
 
         critical = False
         try:
@@ -1255,12 +1261,14 @@ async def dispatch_live_exchange_orders_once(
                 market_price=_to_decimal(row_meta.get("market_price")),
                 client_order_id=row.client_order_id,
             )
+            row.attempts = attempts_before_send + 1
+            send_attempted = True
             result = await client.place_order(request)
             status = result.status.lower()
             row.exchange_order_id = result.exchange_order_id
             row.status = "filled" if status == "filled" else "accepted"
             row.last_error = None
-            row.next_attempt_at = now
+            row.next_attempt_at = None if _is_terminal_status(row.status) else now
             row.updated_at = now
             meta = row.meta if isinstance(row.meta, dict) else {}
             meta["used_weight_headers"] = result.used_weight_headers
@@ -1294,7 +1302,7 @@ async def dispatch_live_exchange_orders_once(
             sent += 1
         except ExchangeError as exc:
             error_sample = str(exc)
-            current_attempts = int(row.attempts or 0)
+            current_attempts = attempts_before_send
             decision = _classify_exchange_error(
                 exc,
                 current_attempts=current_attempts,
@@ -1428,10 +1436,10 @@ async def dispatch_live_exchange_orders_once(
                 paused_triggered = True
         except Exception as exc:  # safety net
             error_sample = str(exc)
-            row.attempts = next_attempt_number
-            delay = _calc_backoff_seconds(attempts=row.attempts)
+            row.attempts = attempts_before_send + 1 if send_attempted else attempts_before_send
+            delay = _calc_backoff_seconds(attempts=max(0, int(row.attempts or 0)))
             row.status = "pending" if row.attempts < max_attempts else "failed"
-            row.next_attempt_at = now + timedelta(seconds=delay) if row.status == "pending" else now
+            row.next_attempt_at = now + timedelta(seconds=delay) if row.status == "pending" else None
             row.last_error = str(exc)
             row.updated_at = now
             if row.status == "pending":
